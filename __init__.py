@@ -1,5 +1,5 @@
 """Research paper agent package."""
 
-from .agent import PhaseAgent, ReviewResult, WorkflowConfig, WorkflowRunner, WorkflowState
+from .agent import PhaseAgent, WorkflowConfig, WorkflowRunner, WorkflowState
 
-__all__ = ["PhaseAgent", "ReviewResult", "WorkflowConfig", "WorkflowRunner", "WorkflowState"]
+__all__ = ["PhaseAgent", "WorkflowConfig", "WorkflowRunner", "WorkflowState"]

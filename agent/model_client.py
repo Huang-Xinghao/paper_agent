@@ -22,6 +22,10 @@ class ModelResponse:
     raw: Any = None
 
 
+class InvalidToolCall(ValueError):
+    """The provider returned an incomplete function call; nothing was executed."""
+
+
 def load_env_file(path: str | os.PathLike[str]) -> None:
     """Load simple KEY=VALUE entries without overriding shell environment."""
     env_path = os.fspath(path)
@@ -50,8 +54,10 @@ def _normalise_response(value: Any) -> ModelResponse:
         return ModelResponse(content=value)
     if isinstance(value, Mapping):
         calls = []
-        for index, call in enumerate(value.get("tool_calls", ())):
+        for index, call in enumerate(value.get("tool_calls") or ()):
             function = call.get("function", call)
+            if not isinstance(function, Mapping) or not function.get("name"):
+                raise InvalidToolCall("Tool call is missing its function name")
             arguments = function.get("arguments", {})
             if isinstance(arguments, str):
                 arguments = json.loads(arguments)
@@ -64,7 +70,9 @@ def _normalise_response(value: Any) -> ModelResponse:
         raise TypeError(f"unsupported model response: {type(value)!r}")
     calls = []
     for index, call in enumerate(getattr(message, "tool_calls", None) or ()):
-        function = call.function
+        function = getattr(call, "function", None)
+        if function is None or not getattr(function, "name", None):
+            raise InvalidToolCall("Tool call is missing its function name")
         arguments = function.arguments
         if isinstance(arguments, str):
             arguments = json.loads(arguments)
@@ -125,5 +133,16 @@ class ModelClient:
                 request["max_tokens"] = max_tokens
         if tools:
             request.update(tools=tools, tool_choice="auto")
-        response = self.client.chat.completions.create(**request)
-        return _normalise_response(response)
+        for attempt in range(3):
+            response = self.client.chat.completions.create(**request)
+            try:
+                return _normalise_response(response)
+            except InvalidToolCall:
+                if attempt == 2:
+                    raise
+                request["messages"] = messages + [{
+                    "role": "user",
+                    "content": "Your last response contained an incomplete tool call and was not executed. "
+                    "Return a valid function tool call with a function name and JSON object arguments, "
+                    "or a normal text response if no tool is needed.",
+                }]

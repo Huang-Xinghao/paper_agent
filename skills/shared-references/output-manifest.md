@@ -35,7 +35,7 @@ Then append one row per output file written:
 
 | Stage | Skills |
 |-------|--------|
-| `idea-discovery` | /idea-creator, /idea-discovery, /novelty-check, /research-review |
+| `idea-discovery` | /idea-creator, /idea-discovery, /novelty-check |
 | `implementation` | /research-refine, /experiment-plan, /experiment-bridge, /run-experiment |
 | `review` | /auto-review-loop |
 | `paper` | /paper-writing, /paper-write, /paper-compile |

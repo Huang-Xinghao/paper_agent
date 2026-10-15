@@ -106,11 +106,14 @@ class AgentLoop:
             result = await result
         return result
 
-    def run(self, prompt: str, *, system_prompt: str, phase: str) -> AgentState:
+    def run(self, prompt: str, *, system_prompt: str, phase: str,
+                  completion_check: Callable[[], None] | None = None) -> AgentState:
         import asyncio
-        return asyncio.run(self.arun(prompt, system_prompt=system_prompt, phase=phase))
+        return asyncio.run(self.arun(prompt, system_prompt=system_prompt, phase=phase,
+                                     completion_check=completion_check))
 
-    async def arun(self, prompt: str, *, system_prompt: str, phase: str) -> AgentState:
+    async def arun(self, prompt: str, *, system_prompt: str, phase: str,
+                  completion_check: Callable[[], None] | None = None) -> AgentState:
         state = AgentState([{"role": "system", "content": system_prompt},
                             {"role": "user", "content": prompt}], phase)
         schemas = [tool_schema(spec) for spec in self.tools]
@@ -141,46 +144,21 @@ class AgentLoop:
                            tools=[call.name for call in response.tool_calls])
             self._write_phase_checkpoint(phase, iteration, "model_returned")
             if not response.tool_calls:
-                required_artifacts = {
-                    "paper_plan": ("PAPER_PLAN.md",),
-                    "paper_figure": ("figures/latex_includes.tex", "figures/figure_plan.md", "figures/figure_captions.md"),
-                    "paper_write": ("paper/main.tex", "paper/references.bib"),
-                }.get(phase, ())
-                missing = [name for name in required_artifacts
-                           if not (self.workspace / name).is_file()
-                           or not (self.workspace / name).read_text(encoding="utf-8").strip()]
-                if phase == "paper_write" and not any(
-                    path.is_file() and path.read_text(encoding="utf-8").strip()
-                    for path in (self.workspace / "paper/sections").glob("*.tex")
-                ):
-                    missing.append("paper/sections/*.tex (at least one nonempty section)")
-                if missing:
+                try:
+                    if completion_check is not None:
+                        completion_check()
+                    else:
+                        self._check_completion(phase)
+                except ArtifactValidationError as exc:
                     state.messages.extend([
-                        {"role": "assistant", "content": response.content},
-                        {"role": "user", "content": "Completion checks failed. Use the write tool to create these nonempty project files before finishing: " + ", ".join(missing)},
+                        {"role": "assistant", "content": response.content or ""},
+                        {"role": "user", "content": f"Completion checks failed: {exc}. "
+                         "Use the available tools to correct the artifact and verify it before finishing."},
                     ])
+                    self._progress("validation_failed", phase=phase, iteration=iteration, error=str(exc))
                     if iteration >= self.max_iterations:
-                        raise ArtifactValidationError(f"{phase} cannot finish without: {', '.join(missing)}")
+                        raise
                     continue
-                if phase == "ideas":
-                    report = self.workspace / "idea-stage/IDEA_REPORT.md"
-                    successful = {message.get("name") for message in state.messages
-                                  if message.get("role") == "tool" and not message.get("is_error")}
-                    issues = []
-                    if not report.is_file() or not report.read_text(encoding="utf-8").strip():
-                        issues.append("Write the nonempty canonical artifact idea-stage/IDEA_REPORT.md.")
-                    if "search_papers" in successful and "verify_papers" not in successful:
-                        issues.append("Call verify_papers on the literature used in the report; disclose unverified records.")
-                    if issues:
-                        state.messages.extend([
-                            {"role": "assistant", "content": response.content},
-                            {"role": "user", "content": "Completion checks: " + " ".join(issues)},
-                        ])
-                        if iteration == self.max_iterations + completion_retries:
-                            if "verify_papers" in " ".join(issues):
-                                raise RuntimeError("ideas cannot finish without verify_papers")
-                            raise RuntimeError("ideas cannot finish without IDEA_REPORT.md")
-                        continue
                 state.final = response.content
                 state.messages.append({"role": "assistant", "content": response.content})
                 self.last_state = state
@@ -191,6 +169,7 @@ class AgentLoop:
                 {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": json.dumps(call.arguments)}}
                 for call in response.tool_calls]}
             state.messages.append(assistant)
+            visual_content = []
             for call in response.tool_calls:
                 self._progress("tool_start", phase=phase, iteration=iteration, tool=call.name)
                 spec = self._by_name.get(call.name)
@@ -204,16 +183,39 @@ class AgentLoop:
                 state.messages.append({"role": "tool", "tool_call_id": call.id,
                                        "name": call.name, "content": result.output,
                                        "is_error": result.is_error})
+                if result.images and not result.is_error:
+                    visual_content.append({"type": "text", "text":
+                        f"Visual output of {call.name} ({call.id}): {result.output}"})
+                    visual_content.extend(result.images)
                 self._progress("tool_end", phase=phase, iteration=iteration,
                                tool=call.name, is_error=result.is_error)
+            # Chat Completions accepts images in user content. Resolve every
+            # outstanding tool call before adding the visual message.
+            if visual_content:
+                state.messages.append({"role": "user", "content": visual_content})
         self.last_state = state
-        if phase == "ideas":
-            successful = {message.get("name") for message in state.messages
-                          if message.get("role") == "tool" and not message.get("is_error")}
-            if "search_papers" in successful and "verify_papers" not in successful:
-                raise RuntimeError("ideas cannot finish without verify_papers")
         raise RuntimeError(f"model exceeded max_iterations={self.max_iterations} "
                            "(per phase-agent call; configure --max-tool-rounds, not workflow stages)")
+
+    def _check_completion(self, phase: str) -> None:
+        """Minimal artifact checks for direct calls without a workflow validator."""
+        required = {
+            "literature": ("literature/RESEARCH_REPORT.md",),
+            "ideas": ("idea-stage/IDEA_REPORT.md",),
+            "paper_plan": ("PAPER_PLAN.md",),
+            "paper_figure": ("figures/latex_includes.tex", "figures/figure_plan.md", "figures/figure_captions.md"),
+            "paper_write": ("paper/main.tex", "paper/references.bib"),
+        }.get(phase, ())
+        missing = [name for name in required
+                   if not (self.workspace / name).is_file()
+                   or not (self.workspace / name).read_text(encoding="utf-8").strip()]
+        if phase == "paper_write" and not any(
+            path.is_file() and path.read_text(encoding="utf-8").strip()
+            for path in (self.workspace / "paper/sections").glob("*.tex")
+        ):
+            missing.append("paper/sections/*.tex (at least one nonempty section)")
+        if missing:
+            raise ArtifactValidationError(f"{phase} cannot finish without: {', '.join(missing)}")
 
     def _model_heartbeat(self, stop: threading.Event, phase: str, iteration: int) -> None:
         """Emit durable liveness events while a synchronous model request is pending."""
@@ -258,7 +260,6 @@ class PhaseAgent(AgentLoop):
         "literature": "research-lit",
         "ideas": "idea-creator",
         "novelty": "novelty-check",
-        "review": "research-review",
         "research_refine": "research-refine",
         "refine": "research-refine-pipeline",
         "experiment_plan": "experiment-plan",
@@ -267,7 +268,6 @@ class PhaseAgent(AgentLoop):
         "paper_figure": "paper-figure",
         "paper_write": "paper-write",
         "paper_compile": "paper-compile",
-        "paper_improve": "auto-paper-improvement-loop",
     }
     DEFAULT_BATTERY_KNOWLEDGE_ROOT = Path(__file__).resolve().parents[2] / "电池资源库"
 
@@ -292,11 +292,11 @@ class PhaseAgent(AgentLoop):
         self.on_progress = on_progress
         self._tools = {spec.name: spec for spec in builtin_tools()}
         self._custom_tools: set[str] = set()
+        self._tool_phases: dict[str, tuple[str, ...]] = {}
         self._skills: list[str] = []
-        self.app = self
         self.configure()
 
-    def add_tool(self, api: ToolSpec) -> None:
+    def add_tool(self, api: ToolSpec, *, phases: tuple[str, ...] | None = None) -> None:
         """Register a tool and rebuild the phase's visible tool set."""
         if callable(api) and not isinstance(api, ToolSpec):
             api = ToolSpec(api.__name__, getattr(api, "__doc__", "") or "", api)
@@ -304,6 +304,10 @@ class PhaseAgent(AgentLoop):
             raise TypeError("api must be a ToolSpec or a callable accepting ToolContext")
         self._tools[api.name] = api
         self._custom_tools.add(api.name)
+        if phases is not None:
+            self._tool_phases[api.name] = phases
+        else:
+            self._tool_phases.pop(api.name, None)
         self.configure()
 
     def add_skill(self, name: str) -> None:
@@ -315,14 +319,15 @@ class PhaseAgent(AgentLoop):
         if phase:
             self.phase = {"proposal": "refine", "experiment": "experiment_bridge"}.get(phase, phase)
         allowed = tools_for_phase(self.phase, tuple(self._tools.values()))
-        selected_names = {spec.name for spec in allowed} | self._custom_tools
+        selected_names = {spec.name for spec in allowed} | {
+            name for name in self._custom_tools
+            if name not in self._tool_phases or self.phase in self._tool_phases[name]
+        }
         selected = tuple(spec for spec in self._tools.values() if spec.name in selected_names)
-        # Reinitialize only the low-level loop state; this object remains the
-        # public runtime and ``app`` continues to point to itself.
+        # Reset the tool loop for the selected phase.
         AgentLoop.__init__(self, self.model, workspace=self.project, tools=selected,
                            max_iterations=self.max_iterations,
                            on_progress=self.on_progress)
-        self.app = self
         self.skill_dirs = (self.skills_root,)
         self.knowledge_roots = ((self.knowledge_root,) if self.knowledge_root else ())
 
@@ -360,12 +365,14 @@ class PhaseAgent(AgentLoop):
                 + compute_context(self.project) + self._experiment_template_context()
                 + compatibility + self._skill_prompt())
 
-    def go(self, prompt: str, *, phase: str | None = None) -> AgentState:
+    def go(self, prompt: str, *, phase: str | None = None,
+           completion_check: Callable[[], None] | None = None) -> AgentState:
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
         self.project.mkdir(parents=True, exist_ok=True)
         self.configure(phase=phase)
-        return self.run(prompt, system_prompt=self._system_prompt(), phase=self.phase)
+        return self.run(prompt, system_prompt=self._system_prompt(), phase=self.phase,
+                        completion_check=completion_check)
 
 
 def main() -> None:
@@ -382,17 +389,11 @@ def main() -> None:
                         help="tool-enabled model rounds per phase-agent invocation (default: 12); not workflow stages; --max-iterations is the legacy alias")
     parser.add_argument("--timeout", type=float, default=None,
                         help="model request timeout in seconds (default: 300)")
-    parser.add_argument("--arxiv-download", action=argparse.BooleanOptionalAction, default=True,
-                        help="download and screen arXiv PDFs before literature synthesis (default: enabled)")
-    parser.add_argument("--arxiv-max-download", type=int, default=5)
-    parser.add_argument("--arxiv-read-pages", type=int, default=3)
     parser.add_argument("--idea-max-total-gpu-hours", type=float, default=8.0)
     parser.add_argument("--idea-search-paper-number", type=int, default=15)
     args = parser.parse_args()
     if args.max_tool_rounds < 1 or (args.timeout is not None and args.timeout <= 0):
         parser.error("--timeout and --max-tool-rounds must be positive")
-    if not 1 <= args.arxiv_max_download <= 50 or not 1 <= args.arxiv_read_pages <= 10:
-        parser.error("--arxiv-max-download must be 1-50; --arxiv-read-pages must be 1-10")
     if not 0 < args.idea_max_total_gpu_hours < float("inf") or not 1 <= args.idea_search_paper_number <= 50:
         parser.error("idea GPU hours must be finite and positive; idea paper number must be 1-50")
 
@@ -411,16 +412,10 @@ def main() -> None:
         model=args.model,
         idea_config=IdeaNodeConfig(args.idea_max_total_gpu_hours,
                                    args.idea_search_paper_number),
-        config=WorkflowConfig(
-            start_node="literature",
-            arxiv_download=args.arxiv_download,
-            arxiv_max_download=args.arxiv_max_download,
-            arxiv_read_pages=args.arxiv_read_pages,
-        ),
+        config=WorkflowConfig(start_node="literature"),
     )
     print(f"状态: {state.status}; 当前节点: {state.current_node}")
     if state.error:
         print(f"错误: {state.error}")
     if state.status != "completed":
-        raise SystemExit({"awaiting_results": 2, "rejected": 3,
-                          "review_failed": 4}.get(state.status, 1))
+        raise SystemExit({"awaiting_results": 2}.get(state.status, 1))

@@ -6,8 +6,8 @@ get evidence; it is not a cached copy of the wiki, dataset descriptions, or data
 | Source | How it reaches this phase | What it can establish |
 | --- | --- | --- |
 | User task, approved artifacts, review, novelty assessment | Workflow prompt and project files | Research objective, accepted decisions, planned claims |
-| `research-wiki/` | Workflow pre-reads `index.md`, `query_pack.md`, and matching pages before `ideas` and `proposal`; other phases use `search_wiki` then `read_wiki` as needed | Prior notes, paper/idea/experiment/claim leads; not independent verification |
-| Online papers | Workflow runs `search_papers` before `ideas`; later searches use `search_papers` and `verify_papers` as needed | Search leads and bibliographic identity; not paper findings unless text was read |
+| Shared repository `research-wiki/` (override: `PAPER_AGENT_WIKI_ROOT`) | Workflow pre-reads `index.md`, `query_pack.md`, and matching pages before `literature`, `ideas`, and `research_refine`; other phases use `search_wiki` then `read_wiki` as needed. Use the wiki tools for shared pages outside the project workspace; returned absolute paths identify their sources | Prior notes, paper/idea/experiment/claim leads; not independent verification |
+| Online papers | Workflow runs `search_papers` before `ideas`; later searches use `search_papers` as needed | Search leads and bibliographic identity; not paper findings unless text was read |
 | Battery knowledge base (`电池资源库`) | Workflow searches and reads matching dataset, input, and method descriptions before `proposal`; other phases use `search_battery_resources` then `read_battery_resource` when available | Candidate datasets, inputs, methods, known caveats; not actual local data or measured values |
 | Project data, code, results, execution receipts | File tools and runner validation | Available fields, implementation, splits, and measured outcomes after direct inspection |
 

@@ -15,8 +15,8 @@ from .loop import PhaseAgent
 from .workflow import IdeaNodeConfig, WorkflowConfig, WorkflowRunner, WorkflowState
 
 WORKFLOW_NODE_NAMES = (
-    "literature", "ideas", "novelty", "refine",
-    "experiment_plan", "experiment_bridge", "experiment_check", "experiment_run",
+    "literature", "ideas", "refine",
+    "experiment_plan", "experiment_bridge",
     "paper_plan", "paper_figure", "paper_write",
     "paper_compile",
 )
@@ -72,10 +72,8 @@ def run_workflow(project: Path, prompt: str, *, max_iterations: int = 12,
 
     def on_node_start(node: str, state: WorkflowState) -> None:
         progress["run_id"] = state.run_id
-        progress["experiment_review_status"] = state.experiment_review_status
         progress["paper_status"] = state.paper_status
         progress.update(successful_node_executions=state.transitions,
-                        scientific_revisions=state.revision_count,
                         fault_retries=state.fault_retry_count)
         _write_json(project / "workflow-state.json", state.to_dict())
         progress.pop("tool", None)
@@ -83,16 +81,13 @@ def run_workflow(project: Path, prompt: str, *, max_iterations: int = 12,
         event("node_start", node=node)
 
     def on_node_end(node: str, state: WorkflowState, result: Any) -> None:
-        progress["experiment_review_status"] = state.experiment_review_status
         progress["paper_status"] = state.paper_status
         progress.update(successful_node_executions=state.transitions,
-                        scientific_revisions=state.revision_count,
                         fault_retries=state.fault_retry_count)
         _write_json(project / "workflow-state.json", state.to_dict())
         event("node_end", node=node, artifact=result.artifact[:200])
 
     def on_node_progress(node: str, state: WorkflowState, details: dict[str, Any]) -> None:
-        progress["experiment_review_status"] = state.experiment_review_status
         progress["paper_status"] = state.paper_status
         _write_json(project / "workflow-state.json", state.to_dict())
         event("node_progress", node=node, round=details["round"], stage=details["stage"])
@@ -123,7 +118,6 @@ def run_workflow(project: Path, prompt: str, *, max_iterations: int = 12,
         raise
     _write_json(project / "workflow-state.json", state.to_dict())
     progress["status"] = state.status
-    progress["experiment_review_status"] = state.experiment_review_status
     progress["paper_status"] = state.paper_status
     event("workflow_end", node=state.current_node, error=state.error or "")
     return state
@@ -135,10 +129,8 @@ def main() -> None:
     parser.add_argument("--max-tool-rounds", "--max-iterations", dest="max_tool_rounds",
                         type=int, default=12,
                         help="tool-enabled model rounds per phase-agent invocation (default: 12); not workflow stages; --max-iterations is the legacy alias")
-    parser.add_argument("--max-artifact-repairs", type=int, default=2,
-                        help="artifact correction attempts per node; 0 disables")
     parser.add_argument("--max-experiment-repairs", type=int, default=3,
-                        help="shared experiment correction budget per invocation; 0 disables")
+                        help="experiment repair limit across workflow resumes; 0 disables")
     parser.add_argument("--model", default=None,
                         help="model name; defaults to PAPER_AGENT_MODEL or gpt-4o")
     parser.add_argument("--timeout", type=float, default=300,
@@ -146,23 +138,16 @@ def main() -> None:
     parser.add_argument("--start-node", help="start at a workflow node using verified project outputs")
     parser.add_argument("--single-node", metavar="NODE", choices=WORKFLOW_NODE_NAMES,
                         help="run one workflow node, including Runner preprocessing, then stop")
-    parser.add_argument("--arxiv-download", action=argparse.BooleanOptionalAction, default=True,
-                        help="download and screen arXiv PDFs before literature synthesis (default: enabled)")
-    parser.add_argument("--arxiv-max-download", type=int, default=5)
-    parser.add_argument("--arxiv-read-pages", type=int, default=3,
-                        help="initial pages to read per arXiv PDF (1-10)")
     parser.add_argument("--idea-max-total-gpu-hours", type=float, default=8.0,
                         help="total GPU-hour planning budget for idea pilots (default: 8)")
     parser.add_argument("--idea-search-paper-number", type=int, default=15,
                         help="target number of papers to retrieve for idea generation (default: 15)")
     parser.add_argument("prompt", nargs="+")
     args = parser.parse_args()
-    if args.max_artifact_repairs < 0 or args.max_experiment_repairs < 0:
-        parser.error("repair limits must be nonnegative")
+    if args.max_experiment_repairs < 0:
+        parser.error("--max-experiment-repairs must be nonnegative")
     if args.timeout <= 0 or args.max_tool_rounds < 1:
         parser.error("--timeout and --max-tool-rounds must be positive")
-    if not 1 <= args.arxiv_max_download <= 50 or not 1 <= args.arxiv_read_pages <= 10:
-        parser.error("--arxiv-max-download must be 1-50; --arxiv-read-pages must be 1-10")
     if not 0 < args.idea_max_total_gpu_hours < float("inf") or not 1 <= args.idea_search_paper_number <= 50:
         parser.error("idea GPU hours must be finite and positive; idea paper number must be 1-50")
     state = run_workflow(args.project, " ".join(args.prompt),
@@ -173,16 +158,11 @@ def main() -> None:
                          idea_config=IdeaNodeConfig(args.idea_max_total_gpu_hours,
                                                     args.idea_search_paper_number),
                          config=WorkflowConfig(start_node="literature",
-                                               max_artifact_repairs=args.max_artifact_repairs,
-                                               max_experiment_repairs=args.max_experiment_repairs,
-                                               arxiv_download=args.arxiv_download,
-                                               arxiv_max_download=args.arxiv_max_download,
-                                               arxiv_read_pages=args.arxiv_read_pages))
+                                               max_experiment_repairs=args.max_experiment_repairs))
     print(f"项目目录: {args.project.resolve()}")
     print(f"状态: {state.status}; 当前节点: {state.current_node}; 原因: {state.error}")
     if state.status != "completed":
-        raise SystemExit({"awaiting_results": 2, "rejected": 3,
-                          "review_failed": 4}.get(state.status, 1))
+        raise SystemExit({"awaiting_results": 2}.get(state.status, 1))
 
 
 if __name__ == "__main__":

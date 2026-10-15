@@ -32,7 +32,7 @@ def _root(ctx: ToolContext) -> Path:
 
 def _resource_type(relative: Path) -> str:
     name = relative.as_posix()
-    if name.startswith("数据集/"):
+    if "数据集" in relative.parts[:-1]:
         return "dataset"
     if name.startswith("电池输入/"):
         return "input"

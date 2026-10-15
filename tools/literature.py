@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import time
 import tempfile
 import urllib.error
-from difflib import SequenceMatcher
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -131,6 +131,17 @@ def _get_json(url: str) -> dict[str, Any]:
     return json.loads(_get_text(url))
 
 
+def _openalex_pdf_urls(item: dict[str, Any]) -> list[str]:
+    locations = [item.get("best_oa_location"), item.get("primary_location")]
+    locations.extend(item.get("locations") or [])
+    urls = []
+    for location in locations:
+        url = (location or {}).get("pdf_url")
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
 @tool(read_only=True)
 def search_papers(ctx: ToolContext, query: str, source: str = "openalex",
                   max_results: int = 10) -> ToolResult:
@@ -146,7 +157,9 @@ def search_papers(ctx: ToolContext, query: str, source: str = "openalex",
         raw = _get_json(url).get("results", [])
         papers = [{"title": item.get("title"), "authors": [a.get("author", {}).get("display_name")
                     for a in item.get("authorships", [])], "year": item.get("publication_year"),
-                   "doi": item.get("doi"), "url": item.get("primary_location", {}).get("landing_page_url"),
+                   "doi": item.get("doi"), "url": (item.get("primary_location") or {}).get("landing_page_url"),
+                   "openalex_id": item.get("id"), "pdf_urls": _openalex_pdf_urls(item),
+                   "open_access": item.get("open_access"),
                    "abstract": None, "source": source} for item in raw]
     elif source == "semantic_scholar":
         fields = "title,authors,year,abstract,externalIds,url,venue"
@@ -177,8 +190,72 @@ def search_papers(ctx: ToolContext, query: str, source: str = "openalex",
 
 
 @tool()
+def download_openalex_paper(ctx: ToolContext, paper: dict) -> ToolResult:
+    """Download an OpenAlex paper's available PDF to papers/openalex/.
+
+    Pass a search_papers record, or title and DOI. Missing PDF links are resolved
+    via OpenAlex DOI lookup. Try alternative PDF locations; report unavailable
+    full text explicitly. Does not download publisher landing pages as PDFs.
+    """
+    doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "",
+                 str(paper.get("doi") or ""), flags=re.I).strip()
+    urls = list(dict.fromkeys(paper.get("pdf_urls") or []))[:5]
+    if not urls and re.fullmatch(r"10\.\d{4,9}/\S+", doi):
+        try:
+            record = _get_json("https://api.openalex.org/works/" +
+                               urllib.parse.quote("https://doi.org/" + doi, safe=""))
+            urls = _openalex_pdf_urls(record)[:5]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return ToolResult(_json({"status": "lookup_failed", "doi": doi,
+                                      "error": str(exc)}), True)
+    if not urls:
+        return ToolResult(_json({"status": "unavailable", "doi": doi,
+                                  "reason": "OpenAlex has no direct PDF location for this paper"}), True)
+    identity = doi.casefold() or str(paper.get("openalex_id") or "") or (
+        str(paper.get("title") or "") + "|" + urls[0])
+    key = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    relative = f"papers/openalex/{key}.pdf"
+    target = ctx.resolve(relative, write=True)
+    if target.is_file():
+        with target.open("rb") as stream:
+            if stream.read(5) == b"%PDF-":
+                return ToolResult(_json({"path": relative, "doi": doi, "status": "cached"}))
+    errors = []
+    for url in urls:
+        temporary = None
+        try:
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("PDF URL must use HTTP or HTTPS")
+            request = urllib.request.Request(url, headers={"User-Agent": "paper-agent/0.1"})
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                header = response.read(5)
+                if header != b"%PDF-":
+                    raise ValueError("Location returned a non-PDF response")
+                with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(header)
+                    size = len(header)
+                    while chunk := response.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > 50 * 1024 * 1024:
+                            raise ValueError("PDF exceeds the 50 MiB download limit")
+                        stream.write(chunk)
+            temporary.replace(target)
+            return ToolResult(_json({"path": relative, "doi": doi, "url": url,
+                                      "status": "downloaded", "attempt_errors": errors}))
+        except (OSError, ValueError) as exc:
+            errors.append({"url": url, "error": str(exc)})
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    return ToolResult(_json({"status": "download_failed", "doi": doi, "errors": errors}), True)
+
+
+@tool()
 def download_arxiv_paper(ctx: ToolContext, url: str) -> ToolResult:
-    """Download and cache a verified arXiv PDF inside the project workspace."""
+    """Download and cache an arXiv PDF inside the project workspace."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"arxiv.org", "export.arxiv.org"}:
         return ToolResult("Not an arXiv paper URL", True)
@@ -214,48 +291,3 @@ def download_arxiv_paper(ctx: ToolContext, url: str) -> ToolResult:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-
-
-@tool(read_only=True)
-def verify_papers(ctx: ToolContext, papers: list[dict], min_year: int | None = None) -> ToolResult:
-    """Normalize/de-duplicate metadata and cross-check DOI/title using Crossref.
-
-    accepted means usable metadata, not verified truth: inspect verification on each record.
-    Missing DOI/network failures stay explicitly unverified. This does not read full text.
-    """
-    accepted: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    rejected: list[dict[str, str]] = []
-    for paper in papers:
-        title = str(paper.get("title") or "").strip()
-        key = re.sub(r"\W+", " ", title.lower()).strip()
-        year = paper.get("year")
-        if not title:
-            rejected.append({"reason": "missing title"}); continue
-        if key in seen:
-            rejected.append({"title": title, "reason": "duplicate title"}); continue
-        if min_year is not None and str(year).isdigit() and int(year) < min_year:
-            rejected.append({"title": title, "reason": f"before {min_year}"}); continue
-        seen.add(key)
-        verification = {"status": "unverified", "reason": "No valid DOI", "full_text_read": False}
-        doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", str(paper.get("doi") or ""), flags=re.I).strip()
-        if re.fullmatch(r"10\.\d{4,9}/\S+", doi):
-            try:
-                record = _get_json("https://api.crossref.org/works/" + urllib.parse.quote(doi, safe=""))["message"]
-                canonical_title = (record.get("title") or [""])[0]
-                normalized = lambda t: re.sub(r"\W+", " ", t.casefold()).strip()
-                matched = (str(record.get("DOI", "")).casefold() == doi.casefold()
-                           and SequenceMatcher(None, normalized(title), normalized(canonical_title)).ratio() >= 0.85)
-                verification = {"status": "verified_metadata" if matched else "mismatch",
-                                "source": "crossref", "canonical_title": canonical_title,
-                                "canonical_doi": record.get("DOI"), "full_text_read": False}
-                if not matched:
-                    rejected.append({"title": title, "reason": "DOI/title mismatch", "verification": verification})
-                    continue
-            except Exception as exc:
-                verification["reason"] = f"DOI lookup unavailable: {exc}"
-        accepted.append({"verification": verification, "title": title, "authors": paper.get("authors") or [], "year": year,
-                         "doi": paper.get("doi"), "url": paper.get("url"), "abstract": paper.get("abstract"),
-                         "source": paper.get("source")})
-    return ToolResult(_json({"accepted": accepted, "rejected": rejected,
-                             "accepted_count": len(accepted), "rejected_count": len(rejected)}))

@@ -15,6 +15,7 @@ class ToolResult:
     output: str = ""
     is_error: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    images: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

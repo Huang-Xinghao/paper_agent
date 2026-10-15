@@ -4,49 +4,31 @@ from __future__ import annotations
 
 import json
 import hashlib
-import importlib.util
 import re
 import csv
 import shutil
 import subprocess
 import os
 import math
-import signal
-import sys
 import uuid
-import time
 from functools import wraps
-from paper_agent.project_config import load_compute_config, compute_context, validate_job_timeout
+from .experiment_queue import run_queue
+from .experiment_executor import ExperimentExecutor, AwaitingResults, ExperimentExecutionError
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from .loop import ArtifactValidationError, PhaseAgent
-from paper_agent.tools.review import CodexReviewer, external_review
-from paper_agent.tools import ToolContext
+from paper_agent.tools import ToolContext, ToolResult, ToolSpec
+from .experiment_handoff import validate_coverage
 from paper_agent.tools.battery_resources import search_battery_resources, read_battery_resource
-from paper_agent.tools.literature import search_papers, discover_local_papers, read_local_paper, download_arxiv_paper
-from paper_agent.tools.wiki import search_wiki, read_wiki
+from paper_agent.tools.literature import search_papers, discover_local_papers, read_local_paper
+from paper_agent.tools.wiki import search_wiki, read_wiki, resolve_wiki_root
 
-WorkflowStatus = Literal["running", "awaiting_results", "completed", "rejected", "review_failed", "failed"]
-PaperStatus = Literal["pending", "pdf_ready", "review_completed", "review_failed"]
+WorkflowStatus = Literal["running", "awaiting_results", "completed", "failed"]
+PaperStatus = Literal["pending", "pdf_ready"]
 
-
-class AwaitingResults(Exception):
-    """The experiment code is ready, but real measurements are not yet present."""
-
-
-class ExperimentExecutionError(RuntimeError):
-    """An executed job failed; its receipt and log are already durable."""
-
-
-class ExperimentCodeRejected(RuntimeError):
-    """A completed independent review found blocking implementation defects."""
-
-
-class ExperimentExpansionRequired(Exception):
-    """Data preparation completed and the bridge must expand deferred jobs."""
 
 
 def artifact_contract(function):
@@ -60,28 +42,6 @@ def artifact_contract(function):
 
 
 @dataclass
-class ReviewResult:
-    """Normalized result from an independent reviewer."""
-
-    score: float | None = None
-    verdict: str | None = None
-    confidence: float | None = None
-    reviewer_model: str | None = None
-    raw_response: str = ""
-    parse_error: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def is_proceed(self) -> bool:
-        return (self.verdict or "").upper().replace(" ", "_") in {
-            "PROCEED", "PROCEED_WITH_CAUTION", "READY", "ACCEPT_AS_IDEA",
-        }
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
 class WorkflowState:
     """Serializable state passed between workflow nodes."""
 
@@ -91,58 +51,40 @@ class WorkflowState:
     status: WorkflowStatus = "running"
     paper_status: PaperStatus = "pending"
     artifacts: dict[str, str] = field(default_factory=dict)
-    review: ReviewResult | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
     transitions: int = 0  # Lifetime successful node executions; never a run budget.
-    revision_count: int = 0
     fault_retry_count: int = 0
     failed_node: str | None = None
     error: str | None = None
     node_results: dict[str, dict[str, Any]] = field(default_factory=dict)
-    idea_candidates: list[dict[str, Any]] = field(default_factory=list)
-    selected_idea: dict[str, Any] | None = None
     experiment_repair_count: int = 0
     experiment_feedback: dict[str, Any] | None = None
-    experiment_review_status: str = "pending"
-    last_experiment_failure: dict[str, Any] | None = None
     experiment_expansion_requested: bool = False
     experiment_expansion_count: int = 0
     experiment_completed_receipts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        value = asdict(self)
-        if self.review is not None:
-            value["review"] = self.review.to_dict()
-        return value
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> WorkflowState:
-        fields = {name: value[name] for name in cls.__dataclass_fields__
-                  if name in value and name != "review"}
-        review = value.get("review")
-        fields["review"] = ReviewResult(**review) if isinstance(review, dict) else None
-        if "failed_node" not in value and value.get("status") == "failed":
-            node = value.get("current_node")
-            if str(value.get("error", "")).startswith(f"node {node} failed:"):
-                fields["failed_node"] = node
-        return cls(**fields)
+        # Checkpoints from the former review/idea-selection workflow remain
+        # resumable. Ignore only retired fields; keep rejecting unknown schema
+        # errors instead of silently dropping arbitrary state.
+        retired = {
+            "review", "experiment_review_status", "revision_count",
+            "idea_candidates", "selected_idea", "last_experiment_failure",
+        }
+        return cls(**{key: item for key, item in value.items() if key not in retired})
 
 
 @dataclass(frozen=True)
 class WorkflowConfig:
     """Routing and retry limits for the research-to-paper workflow."""
 
-    start_node: str = "ideas"
-    min_proceed_score: float = 7.0
-    min_revision_score: float = 5.0
-    max_revisions: int = 1
+    start_node: str = "literature"
     max_node_steps_per_run: int | None = None
-    max_paper_review_rounds: int = 2
-    max_artifact_repairs: int = 2
     max_experiment_repairs: int = 3
-    arxiv_download: bool = True
-    arxiv_max_download: int = 5
-    arxiv_read_pages: int = 3
 
 
 @dataclass(frozen=True)
@@ -169,35 +111,20 @@ class WorkflowRunner:
     def __init__(self, agent: PhaseAgent, *, config: WorkflowConfig | None = None,
                  idea_config: IdeaNodeConfig | None = None,
                  run_id: str | None = None,
-                 reviewer: Any | None = None,
-                 code_reviewer: Any | None = None,
                  on_node_start: Callable[[str, WorkflowState], None] | None = None,
                  on_node_end: Callable[[str, WorkflowState, NodeResult], None] | None = None,
                  on_node_progress: Callable[[str, WorkflowState, dict[str, Any]], None] | None = None):
         self.agent = agent
-        # Retain legacy review integrations for compatibility; no active node invokes them.
-        self.reviewer = reviewer
-        self.code_reviewer = code_reviewer
-        # Production phase-agent runs begin with the explicit literature phase;
-        # lightweight doubles retain the historical ideas entry point.
-        self.config = config or WorkflowConfig(
-            start_node="literature" if isinstance(agent, PhaseAgent) else "ideas")
+        self.experiments = ExperimentExecutor(agent.project, knowledge_root=getattr(agent, "knowledge_root", None))
+        self.config = config or WorkflowConfig()
         self.idea_config = idea_config or IdeaNodeConfig()
         if not math.isfinite(self.idea_config.max_total_gpu_hours) or self.idea_config.max_total_gpu_hours <= 0:
             raise ValueError("max_total_gpu_hours must be a finite positive number")
         if type(self.idea_config.search_paper_number) is not int or not 1 <= self.idea_config.search_paper_number <= 50:
             raise ValueError("search_paper_number must be between 1 and 50")
-        if self.config.max_revisions < 0:
-            raise ValueError("max_revisions must be nonnegative")
         if self.config.max_node_steps_per_run is not None and self.config.max_node_steps_per_run < 1:
             raise ValueError("max_node_steps_per_run must be positive")
-        if self.config.max_paper_review_rounds < 1:
-            raise ValueError("max_paper_review_rounds must be at least 1")
-        if not 1 <= self.config.arxiv_max_download <= 50:
-            raise ValueError("arxiv_max_download must be between 1 and 50")
-        if not 1 <= self.config.arxiv_read_pages <= 10:
-            raise ValueError("arxiv_read_pages must be between 1 and 10")
-        for name in ("max_artifact_repairs", "max_experiment_repairs"):
+        for name in ("max_experiment_repairs",):
             value = getattr(self.config, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
@@ -205,19 +132,14 @@ class WorkflowRunner:
         self.on_node_start = on_node_start
         self.on_node_end = on_node_end
         self.on_node_progress = on_node_progress
-        self._ideas_research: dict[str, Any] | None = None
-        self._ideas_research_key: tuple[str, str, int] | None = None
         self.require_image_figure = os.environ.get(
             "PAPER_AGENT_ENABLE_IMAGE_FIGURE", "").lower() in {"1", "true", "yes"}
         self._nodes: dict[str, Callable[[WorkflowState, str], NodeResult]] = {
             "literature": self._run_literature,
             "ideas": self._run_ideas,
-            "novelty": self._run_novelty,
             "refine": self._run_refine,
             "experiment_plan": self._run_experiment_plan,
             "experiment_bridge": self._run_experiment_bridge,
-            "experiment_check": self._run_experiment_check,
-            "experiment_run": self._run_experiment_run,
             "paper_plan": self._run_paper_plan,
             "paper_figure": self._run_paper_figure,
             "paper_write": self._run_paper_write,
@@ -233,29 +155,25 @@ class WorkflowRunner:
                                        task_prompt=prompt)
         if not state.task_prompt:
             state.task_prompt = prompt
-        # Resume old checkpoints through the main-agent path without review gates.
-        removed_nodes = {"review": "refine", "experiment_code_review": "experiment_check",
-                         "auto_paper_improvement_loop": "paper_compile"}
-        if state.current_node in removed_nodes:
-            state.current_node = removed_nodes[state.current_node]
-            if state.status in {"review_failed", "rejected"}:
-                state.status = "running"
-                state.error = None
         if state.status == "awaiting_results":
             state.status = "running"
             state.error = None
         if state.status != "running":
             return state
 
-        # Guard accidental routing loops within this invocation only. Scientific
-        # revisions have their own limit; prior successful runs cost no budget.
+        # Old checkpoints resume under the bridge that now owns execution.
+        if state.current_node in {"experiment_check", "experiment_run"}:
+            state.current_node = "experiment_bridge"
+        # A checkpoint paused at the removed novelty node continues with the idea.
+        if state.current_node == "novelty":
+            state.current_node = "refine"
+
+        # Guard routing loops within this invocation; prior runs cost no budget.
         steps_this_run = 0
+        # Experiment repair/expansion now happens inside the bridge tool loop.
         step_limit = self.config.max_node_steps_per_run or (
-            len(self._nodes) * (self.config.max_revisions + 1) + 4 * self.config.max_experiment_repairs)
+            len(self._nodes) + 6 + 4 * self.config.max_experiment_repairs)
         while state.status == "running":
-            if (state.experiment_feedback and state.current_node in {
-                    "experiment_check", "experiment_run"}):
-                state.current_node = "experiment_bridge"
             if steps_this_run >= step_limit:
                 return self._fail(state, "workflow exceeded max_node_steps_per_run")
             handler = self._nodes.get(state.current_node)
@@ -269,50 +187,20 @@ class WorkflowRunner:
             try:
                 if self.on_node_start:
                     self.on_node_start(node, state)
-                result = self._run_with_repairs(node, handler, state, prompt + "\n\n" + compute_context(self._project))
+                result = handler(state, prompt)
             except AwaitingResults as exc:
                 state.status = "awaiting_results"
                 state.error = str(exc)
                 return state
-            except ExperimentExpansionRequired as exc:
-                state.experiment_expansion_requested = True
-                state.current_node = "experiment_bridge"
-                state.error = str(exc)
-                continue
-            except (ExperimentExecutionError, ExperimentCodeRejected) as exc:
-                try:
-                    self._queue_experiment_repair(state, node, exc)
-                except Exception as repair_error:
-                    state.failed_node = node
-                    if isinstance(exc, ExperimentCodeRejected):
-                        state.status = "rejected"
-                        state.error = str(repair_error)
-                        return state
-                    return self._fail(state, str(repair_error))
-                continue
             except Exception as exc:
                 state.failed_node = node
-                if node == "experiment_code_review":
-                    state.experiment_review_status = "incomplete"
-                    state.status = "review_failed"
-                    state.error = f"node {node} failed: {exc}"
-                    return state
-                if node == "auto_paper_improvement_loop" and state.paper_status == "pdf_ready":
-                    state.paper_status = "review_failed"
-                    state.status = "review_failed"
-                    state.error = f"node {node} failed: {exc}"
-                    return state
                 return self._fail(state, f"node {node} failed: {exc}")
             state.artifacts[node] = result.artifact
             state.node_results[node] = {
                 "artifact": result.artifact,
                 **result.metadata,
             }
-            # PhaseAgent is its own runtime.  Keep the ``app`` fallback for
-            # lightweight test doubles and older integrations.
             messages = getattr(self.agent, "last_state", None)
-            if messages is None:
-                messages = getattr(getattr(self.agent, "app", None), "last_state", None)
             if messages is not None:
                 state.node_results[node]["tool_calls"] = [
                     message.get("name") for message in getattr(messages, "messages", [])
@@ -344,55 +232,40 @@ class WorkflowRunner:
                 self.on_node_end(node, state, result)
         return state
 
-    def _repair_snapshot(self) -> dict[str, str]:
-        # Code, plans and configs only; logs/results must not count as progress.
-        excluded = {"results", "smoke-results", "experiment-runs", ".paper-agent",
-                    "research-wiki", ".git", ".venv", "__pycache__", "data"}
-        return {str(p.relative_to(self._project)): hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in self._project.rglob("*")
-                if not any(part in excluded for part in p.relative_to(self._project).parts)
-                and p.is_file() and not p.is_symlink()
-                and p.suffix in {".py", ".json", ".yaml", ".yml", ".toml", ".md", ".tex"}
-                and not p.name.startswith("workflow-")}
 
-    def _record_repair(self, state: WorkflowState, node: str, kind: str,
-                       attempt: int, error: Exception) -> None:
-        entry = {"node": node, "kind": kind, "attempt": attempt, "error": str(error),
-                 "timestamp": datetime.now(timezone.utc).isoformat()}
-        state.history.append(entry)
-        state.fault_retry_count += 1
-        directory = self._project / ".paper-agent" / "repairs"
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"{uuid.uuid4().hex}.json").write_text(
-            json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
-        if self.on_node_start:
-            self.on_node_start(node, state)  # checkpoint repair intent before calling model
+    def _go(self, prompt: str, *, phase: str,
+            completion_check: Callable[[], None] | None = None):
+        check = completion_check or (lambda: self._validate_phase_outputs(phase))
+        return self.agent.go(prompt, phase=phase, completion_check=check)
 
-    def _run_with_repairs(self, node, handler, state, prompt):
-        artifact_attempts = 0
-        previous_failure = None
-        feedback = ""
-        repairable = {"novelty", "refine", "experiment_plan", "experiment_bridge",
-                      "paper_plan", "paper_figure", "paper_write"}
-        while True:
+    def _validate_phase_outputs(self, phase: str) -> None:
+        required = {
+            "literature": ["literature/RESEARCH_REPORT.md"],
+            "ideas": ["idea-stage/IDEA_REPORT.md"],
+            "novelty": ["idea-stage/NOVELTY.json"],
+            "research_refine": ["refine-logs/FINAL_PROPOSAL.md"],
+            "experiment_plan": ["refine-logs/EXPERIMENT_PLAN.md", "refine-logs/EXPERIMENT_TRACKER.md"],
+            "paper_plan": ["PAPER_PLAN.md"],
+            "paper_figure": ["figures/latex_includes.tex", "figures/figure_plan.md", "figures/figure_captions.md"],
+            "paper_write": ["paper/main.tex", "paper/references.bib"],
+        }
+        self._validate_required_artifacts(required.get(phase, []))
+        if phase == "novelty":
             try:
-                return handler(state, prompt + feedback)
-            except ArtifactValidationError as exc:
-                if node not in repairable or artifact_attempts >= self.config.max_artifact_repairs:
-                    raise
-                fingerprint = (str(exc), self._repair_snapshot())
-                if fingerprint == previous_failure:
-                    raise RuntimeError(f"Artifact repair made no progress: {exc}") from exc
-                previous_failure = fingerprint
-                artifact_attempts += 1
-                self._record_repair(state, node, "artifact_repair", artifact_attempts, exc)
-                feedback = (
-                    f"\n\nRunner validation failed (repair {artifact_attempts}/"
-                    f"{self.config.max_artifact_repairs}): {exc}\n"
-                    "Correct the generated artifact using the existing evidence. Preserve the task, "
-                    "scientific requirements, source datasets, measurements and user resource settings. "
-                    "Do not weaken checks or invent missing evidence. The runner will validate again."
-                )
+                payload = json.loads(self._require_file("idea-stage/NOVELTY.json").read_text(encoding="utf-8"))
+            except (ValueError, UnicodeError) as exc:
+                raise ArtifactValidationError(f"NOVELTY.json is not valid JSON: {exc}") from exc
+            self._validate_novelty_json(payload)
+        elif phase == "experiment_bridge":
+            self._experiment_manifest()
+        elif phase == "paper_figure":
+            messages = getattr(self.agent.last_state, "messages", [])
+            self._figure_receipts(messages)
+            self._figure_visual_checks(messages)
+        elif phase == "paper_write":
+            sections = (self._project / "paper/sections").glob("*.tex")
+            if not any(path.is_file() and path.read_text(encoding="utf-8").strip() for path in sections):
+                raise ArtifactValidationError("paper/sections/ requires a nonempty TeX section")
 
     def _experiment_evidence_snapshot(self):
         paths = set()
@@ -402,32 +275,11 @@ class WorkflowRunner:
         return {str(p.relative_to(self._project)): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in paths}
 
-    def _queue_experiment_repair(self, state, node, error):
-        """Persist feedback and route to bridge; never call an agent or run a job here."""
-        if node not in {"experiment_code_review", "experiment_check", "experiment_run"}:
-            raise error
-        if state.experiment_repair_count >= self.config.max_experiment_repairs:
-            raise RuntimeError(f"Experiment repair limit reached: {error}") from error
-        fingerprint = {"error": str(error).split("; log:")[0], "code": self._repair_snapshot()}
-        if isinstance(error, ExperimentExecutionError) and fingerprint == state.last_experiment_failure:
-            raise RuntimeError(f"Experiment repair made no progress: {error}") from error
-        state.last_experiment_failure = fingerprint
-        state.experiment_repair_count += 1
-        state.experiment_feedback = {
-            "source_node": node, "error": str(error), "attempt": state.experiment_repair_count,
-            "protected_evidence": self._experiment_evidence_snapshot(),
-            "manifest": self._experiment_manifest() if isinstance(error, ExperimentExecutionError) else None,
-        }
-        for stale in ("experiment_code_review", "experiment_check", "experiment_run"):
-            state.node_results.pop(stale, None)
-            state.artifacts.pop(stale, None)
-        state.experiment_review_status = "pending"
-        state.current_node = "experiment_bridge"
-        self._record_repair(state, node, "experiment_repair", state.experiment_repair_count, error)
-
     def start_from_project(self, node: str, prompt: str,
                            state: WorkflowState | None = None) -> WorkflowState:
         """Prepare an explicit entry point from durable outputs, checking its inputs."""
+        if node in {"experiment_check", "experiment_run"}:
+            node = "experiment_bridge"
         if node not in self._nodes:
             raise ValueError(f"unknown workflow node: {node}")
         if state is None:
@@ -436,12 +288,10 @@ class WorkflowRunner:
             raise ValueError("saved workflow task differs from the supplied prompt")
         required = {
             "ideas": ["literature/RESEARCH_REPORT.md"],
-            "novelty": ["idea-stage/IDEA_REPORT.md"],
-            "refine": ["idea-stage/IDEA_REPORT.md", "idea-stage/NOVELTY.json"],
+            "refine": ["idea-stage/IDEA_REPORT.md"],
             "experiment_plan": ["refine-logs/FINAL_PROPOSAL.md"],
             "experiment_bridge": ["refine-logs/FINAL_PROPOSAL.md", "refine-logs/EXPERIMENT_PLAN.md",
                                    "refine-logs/EXPERIMENT_TRACKER.md"],
-            "experiment_check": ["experiments/manifest.json"],
             "paper_plan": ["refine-logs/FINAL_PROPOSAL.md",
                            "refine-logs/EXPERIMENT_PLAN.md"],
             "paper_figure": ["PAPER_PLAN.md"],
@@ -450,16 +300,8 @@ class WorkflowRunner:
         }
         for relative in required.get(node, []):
             self._require_file(relative)
-        if node == "experiment_run":
-            if "experiment_check" not in state.node_results:
-                raise ValueError("experiment_run requires a saved experiment_check result; start at experiment_check")
-            smoke = state.node_results["experiment_check"].get("smoke", {})
-            if smoke.get("status") != "completed":
-                raise ValueError("experiment_run requires a completed smoke-test receipt")
-        if node in {"novelty", "refine"}:
-            state.artifacts["ideas"] = self._require_file("idea-stage/IDEA_REPORT.md").read_text(encoding="utf-8")
         if node == "refine":
-            state.artifacts["novelty"] = self._require_file("idea-stage/NOVELTY.json").read_text(encoding="utf-8")
+            state.artifacts["ideas"] = self._require_file("idea-stage/IDEA_REPORT.md").read_text(encoding="utf-8")
         state.task_prompt = prompt
         state.current_node = node
         state.status = "running"
@@ -468,12 +310,11 @@ class WorkflowRunner:
 
     def _research_context(self, query: str, *, stage: str, max_results: int = 5) -> dict[str, Any]:
         """Read bounded source material before an idea or experiment-plan phase."""
-        if not isinstance(self.agent, PhaseAgent):
-            return {}
         project = self._project
         context: dict[str, Any] = {"wiki": {"status": "unavailable"}}
         tool_ctx = ToolContext(project)
-        wiki_root = project / "research-wiki"
+        wiki_root = resolve_wiki_root()
+        context["wiki"]["root"] = str(wiki_root)
         if wiki_root.is_dir():
             pages = []
             seen = set()
@@ -488,7 +329,9 @@ class WorkflowRunner:
                     raise ValueError(result.output)
                 for match in json.loads(result.output)["matches"]:
                     path = Path(match["path"])
-                    relative = path.relative_to("research-wiki").as_posix()
+                    if not path.is_absolute():
+                        path = project / path
+                    relative = path.resolve().relative_to(wiki_root).as_posix()
                     if relative not in seen and path.parent.name in {"papers", "ideas", "experiments", "claims"}:
                         seen.add(relative)
                         pages.append(relative)
@@ -497,7 +340,7 @@ class WorkflowRunner:
             records = []
             for relative in pages[:7]:
                 try:
-                    result = read_wiki(tool_ctx, path=f"research-wiki/{relative}", limit=220)
+                    result = read_wiki(tool_ctx, path=str(wiki_root / relative), limit=220)
                     if result.is_error:
                         raise ValueError(result.output)
                     payload = json.loads(result.output)
@@ -507,7 +350,7 @@ class WorkflowRunner:
                     errors.append(f"{relative}: {exc}")
             context["wiki"] = {"status": "partial" if errors and records else
                                "read" if records else "read_failed" if errors else "empty",
-                               "pages": records, "errors": errors}
+                               "pages": records, "errors": errors, "root": str(wiki_root)}
 
         if stage in {"ideas", "literature"}:
             try:
@@ -561,7 +404,7 @@ class WorkflowRunner:
         return context
 
     def _literature_inputs(self, ctx: ToolContext, query: str) -> dict[str, Any]:
-        """Perform the baseline PDF screening before asking the model to synthesize."""
+        """Screen existing local PDFs before asking the model to synthesize."""
         def payload(result):
             if result.is_error:
                 raise ValueError(result.output)
@@ -591,38 +434,7 @@ class WorkflowRunner:
         local = {"status": "partial" if errors and records else "read" if records else
                  "read_failed" if errors else "empty", "found": found,
                  "papers": records, "errors": errors}
-        arxiv: dict[str, Any] = {"status": "disabled", "papers": [], "errors": []}
-        if self.config.arxiv_download:
-            records, errors = [], []
-            candidates = []
-            try:
-                search = payload(search_papers(ctx, query=query[:500], source="arxiv",
-                                              max_results=self.config.arxiv_max_download))
-                candidates = search["papers"][:self.config.arxiv_max_download]
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                errors.append(f"search: {exc}")
-            seen = set()
-            for paper in candidates:
-                record = dict(paper)
-                try:
-                    download = payload(download_arxiv_paper(ctx, url=paper["url"]))
-                    if download["arxiv_id"] in seen:
-                        continue
-                    seen.add(download["arxiv_id"])
-                    record["download"] = download
-                    record["reading"] = screen(download["path"], self.config.arxiv_read_pages)
-                    record["status"] = "read"
-                except (OSError, ValueError, KeyError, TypeError) as exc:
-                    record["status"] = "read_failed" if "download" in record else "download_failed"
-                    record["error"] = str(exc)
-                    errors.append(f"{paper.get('url')}: {exc}")
-                records.append(record)
-            successful = sum(record.get("status") == "read" for record in records)
-            arxiv = {"status": "partial" if errors and successful else "read" if successful else
-                     "failed" if errors else "empty", "papers": records, "errors": errors,
-                     "selection": "arxiv API relevance order", "max_download": self.config.arxiv_max_download,
-                     "read_pages": self.config.arxiv_read_pages}
-        return {"local_papers": local, "arxiv_papers": arxiv}
+        return {"local_papers": local}
 
     def _run_ideas(self, state: WorkflowState, prompt: str, *,
                    max_total_gpu_hours: float | None = None,
@@ -639,17 +451,13 @@ class WorkflowRunner:
         literature = self._require_file(literature_path).read_text(encoding="utf-8")
         if not literature.strip():
             raise ValueError(f"{literature_path} is empty")
-        research_key = (state.run_id, prompt, search_paper_number)
-        if self._ideas_research is None or self._ideas_research_key != research_key:
-            self._ideas_research = self._research_context(
-                prompt, stage="ideas", max_results=search_paper_number)
-            self._ideas_research_key = research_key
-        research = self._ideas_research
+        research = self._research_context(
+            prompt, stage="ideas", max_results=search_paper_number)
         instruction = (
             "Generate a concrete, falsifiable research idea and preserve it as a project artifact. "
             "Write a complete standalone report; do not describe the generation or revision process."
         )
-        result = self.agent.go(
+        result = self._go(
             f"Original task:\n{prompt}\n\nCurrent node task:\n{instruction}\n"
             f"Idea node parameters:\nMAX_TOTAL_GPU_HOURS={max_total_gpu_hours:g}; "
             f"SEARCH_PAPER_NUMBER={search_paper_number}. "
@@ -663,18 +471,7 @@ class WorkflowRunner:
         idea = self._require_file("idea-stage/IDEA_REPORT.md").read_text(encoding="utf-8")
         if not idea.strip():
             raise ValueError("idea-stage/IDEA_REPORT.md is empty")
-        # The canonical file is the hand-off path used by later nodes. Keep an
-        # immutable, numbered copy as well so each generated idea remains
-        # independently reviewable and can be restored after ranking.
-        version_path = self._save_idea_version(state.revision_count, idea)
-        messages = getattr(result, "messages", ())
-        successful = {message.get("name") for message in messages
-                      if message.get("role") == "tool" and not message.get("is_error")}
-        if "search_papers" in successful and "verify_papers" not in successful:
-            raise ValueError("ideas used search_papers without a successful verify_papers call")
         return NodeResult(idea, {"phase": "ideas", "iterations": result.iterations,
-                                        "revision": state.revision_count,
-                                        "version_path": str(version_path.relative_to(self._project)),
                                         "canonical_path": "idea-stage/IDEA_REPORT.md",
                                         "literature_source": literature_path,
                                         "literature_sha256": hashlib.sha256(literature.encode("utf-8")).hexdigest(),
@@ -683,13 +480,6 @@ class WorkflowRunner:
                                             "search_paper_number": search_paper_number},
                                         "research_sources": self._research_sources(research)})
 
-    def _save_idea_version(self, revision: int, idea: str) -> Path:
-        """Persist a numbered idea snapshot while retaining the canonical hand-off."""
-        versions = self._project / "idea-stage" / "revisions"
-        versions.mkdir(parents=True, exist_ok=True)
-        target = versions / f"IDEA_REPORT.v{revision}.md"
-        target.write_text(idea, encoding="utf-8")
-        return target
 
     @staticmethod
     def _research_sources(research: dict[str, Any]) -> dict[str, Any]:
@@ -699,220 +489,28 @@ class WorkflowRunner:
                               for paper in research.get("online_papers", {}).get("papers", [])],
             "battery_resources": [item["resource_id"] for item in
                                   research.get("battery_resources", {}).get("resources", [])],
-            **({"local_papers": [paper["path"] for paper in research["local_papers"]["papers"]],
-                "arxiv_papers": [paper["download"]["path"] for paper in research["arxiv_papers"]["papers"]
-                                 if "download" in paper]} if "local_papers" in research else {}),
+            **({"local_papers": [paper["path"] for paper in research["local_papers"]["papers"]]}
+               if "local_papers" in research else {}),
             "status": {name: value.get("status") for name, value in research.items()},
         }
 
     def _run_literature(self, state: WorkflowState, prompt: str) -> NodeResult:
         """Collect bounded literature context; the phase agent owns interpretation."""
         research = self._research_context(prompt, stage="literature")
-        result = self.agent.go(
+        result = self._go(
             "Research task:\n" + prompt + "\nRunner-collected literature context:\n" +
             json.dumps(research, ensure_ascii=False), phase="literature"
         )
-        target = self._project / "literature/RESEARCH_REPORT.md"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # The literature skill may write the report through the `write` tool
-        # before returning a short completion message. Preserve that artifact;
-        # only use the final model text when this run did not write the target.
-        target_written = any(
-            message.get("role") == "tool"
-            and message.get("name") in {"write", "edit"}
-            and not message.get("is_error")
-            and "literature/RESEARCH_REPORT.md" in str(message.get("content", ""))
-            for message in getattr(result, "messages", ())
-        )
-        if target_written and target.is_file():
-            report = target.read_text(encoding="utf-8")
-        else:
-            report = result.final
-            target.write_text(report, encoding="utf-8")
+        report = self._require_file("literature/RESEARCH_REPORT.md").read_text(encoding="utf-8")
         return NodeResult(report, {"phase": "literature", "iterations": result.iterations,
                                    "research_sources": self._research_sources(research)})
 
-    def _run_review(self, state: WorkflowState, prompt: str) -> NodeResult:
-        idea = self._require_file("idea-stage/IDEA_REPORT.md").read_text(encoding="utf-8")
-        novelty = self._require_file("idea-stage/NOVELTY.json").read_text(encoding="utf-8")
-        if not idea.strip():
-            raise ValueError("idea-stage/IDEA_REPORT.md is empty")
-        self._validate_novelty_json(json.loads(novelty))
-        state.artifacts["ideas"] = idea
-        state.artifacts["novelty"] = novelty
-        review_boundary = (
-            "Review the idea, its internal logic, novelty evidence, and validation plan. "
-            "The idea phase does not fully audit real datasets; lack of completed data auditing "
-            "or experiment results alone is not a BLOCKER or required idea revision. "
-            "Record unverified data conditions as pre-experiment checks. Do not include strengths.\n\n"
-        )
-        # Compatibility hook for lightweight test/embedding agents. Production
-        # PhaseAgent instances always use the normal review phase below.
-        if self.reviewer is not None and not isinstance(self.agent, PhaseAgent):
-            review_prompt = (
-                review_boundary + "You are an independent scientific idea reviewer. Return ONLY valid JSON with score, verdict, confidence, summary, "
-                "critical_issues, minimum_next_steps, and novelty_assessment.\n\n"
-                f"Original task:\n{prompt}\n\nCurrent idea artifact:\n{idea}"
-                f"\n\nNovelty assessment:\n{novelty}"
-            )
-            try:
-                payload = self.reviewer.review(self.agent.project, review_prompt)
-                content = payload.get("content", "")
-                if not isinstance(content, str):
-                    raise RuntimeError("reviewer returned no text content")
-                review = parse_review_result(type("ReviewResponse", (), {
-                    "final": content, "messages": []
-                })())
-                return self._record_idea_review(state, review, content, "custom-reviewer",
-                                                thread_id=payload.get("threadId"))
-            except Exception as exc:
-                fallback = self.agent.go(
-                    review_boundary + f"Return ONLY valid JSON with score, verdict, confidence, summary, "
-                    f"critical_issues, minimum_next_steps, and novelty_assessment.\n\n"
-                    f"Original task:\n{prompt}\n\nCurrent idea artifact:\n{idea}"
-                    f"\n\nNovelty assessment:\n{novelty}",
-                    phase="review")
-                review = parse_review_result(fallback)
-                return self._record_idea_review(state, review, fallback.final,
-                                                "local-fallback", fallback_reason=str(exc))
-        result = self.agent.go(
-            review_boundary + f"Original task:\n{prompt}\n\nCurrent idea artifact:\n{idea}\n\n"
-            f"Novelty assessment:\n{novelty}",
-            phase="review",
-        )
-        review = parse_review_result(result)
-        return self._record_idea_review(state, review, result.final, "agent-review")
-
-    def _record_idea_review(self, state: WorkflowState, review: ReviewResult,
-                            content: str, provider: str, **metadata: Any) -> NodeResult:
-        state.review = review
-        idea = self._require_file("idea-stage/IDEA_REPORT.md").read_text(encoding="utf-8")
-        if review.score is not None and not review.parse_error:
-            version_path = self._project / "idea-stage" / "revisions" / \
-                f"IDEA_REPORT.v{state.revision_count}.md"
-            state.idea_candidates.append({"revision": state.revision_count,
-                                          "idea": idea, "review": review.to_dict(),
-                                          "version_path": str(version_path.relative_to(self._project))
-                                          if version_path.is_file() else None,
-                                          "provider": provider, **metadata})
-        # The review skill's durable contract is established at the review
-        # node itself. Later nodes may update selected_idea/candidates, but
-        # Starting at refine must already have a valid REVIEW.json.
-        review_path = self._project / "idea-stage/REVIEW.json"
-        review_path.parent.mkdir(parents=True, exist_ok=True)
-        review_path.write_text(
-            json.dumps({"review": review.to_dict(),
-                        "selected_idea": None,
-                        "candidates": state.idea_candidates},
-                       ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        readable = self._format_review_markdown(review, content)
-        (self._project / "idea-stage/REVIEW.md").write_text(readable, encoding="utf-8")
-        if review.parse_error or review.score is None:
-            raise ValueError(f"invalid idea review: {review.parse_error or 'missing score'}")
-        return NodeResult(content, {"phase": "review", "review": review.to_dict(),
-                                    "provider": provider, **metadata})
-
-    @staticmethod
-    def _format_review_markdown(review: ReviewResult, content: str) -> str:
-        """Persist the review as a researcher-readable improvement memo."""
-        payload = review.details
-        lines = ["# 研究方案评审与改进意见", "",
-                 f"- 评分：{review.score if review.score is not None else '未知'} / 10",
-                 f"- 结论：{review.verdict or '未知'}",
-                 f"- 评审模型：{review.reviewer_model or 'unknown'}", ""]
-        if payload:
-            sections = (("总评", "summary"),
-                        ("维度评分", "dimension_scores"),
-                        ("关键问题", "critical_issues"),
-                        ("必须修改", "required_changes"),
-                        ("必需修改与最小验证", "minimum_next_steps"),
-                        ("新颖性判断", "novelty_assessment"),
-                        ("证据缺口", "evidence_gaps"))
-            for title, key in sections:
-                value = payload.get(key)
-                if not value and key not in {"dimension_scores", "required_changes"}:
-                    continue
-                lines.extend([f"## {title}", ""])
-                if not value and key == "dimension_scores":
-                    lines.extend(["评审未提供三个独立维度评分。", ""])
-                    continue
-                if not value and key == "required_changes":
-                    lines.extend(["评审未提供必需修改清单。", ""])
-                    continue
-                if isinstance(value, list):
-                    for item in value:
-                        if isinstance(item, dict):
-                            severity = item.get("severity", "")
-                            issue = item.get("issue", "")
-                            evidence = item.get("evidence", "")
-                            change = item.get("required_change", "")
-                            test = item.get("resolution_test", "")
-                            text = f"**{severity}** {issue}" if severity else issue
-                            if evidence:
-                                text += f"\n证据：{evidence}"
-                            if change:
-                                text += f"\n必需修改：{change}"
-                            if test:
-                                text += f"\n最小验证：{test}"
-                            lines.extend([f"- {text}", ""])
-                        else:
-                            lines.extend([f"- {item}", ""])
-                elif isinstance(value, dict):
-                    labels = {
-                        "problem_importance": "解决问题的重要性",
-                        "method_novelty": "使用方法的新颖性",
-                        "method_soundness": "所提出方法的合理性",
-                    }
-                    for dimension, result in value.items():
-                        if isinstance(result, dict):
-                            score = result.get("score", "未知")
-                            assessment = result.get("assessment", "")
-                            text = f"**{labels.get(dimension, dimension)}：{score} / 10**"
-                            if assessment:
-                                text += f"\n{assessment}"
-                            lines.extend([f"- {text}", ""])
-                        else:
-                            lines.extend([f"- **{labels.get(dimension, dimension)}**：{result}", ""])
-                else:
-                    lines.extend([str(value), ""])
-            return "\n".join(lines).rstrip() + "\n"
-        lines.extend(["## 批判性与建设性意见", "", content.strip(), ""])
-        return "\n".join(lines)
-
-    def _select_best_idea(self, state: WorkflowState) -> None:
-        if not state.idea_candidates:
-            raise ValueError("no idea has a valid scored review")
-        best = max(state.idea_candidates, key=lambda item: item["review"]["score"])
-        idea = best["idea"]
-        (self._project / "idea-stage/IDEA_REPORT.md").write_text(idea, encoding="utf-8")
-        state.artifacts["ideas"] = idea
-        state.review = ReviewResult(**best["review"])
-        state.selected_idea = {"revision": best["revision"],
-                               "score": state.review.score, "provider": best["provider"],
-                               "version_path": best.get("version_path")}
-        (self._project / "idea-stage/REVIEW.json").write_text(
-            json.dumps({"review": state.review.to_dict(), "selected_idea": state.selected_idea,
-                        "candidates": state.idea_candidates}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8")
-
-    @staticmethod
-    def _normalize_novelty_json(payload: Any) -> Any:
-        """Accept the legacy idea label, but emit only the current field name."""
-        if not isinstance(payload, dict):
-            return payload
-        normalized = dict(payload)
-        if "idea_under_review" in normalized:
-            normalized.setdefault("idea_under_check", normalized.pop("idea_under_review"))
-        return normalized
 
     @staticmethod
     @artifact_contract
     def _validate_novelty_json(payload: dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             raise ValueError("NOVELTY.json must be an object")
-        payload = WorkflowRunner._normalize_novelty_json(payload)
         required = ("schema_version", "idea_under_check", "core_claims",
                     "closest_competing_work", "novelty_score", "verdict",
                     "positioning_recommendation", "unresolved_checks")
@@ -936,7 +534,6 @@ class WorkflowRunner:
 
     @staticmethod
     def _render_novelty_markdown(payload: dict[str, Any]) -> str:
-        payload = WorkflowRunner._normalize_novelty_json(payload)
         claims = "\n".join(f"{i}. {item}" for i, item in enumerate(payload["core_claims"], 1))
         work = "\n".join(f"- {item}" for item in payload["closest_competing_work"])
         checks = "\n".join(f"- {item}" for item in payload["unresolved_checks"])
@@ -948,12 +545,17 @@ class WorkflowRunner:
     def _run_novelty(self, state: WorkflowState, prompt: str) -> NodeResult:
         target = self._project / "idea-stage/NOVELTY.json"
         previous = target.read_text(encoding="utf-8") if target.is_file() else None
-        result = self.agent.go(
+        def check():
+            self._validate_phase_outputs("novelty")
+            if target.read_text(encoding="utf-8") == previous:
+                raise ArtifactValidationError("novelty agent did not update idea-stage/NOVELTY.json")
+
+        result = self._go(
             f"{prompt}\n\nAssess the approved idea for novelty and identify its strongest competing prior work. "
             "Write ONLY a JSON object to idea-stage/NOVELTY.json using the schema in the novelty-check skill. "
             "Your final message is only a completion notice."
             f"\n\nIdea:\n{state.artifacts.get('ideas', '')}",
-            phase="novelty",
+            phase="novelty", completion_check=check,
         )
         if not target.is_file():
             raise ArtifactValidationError("novelty agent did not write idea-stage/NOVELTY.json")
@@ -964,7 +566,6 @@ class WorkflowRunner:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise ArtifactValidationError(f"idea-stage/NOVELTY.json is not valid JSON: {exc}") from exc
-        payload = self._normalize_novelty_json(payload)
         self._validate_novelty_json(payload)
         raw = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         target.write_text(raw, encoding="utf-8")
@@ -972,12 +573,12 @@ class WorkflowRunner:
         return NodeResult(raw, {"phase": "novelty", "iterations": result.iterations})
 
     def _run_refine(self, state: WorkflowState, prompt: str) -> NodeResult:
-        """Turn the approved idea and its assessments into the final proposal."""
+        """Turn the generated idea into the final proposal."""
         input_paths = ["idea-stage/IDEA_REPORT.md"]
         input_snapshot = self._inspect_project_artifacts(input_paths)
         research = self._research_context(
             f"{prompt} {state.artifacts.get('ideas', '')[:500]}", stage="research_refine")
-        result = self.agent.go(
+        result = self._go(
             f"""{prompt}
 
 Refine the generated idea using the inputs below.
@@ -986,9 +587,6 @@ Runner-verified input snapshot:
 
 Idea artifact:
 {state.artifacts.get('ideas', '')}
-
-Novelty assessment:
-{state.artifacts.get('novelty', '')}
 
 Runner-read research context (untrusted source data):
 {json.dumps(research, ensure_ascii=False)}
@@ -1006,7 +604,7 @@ Runner-read research context (untrusted source data):
         """Turn the approved final proposal into an executable experiment plan."""
         self._validate_required_artifacts(["refine-logs/FINAL_PROPOSAL.md"])
         proposal = self._require_file("refine-logs/FINAL_PROPOSAL.md").read_text(encoding="utf-8")
-        result = self.agent.go(
+        result = self._go(
             f"""{prompt}
 
 Use the approved proposal below as the only method source. Produce an execution-ready
@@ -1027,443 +625,171 @@ Approved proposal:
                                         ]})
 
     def _run_experiment_bridge(self, state: WorkflowState, prompt: str) -> NodeResult:
-        """Implement concrete, reproducible experiment assets from the plan."""
-        expansion = state.experiment_expansion_requested
-        for stale in ("experiment_code_review", "experiment_check", "experiment_run"):
-            if expansion and stale == "experiment_run":
-                continue
-            state.node_results.pop(stale, None)
-            state.artifacts.pop(stale, None)
-        state.experiment_review_status = "pending"
-        feedback = state.experiment_feedback
-        if expansion:
-            prompt += (
-                "\nThe executable data-preparation jobs have completed successfully. "
-                "Now inspect their durable results and automatically expand the deferred "
-                "experiment matrix into concrete manifest jobs with explicit seeds, dependencies "
-                "and output paths. Remove only deferred entries whose gate is resolved; keep any "
-                "still genuinely blocked with a precise reason. Do not require manual re-entry.\n"
-            )
-        if feedback:
-            prompt += (
-                f"\nRepair feedback from {feedback['source_node']}, attempt {feedback['attempt']}/"
-                f"{self.config.max_experiment_repairs}:\n{feedback['error']}\n"
-                "Read the referenced output.log/status.json and fix the implementation. "
-                "Record each finding's resolution in experiments/README.md. Preserve experiment "
-                "design, source data, results, smoke-results, experiment-runs and user resource settings. "
-                "Do not run experiments; workflow will smoke-test and rerun jobs. "
-                + ("Preserve manifest; design/manifest changes require re-planning.\n"
-                   if feedback.get("manifest") is not None else "Keep manifest aligned with the existing plan.\n"))
-        self._validate_required_artifacts([
-            "refine-logs/FINAL_PROPOSAL.md",
-            "refine-logs/EXPERIMENT_PLAN.md",
-            "refine-logs/EXPERIMENT_TRACKER.md",
-        ])
-        plan = self._inspect_experiment_plan()
-        recovered = None
-        try:
-            result = self.agent.go(
-                f"{prompt}\nRunner-verified experiment plan context:\n{plan}",
-                phase="experiment_bridge")
-        except RuntimeError as exc:
-            recovered = self._recover_experiment_manifest(exc)
-            if recovered is None:
-                raise
-            result = None
-        if feedback:
-            if self._experiment_evidence_snapshot() != feedback["protected_evidence"]:
-                raise RuntimeError("Experiment repair modified protected evidence or resource settings")
-            if feedback.get("manifest") is not None:
-                try:
-                    unchanged = self._experiment_manifest() == feedback["manifest"]
-                except ArtifactValidationError as exc:
-                    raise RuntimeError("Experiment repair changed manifest; explicit re-planning is required") from exc
-                if not unchanged:
-                    raise RuntimeError("Experiment repair changed manifest; explicit re-planning is required")
-        self._experiment_manifest()
-        package_check = self._inspect_experiment_package()
-        metadata = {"phase": "experiment_bridge", "iterations": result.iterations if result else None,
-                                        "inputs": [
-                                            "refine-logs/FINAL_PROPOSAL.md",
-                                            "refine-logs/EXPERIMENT_PLAN.md",
-                                            "refine-logs/EXPERIMENT_TRACKER.md",
-                                        ], "package_check": package_check}
-        if recovered:
-            metadata["recovery"] = recovered
-        if feedback:
-            metadata["repair"] = {key: feedback[key] for key in ("source_node", "error", "attempt")}
-        if expansion:
-            state.experiment_expansion_requested = False
-            state.experiment_expansion_count += 1
-            metadata["expanded_after_data_preparation"] = True
-            metadata["expansion_count"] = state.experiment_expansion_count
-        state.experiment_feedback = None
-        return NodeResult(getattr(result, "final", "experiment package ready") if result else "experiment manifest recovered", metadata)
-
-    def _run_experiment_code_review(self, state: WorkflowState, prompt: str) -> NodeResult:
-        """Read-only independent review with durable raw responses and failure records."""
-        for stale in ("experiment_check", "experiment_run"):
-            state.node_results.pop(stale, None)
-            state.artifacts.pop(stale, None)
-        state.experiment_review_status = "pending"
+        """Own implementation, sanity, deployment, collection and plan reconciliation."""
         self._validate_required_artifacts([
             "refine-logs/FINAL_PROPOSAL.md", "refine-logs/EXPERIMENT_PLAN.md",
-            "refine-logs/EXPERIMENT_TRACKER.md", "experiments/manifest.json",
+            "refine-logs/EXPERIMENT_TRACKER.md",
         ])
-        self._experiment_manifest()
-        instructions = (Path(__file__).resolve().parents[1] / "skills" /
-                        "experiment-code-review" / "SKILL.md").read_text(encoding="utf-8")
-        directory = self._project / ".paper-agent" / "experiment-code-reviews" / uuid.uuid4().hex
-        directory.mkdir(parents=True)
-        record = {"status": "running", "repair_count": state.experiment_repair_count,
-                  "started_at": datetime.now(timezone.utc).isoformat()}
-        def save():
-            (directory / "review.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        save()
-        relative = str((directory / "review.json").relative_to(self._project))
-        state.experiment_review_status = "running"
-        state.node_results["experiment_code_review"] = {"artifact": relative, "status": "running"}
-        if self.on_node_progress:
-            self.on_node_progress("experiment_code_review", state,
-                                  {"round": state.experiment_repair_count, "stage": "review_started"})
+        checked_sources = None
+        executed_manifest = None
+        blocker = None
+        terminal_error = None
+        protected_evidence = (state.experiment_feedback or {}).get("protected_evidence")
+
+        def sources():
+            # Recheck smoke after executable edits, not result/report updates.
+            return {str(p): p.read_bytes() for p in (self._project / "experiments").rglob("*")
+                    if p.is_file() and p.suffix in {".py", ".sh", ".json", ".yaml", ".yml"}
+                    and p.name != "coverage.json"}
+
+        def checkpoint(stage):
+            if self.on_node_progress:
+                self.on_node_progress("experiment_bridge", state, {
+                    "round": state.experiment_repair_count, "stage": stage})
+
+        def execute(operation):
+            nonlocal checked_sources, executed_manifest, blocker, terminal_error, protected_evidence
+            if terminal_error is not None:
+                return ToolResult(str(terminal_error), True)
+            try:
+                if protected_evidence is not None:
+                    if self._experiment_evidence_snapshot() != protected_evidence:
+                        raise RuntimeError("Experiment repair modified protected evidence or resource settings")
+                    protected_evidence = None
+                    # Consume the guard durably before the runner writes new evidence.
+                    # A later model/API failure may resume this same bridge invocation.
+                    if state.experiment_feedback is not None:
+                        state.experiment_feedback.pop("protected_evidence", None)
+                manifest = self._experiment_manifest()
+                validate_coverage(self.experiments, state, manifest)
+                if operation == "check":
+                    executed_manifest = None
+                    checked_sources = None
+                    checkpoint("running_smoke")
+                    receipt = self._run_experiment_check(state, prompt)
+                    state.node_results["experiment_check"] = receipt.metadata
+                    checked_sources = sources()
+                    result = {"status": "completed", "smoke": receipt.metadata["smoke"]}
+                else:
+                    if checked_sources is None or checked_sources != sources():
+                        raise ArtifactValidationError("Call check_experiments after the latest code/manifest edits")
+                    self._checked_manifest(state)
+                    executed_manifest = None
+                    checkpoint("running_jobs")
+                    receipts = run_queue(self.experiments, state, manifest,
+                                         on_progress=lambda _node, _state, detail:
+                                         self.on_node_progress("experiment_bridge", state, detail)
+                                         if self.on_node_progress else None)
+                    executed_manifest = manifest
+                    result = {"status": "completed", "completed_jobs": len(receipts),
+                              "receipts": [{"id": r["job"]["id"], "status": r["status"],
+                                            "log": r["log"]} for r in receipts],
+                              "deferred_jobs": manifest.get("deferred_jobs", []),
+                              "next": "Read results, reconcile the original plan, update coverage/tracker and EXPERIMENT_RESULTS.md; implement missing required analyses and run again."}
+                blocker = None
+                checkpoint("smoke_completed" if operation == "check" else "results_ready")
+                return ToolResult(json.dumps(result, ensure_ascii=False))
+            except AwaitingResults as exc:
+                blocker = exc
+                checkpoint("awaiting_results")
+                return ToolResult(str(exc), True)
+            except ExperimentExecutionError as exc:
+                checked_sources = None
+                state.experiment_repair_count += 1
+                protected_evidence = self._experiment_evidence_snapshot()
+                state.experiment_feedback = {"source_node": "experiment_bridge", "error": str(exc),
+                                             "attempt": state.experiment_repair_count,
+                                             "protected_evidence": protected_evidence}
+                if state.experiment_repair_count > self.config.max_experiment_repairs:
+                    terminal_error = RuntimeError(f"Experiment repair limit reached: {exc}")
+                checkpoint("repair_required")
+                return ToolResult(str(terminal_error or exc) +
+                                  "; read the durable log, fix code, then check_experiments and run_experiments again.", True)
+            except (ValueError, RuntimeError) as exc:
+                if not isinstance(exc, (ValueError, ArtifactValidationError)):
+                    terminal_error = exc
+                return ToolResult(str(exc), True)
+
+        def check_experiments(ctx: ToolContext) -> ToolResult:
+            """Run the manifest smoke test before deployment; returns a real receipt/log. Recheck after code or manifest edits."""
+            return execute("check")
+
+        def run_experiments(ctx: ToolContext) -> ToolResult:
+            """Run checked manifest jobs through the resumable one-training-per-GPU queue. Waits for completion; model HTTP timeout does not limit jobs. Reuses completed jobs."""
+            return execute("run")
+
+        for handler in (check_experiments, run_experiments):
+            self.agent.add_tool(ToolSpec(handler.__name__, handler.__doc__, handler),
+                                phases=("experiment_bridge",))
+
+        def complete():
+            if terminal_error is not None:
+                raise terminal_error
+            if blocker is not None:
+                raise blocker
+            manifest = self._experiment_manifest()
+            if executed_manifest != manifest or checked_sources != sources():
+                raise ArtifactValidationError("Bridge must check and run the current implementation before handoff")
+            if manifest.get("deferred_jobs"):
+                raise ArtifactValidationError("Resolve deferred jobs from actual results before handoff")
+            validate_coverage(self.experiments, state, manifest, completed=True)
+            self._validate_required_artifacts(["refine-logs/EXPERIMENT_RESULTS.md",
+                                               "refine-logs/EXPERIMENT_TRACKER.md"])
+
+        feedback = {k: v for k, v in (state.experiment_feedback or {}).items()
+                    if k != "protected_evidence"}
         try:
-            repair = state.node_results.get("experiment_bridge", {}).get("repair")
-            brief = f"{instructions}\n\nResearch task and compute context:\n{prompt}"
-            if repair:
-                brief += "\n\nPrevious repair feedback (read the referenced record and verify the fix):\n" + json.dumps(repair, ensure_ascii=False)
-            payload = self.code_reviewer.review(self._project, brief)
-            record["response"] = payload
-            save()
-            raw = payload.get("content")
-            if not isinstance(raw, str) or not raw.strip():
-                raise ValueError("Code reviewer returned an empty response")
-            (directory / "response.txt").write_text(raw, encoding="utf-8")
-            normalized = raw.strip()
-            if normalized.startswith("```"):
-                normalized = re.sub(r"^```(?:json)?\s*|\s*```$", "", normalized)
-            review = json.loads(normalized)
-            if (not isinstance(review, dict) or type(review.get("accepted")) is not bool
-                    or not isinstance(review.get("summary"), str) or not review["summary"].strip()
-                    or not isinstance(review.get("findings"), list)):
-                raise ValueError("Code review requires accepted:boolean, summary:string and findings:list")
-            for finding in review["findings"]:
-                if (not isinstance(finding, dict) or finding.get("severity") not in {"blocker", "minor"}
-                        or any(not isinstance(finding.get(key), str) or not finding[key].strip()
-                               for key in ("file", "evidence", "suggestion"))
-                        or type(finding.get("line")) is not int or finding["line"] < 1):
-                    raise ValueError("Invalid code review finding: require severity, file, line, evidence, suggestion")
-            blockers = any(item["severity"] == "blocker" for item in review["findings"])
-            if review["accepted"] == blockers:
-                raise ValueError("Code review accepted verdict contradicts blocking findings")
-            record.update(status="completed", review=review)
-        except Exception as exc:
-            record.update(status="incomplete", error=str(exc))
-            state.experiment_review_status = "incomplete"
-            state.node_results["experiment_code_review"] = {"artifact": relative, "status": "incomplete", "error": str(exc)}
+            result = self._go(
+                f"{prompt}\nOwn the full experiment cycle: implement, check_experiments, run_experiments, "
+                "collect and reconcile every required plan item, then hand off to paper_plan. "
+                "Use skill(name='run-experiment') for the execution subskill. Do not launch training through bash. "
+                "Completed jobs are reusable; add missing postprocessing instead of retraining. "
+                "Write experiments/coverage.json before checking, update it from real results, and write "
+                "refine-logs/EXPERIMENT_RESULTS.md before finishing. Review the entire original plan, "
+                "not only manifest jobs or summary tables.\n"
+                f"Saved execution feedback: {json.dumps(feedback, ensure_ascii=False)}\n"
+                f"Runner-verified experiment plan context:\n{self._inspect_experiment_plan()}",
+                phase="experiment_bridge", completion_check=complete)
+        except Exception:
+            if terminal_error is not None:
+                raise terminal_error
+            if blocker is not None:
+                raise blocker
             raise
-        finally:
-            record["finished_at"] = datetime.now(timezone.utc).isoformat()
-            save()
-        state.experiment_review_status = "accepted" if review["accepted"] else "changes_requested"
-        metadata = {"status": state.experiment_review_status, "review": review}
-        state.node_results["experiment_code_review"] = {"artifact": relative, **metadata}
-        if not review["accepted"]:
-            state.history.append({"node": "experiment_code_review", "artifact": relative, **metadata})
-            raise ExperimentCodeRejected(f"Code review requires changes; read {relative}: {review['summary']}")
-        return NodeResult(relative, metadata)
+        complete()
+        state.experiment_feedback = None
+        state.experiment_expansion_requested = False
+        return NodeResult("refine-logs/EXPERIMENT_RESULTS.md", {
+            "phase": "experiment_bridge", "iterations": result.iterations,
+            "coverage": "experiments/coverage.json", "manifest": "experiments/manifest.json",
+            "completed_jobs": len(state.experiment_completed_receipts),
+        })
 
-    def _recover_experiment_manifest(self, error: RuntimeError) -> dict[str, Any] | None:
-        """Finish a manifest only after the experiment agent exhausts its tool budget."""
-        if not str(error).startswith("model exceeded max_iterations="):
-            return None
-        manifest_path = self._project / "experiments/manifest.json"
-        if manifest_path.is_file() and manifest_path.stat().st_size:
-            self._experiment_manifest()
-            return {"reason": str(error), "manifest_source": "existing"}
-
-        generator = self._project / "experiments/build_manifest.py"
-        if not generator.is_file():
-            return None
-        try:
-            completed = subprocess.run(
-                [sys.executable, str(generator)], cwd=self._project, text=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return None
-        if completed.returncode != 0:
-            return None
-        self._experiment_manifest()
-        return {"reason": str(error), "manifest_source": "experiments/build_manifest.py"}
-
-    def _experiment_path(self, relative: str) -> Path:
-        path = (self._project / relative).resolve()
-        if not path.is_relative_to(self._project):
-            raise ValueError(f"experiment path escapes workspace: {relative}")
-        return path
-
-    def _experiment_input_path(self, path: str) -> Path:
-        from paper_agent.tools.data_access import resolve_data_read
-        root = getattr(self.agent, "knowledge_root", None)
-        return resolve_data_read(self._project, (root,) if root else (), path)
 
     @artifact_contract
     def _experiment_manifest(self) -> dict[str, Any]:
-        manifest = json.loads(self._require_file("experiments/manifest.json").read_text())
-        if manifest.get("backend") != "local":
-            raise ValueError("experiment manifest backend must be local")
-        if manifest.get("bridge_status") == "BLOCKED":
-            raise AwaitingResults(
-                "Experiment bridge reported BLOCKED. Inspect experiments/README.md and "
-                "experiments/configs/blocked_registry.json, resolve the documented blockers, "
-                "then resume at experiment_plan or experiment_bridge; no experiments have run.")
-        jobs = manifest.get("jobs")
-        if not isinstance(jobs, list) or not jobs:
-            raise ValueError("manifest requires nonempty jobs")
-        seen = set()
-        outputs = set()
-        for job in [manifest.get("smoke", {})] + jobs:
-            requirement = job.get("resources", {})
-            if not isinstance(requirement, dict) or set(requirement) - {"device"} or requirement.get("device", "auto") not in {"auto", "cpu", "cuda", "mps"}:
-                raise ValueError("job resources must contain only device: auto, cpu, cuda or mps")
-            identifier = job.get("id", "")
-            if not re.fullmatch(r"[A-Za-z0-9_-]+", identifier) or identifier in seen:
-                raise ValueError("job IDs must be unique simple identifiers")
-            seen.add(identifier)
-            argv = job.get("argv")
-            if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
-                raise ValueError("job argv must be a nonempty string list")
-            validate_job_timeout(self._project, job)
-            if str(job.get("implementation_status", "")).startswith("BLOCKED"):
-                raise ValueError(f"Job {identifier} is not implemented; move it to deferred_jobs with a reason")
-            expected = job.get("expected_outputs")
-            if not isinstance(expected, list) or not expected:
-                raise ValueError("job requires expected_outputs")
-            for name in expected:
-                path = self._experiment_path(name)
-                prefix = "smoke-results" if job is manifest["smoke"] else "results"
-                if not path.is_relative_to(self._project / prefix) or path.suffix not in {".json", ".csv"}:
-                    raise ValueError(f"job outputs must be JSON/CSV under {prefix}/")
-                if str(path) in outputs:
-                    raise ValueError("jobs must have distinct output paths")
-                outputs.add(str(path))
-        deferred = manifest.get("deferred_jobs", [])
-        if not isinstance(deferred, list):
-            raise ValueError("deferred_jobs must be a list of non-executable task descriptions")
-        for entry in deferred:
-            if (not isinstance(entry, dict) or not isinstance(entry.get("id"), str)
-                    or not entry["id"] or entry["id"] in seen
-                    or not isinstance(entry.get("reason"), str) or not entry["reason"].strip()
-                    or "argv" in entry or "timeout_seconds" in entry):
-                raise ValueError("deferred_jobs require unique IDs and reasons, without executable argv/timeout_seconds")
-            seen.add(entry["id"])
-        inputs = manifest.get("required_inputs")
-        if not isinstance(inputs, list) or not inputs or not all(isinstance(p, str) for p in inputs):
-            raise ValueError("manifest requires required_inputs")
-        return manifest
-
-    def _resource_config(self) -> dict[str, Any]:
-        return load_compute_config(self._project)
-
-    @staticmethod
-    def _available_devices() -> dict[str, Any]:
-        available = {"cpu": True, "cuda_count": 0, "mps": False}
-        if importlib.util.find_spec("torch") is None:
-            return available
-        try:
-            import torch
-            if torch.cuda.is_available():
-                available["cuda_count"] = torch.cuda.device_count()
-            available["mps"] = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
-        except (ImportError, OSError, RuntimeError):
-            pass
-        return available
-
-    def _resolve_experiment_resources(self, job: dict[str, Any]) -> dict[str, Any]:
-        config = self._resource_config()
-        required = job.get("resources", {}).get("device", "auto")
-        selected = config["device"]
-        if selected != "auto" and required != "auto" and selected != required:
-            raise AwaitingResults(
-                f"Experiment {job['id']} requires {required}, but project compute configuration selects {selected}. "
-                "Change the resource configuration or use a matching machine, then resume.")
-        available = self._available_devices()
-        device = required if required != "auto" else selected
-        if device == "auto":
-            device = "cuda" if config["gpu_index"] is not None or available["cuda_count"] else "mps" if available["mps"] else "cpu"
-        index = config["gpu_index"] if device == "cuda" else None
-        if device == "cuda" and (not available["cuda_count"] or index is not None and index >= available["cuda_count"]):
-            raise AwaitingResults(
-                f"Experiment {job['id']} requires CUDA"
-                f"{f' GPU {index}' if index is not None else ''}; this Python environment reports "
-                f"{available['cuda_count']} CUDA devices. Use a matching machine or change project-config.json, then resume.")
-        if device == "mps" and not available["mps"]:
-            raise AwaitingResults(
-                f"Experiment {job['id']} requires MPS, but it is unavailable in this Python environment. "
-                "Use a matching Mac or change project-config.json, then resume.")
-        return {"requested": config, "required_device": required, "allocated_device": device,
-                "gpu_index": index, "cpu_threads": config["cpu_threads"], "available": available}
-
-    def _validate_measurements(self, relative: str) -> None:
-        path = self._experiment_path(relative)
-        if not path.is_file() or not path.stat().st_size:
-            raise RuntimeError(f"missing experiment result: {relative}")
-        if path.suffix == ".json":
-            value = json.loads(path.read_text())
-        else:
-            with path.open(newline="") as stream:
-                value = list(csv.DictReader(stream))
-        numbers = []
-        def visit(item):
-            if isinstance(item, dict):
-                for child in item.values(): visit(child)
-            elif isinstance(item, list):
-                for child in item: visit(child)
-            elif not isinstance(item, bool):
-                try: numbers.append(float(item))
-                except (ValueError, TypeError): pass
-        visit(value)
-        if not numbers or not all(math.isfinite(n) for n in numbers):
-            raise RuntimeError(f"result has no finite measurements or contains NaN/Inf: {relative}")
-
-    def _experiment_seconds_used(self) -> float:
-        total = 0.0
-        for path in (self._project / "experiment-runs").glob("*/status.json"):
-            receipt = json.loads(path.read_text())
-            if receipt.get("status") == "running":
-                raise AwaitingResults(f"Unfinished experiment receipt: {path}. Reconcile the interrupted job before resuming a budgeted run.")
-            elapsed = receipt.get("elapsed_seconds")
-            if elapsed is None:
-                elapsed = (datetime.fromisoformat(receipt["finished"]) -
-                           datetime.fromisoformat(receipt["started"])).total_seconds()
-            if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
-                raise ValueError(f"Invalid experiment duration: {path}")
-            total += elapsed
-        return total
-
-    def _execute_experiment(self, job: dict[str, Any]) -> dict[str, Any]:
-        resources = self._resolve_experiment_resources(job)
-        config = resources["requested"]
-        timeout = job["timeout_seconds"]
-        validate_job_timeout(self._project, job)
-        used = self._experiment_seconds_used() if config["total_experiment_seconds"] is not None else 0.0
-        if config["total_experiment_seconds"] is not None:
-            remaining = config["total_experiment_seconds"] - used
-            if remaining <= 0:
-                raise AwaitingResults("Project total_experiment_seconds exhausted; increase the user-owned budget to continue.")
-            timeout = min(timeout, remaining)
-        directory = self._project / "experiment-runs" / (job["id"] + "-" + uuid.uuid4().hex[:12])
-        directory.mkdir(parents=True)
-        # Preserve previous outputs, so stale metrics cannot count as this attempt.
-        for index, name in enumerate(job["expected_outputs"]):
-            path = self._experiment_path(name)
-            if path.exists():
-                shutil.move(str(path), str(directory / f"previous-{index}{path.suffix}"))
-        argv = list(job["argv"])
-        if argv[0] in {"python", "python3"}: argv[0] = sys.executable
-        env = os.environ.copy()
-        env["PAPER_AGENT_DEVICE"] = resources["allocated_device"]
-        backend_report = directory / "compute-backend.json"
-        env["PAPER_AGENT_BACKEND_REPORT"] = str(backend_report.resolve())
-        if resources["allocated_device"] == "cuda" and resources["gpu_index"] is not None:
-            env["CUDA_VISIBLE_DEVICES"] = str(resources["gpu_index"])
-        elif resources["allocated_device"] != "cuda":
-            env["CUDA_VISIBLE_DEVICES"] = ""
-        if resources["allocated_device"] == "mps":
-            env["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
-        if resources["cpu_threads"] is not None:
-            env["OMP_NUM_THREADS"] = str(resources["cpu_threads"])
-            env["MKL_NUM_THREADS"] = str(resources["cpu_threads"])
-        receipt = {"job": job, "status": "running", "argv": argv, "resources": resources,
-                   "compute_backend": {"status": "unknown", "reason": "No runtime backend report"},
-                   "started": datetime.now(timezone.utc).isoformat(),
-                   "log": str((directory / "output.log").relative_to(self._project))}
-        record = directory / "status.json"
-        receipt.update(effective_timeout_seconds=timeout, prior_experiment_seconds=used)
-        record.write_text(json.dumps(receipt, indent=2))
-        attempt_started = time.monotonic()
-        try:
-            with (directory / "output.log").open("w") as log:
-                process = subprocess.Popen(argv, cwd=self._project, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                           start_new_session=True)
-                try:
-                    code = process.wait(timeout=timeout)
-                except BaseException:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-                    raise
-            receipt["exit_code"] = code
-            if code != 0: raise RuntimeError(f"exit code {code}")
-            for name in job["expected_outputs"]: self._validate_measurements(name)
-            receipt["status"] = "completed"
-        except Exception as exc:
-            receipt.update(status="failed", error=str(exc))
-        finally:
-            if backend_report.is_file():
-                try:
-                    backend = json.loads(backend_report.read_text(encoding="utf-8"))
-                    if (not isinstance(backend, dict)
-                            or backend.get("device") not in {"cpu", "cuda", "mps", "mixed"}
-                            or not isinstance(backend.get("framework"), str)
-                            or not backend["framework"].strip()
-                            or not isinstance(backend.get("evidence"), str)
-                            or not backend["evidence"].strip()):
-                        raise ValueError("backend report requires device, framework and runtime evidence")
-                    receipt["compute_backend"] = {
-                        "status": "reported", "source": "experiment_process",
-                        "report": str(backend_report.relative_to(self._project)),
-                        "device": backend["device"], "framework": backend["framework"],
-                        "evidence": backend["evidence"],
-                    }
-                except (ValueError, OSError) as exc:
-                    receipt["compute_backend"] = {"status": "unknown", "reason": f"Invalid runtime backend report: {exc}"}
-            receipt["elapsed_seconds"] = time.monotonic() - attempt_started
-            receipt["finished"] = datetime.now(timezone.utc).isoformat()
-            record.write_text(json.dumps(receipt, indent=2))
-        if receipt["status"] != "completed":
-            log_tail = (directory / "output.log").read_text(errors="replace")[-12000:]
-            if re.search(r"(?:HTTP(?:Error)?[ :]+|status(?: code)?[ :]+)(?:401|403)\b", log_tail, re.I):
-                raise RuntimeError(f"Experiment authorization failure; log: {receipt['log']}")
-            raise ExperimentExecutionError(f"Experiment {job['id']} failed: {receipt.get('error')}; log: {receipt['log']}")
-        return receipt
+        self._require_file("experiments/manifest.json")
+        return self.experiments.load_manifest()
 
     def _run_experiment_check(self, state: WorkflowState, prompt: str) -> NodeResult:
-        self._resource_config()
+        self.experiments.compute_config()
         manifest = self._experiment_manifest()
-        missing = [p for p in manifest["required_inputs"] if not self._experiment_input_path(p).exists()]
+        missing = [p for p in manifest["required_inputs"] if not self.experiments.input_path(p).exists()]
         if missing:
             raise AwaitingResults(f"Missing experiment inputs: {missing}. Supply real data and resume.")
-        receipt = self._execute_experiment(manifest["smoke"])
+        receipt = self.experiments.execute(manifest["smoke"])
         return NodeResult(receipt["log"], {"phase": "experiment_check", "smoke": receipt,
                                           "manifest": manifest})
 
     def _checked_manifest(self, state: WorkflowState) -> dict[str, Any]:
         manifest = self._experiment_manifest()
         if manifest != state.node_results.get("experiment_check", {}).get("manifest"):
-            raise RuntimeError("manifest not smoke-checked; restart at experiment_check")
+            raise RuntimeError("manifest not smoke-checked; call check_experiments again")
         return manifest
 
     def _run_experiment_run(self, state: WorkflowState, prompt: str) -> NodeResult:
         manifest = self._checked_manifest(state)
-        receipts = []
-        prior = state.experiment_completed_receipts or state.node_results.get("experiment_run", {}).get("jobs", [])
-        completed = {item.get("id"): item for item in prior
-                     if isinstance(item, dict) and item.get("status") in {"completed", "success"}}
-        for job in manifest["jobs"]:
-            if job.get("id") in completed:
-                receipts.append(completed[job["id"]])
-            else:
-                receipts.append(self._execute_experiment(job))
-            state.node_results["experiment_run"] = {
-                "artifact": "experiment-runs", "phase": "experiment_run", "jobs": list(receipts),
-                "deferred_jobs": manifest.get("deferred_jobs", []),
-            }
-            state.experiment_completed_receipts = list(receipts)
-        if manifest.get("deferred_jobs"):
-            if state.experiment_expansion_count >= 2:
-                self._require_no_deferred_jobs(manifest)
-            raise ExperimentExpansionRequired(
-                "Data-preparation jobs completed; expanding deferred experiment matrix before execution.")
+        receipts = run_queue(self.experiments, state, manifest, on_progress=self.on_node_progress)
         return NodeResult("experiment-runs", {"phase": "experiment_run", "jobs": receipts})
 
     @staticmethod
@@ -1487,7 +813,9 @@ Approved proposal:
 
     def _validate_required_artifacts(self, relatives: list[str]) -> None:
         for relative in relatives:
-            self._require_file(relative)
+            path = self._require_file(relative)
+            if not path.read_text(encoding="utf-8").strip():
+                raise ArtifactValidationError(f"required artifact is empty: {relative}")
 
     def _inspect_project_artifacts(self, relatives: list[str]) -> list[dict[str, Any]]:
         records = []
@@ -1516,15 +844,6 @@ Approved proposal:
                            "headings": headings,
                            "content": text[:12000]}, ensure_ascii=False)
 
-    def _inspect_experiment_package(self) -> dict[str, Any]:
-        files = [p for p in self._project.rglob("*")
-                 if p.is_file() and ".git" not in p.parts]
-        code = [p for p in files if p.suffix in {".py", ".sh", ".ipynb"}]
-        docs = [p for p in files if p.name.lower() in {"readme.md", "experiment_readme.md"}]
-        entry = [p for p in code if p.name in {"main.py", "run.py", "train.py", "experiment.py"}]
-        return {"files": len(files), "code_files": len(code),
-                "documentation": bool(docs), "entrypoint": bool(entry),
-                "code_paths": [str(p.relative_to(self._project)) for p in code[:30]]}
 
     def _result_files(self) -> list[Path]:
         root = self._project / "results"
@@ -1573,9 +892,12 @@ Approved proposal:
         self._require_file("refine-logs/FINAL_PROPOSAL.md")
         self._require_file("refine-logs/EXPERIMENT_PLAN.md")
         paths = [str(path.relative_to(self._project)) for path in results]
-        result = self.agent.go(
+        result = self._go(
             f"Original task:\n{prompt}\n\nCreate the paper plan. "
-            f"Available measured result files: {paths}.", phase="paper_plan")
+            f"Available measured result files: {paths}. "
+            "Read refine-logs/EXPERIMENT_RESULTS.md and experiments/coverage.json when present. "
+            "Preserve a mapping for every original figure/panel evidence task; move or merge "
+            "only with an explicit destination, and never silently remove required evidence.", phase="paper_plan")
         self._require_file("PAPER_PLAN.md")
         return NodeResult("PAPER_PLAN.md", {"phase": "paper_plan", "results": paths, "iterations": result.iterations})
 
@@ -1593,46 +915,129 @@ Approved proposal:
             "do not satisfy this requirement."
             if self.require_image_figure else ""
         )
-        result = self.agent.go(
+        result = self._go(
             f"Original task:\n{prompt}\n\nProduce the planned figures from PAPER_PLAN.md "
-            "and results/ using the phase skill." + image_instruction, phase="paper_figure")
+            "and results/ using the phase skill. You own visual inspection and repair: "
+            "view every final figure with view_image, fix layout problems and view again after edits. "
+            "Write figures/visual_checks.json with final asset/preview hashes and specific findings "
+            "as described in the skill. Completion checks reject missing or stale visual reviews; "
+            "do not leave this work to an external supervisor." + image_instruction, phase="paper_figure")
         self._require_file("figures/latex_includes.tex")
         self._require_file("figures/figure_plan.md")
         self._require_file("figures/figure_captions.md")
         metadata: dict[str, Any] = {"phase": "paper_figure", "iterations": result.iterations}
+        images = self._figure_receipts(getattr(result, "messages", []))
+        if images:
+            metadata.update(image_backend="project-mcp", images=list(images.values()))
+        metadata["visual_checks"] = self._figure_visual_checks(getattr(result, "messages", []))
+        return NodeResult("figures/latex_includes.tex", metadata)
+
+    @artifact_contract
+    def _figure_visual_checks(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Require current-invocation visual input for every delivered graphic.
+
+        This checks review provenance/freshness, not the model's aesthetic judgment.
+        """
+        figures = (self._project / "figures").resolve()
+
+        def local_file(relative: str) -> Path:
+            if not isinstance(relative, str):
+                raise ArtifactValidationError("Visual check paths must be strings")
+            path = (self._project / relative).resolve()
+            if not path.is_relative_to(figures) or not path.is_file():
+                raise ArtifactValidationError(f"Visual check needs an existing file inside figures/: {relative}")
+            return path
+
+        assets: set[Path] = set()
+        visited: set[Path] = set()
+
+        def collect(source: Path):
+            if source in visited:
+                return
+            visited.add(source)
+            text = re.sub(r"(?<!\\)%[^\n]*", "", source.read_text(encoding="utf-8"))
+            for relative in re.findall(r"\\includegraphics\*?(?:\s*\[[^\]]*\])?\s*\{([^{}]+)\}", text):
+                path = self._project / relative
+                if not path.suffix:
+                    path = next((path.with_suffix(ext) for ext in (".pdf", ".png", ".jpg", ".jpeg")
+                                 if path.with_suffix(ext).is_file()), path)
+                assets.add(local_file(str(path)))
+            for relative in re.findall(r"\\(?:input|include)\s*\{([^{}]+)\}", text):
+                path = self._project / relative
+                if not path.suffix:
+                    path = path.with_suffix(".tex")
+                collect(local_file(str(path)))
+
+        collect(self._require_file("figures/latex_includes.tex"))
+        if not assets:
+            return []
+        review_path = self._require_file("figures/visual_checks.json")
+        reviews = json.loads(review_path.read_text(encoding="utf-8")).get("figures")
+        if not isinstance(reviews, list):
+            raise ArtifactValidationError("visual_checks.json requires a figures list")
+        viewed = set()
+        for message in messages:
+            if (message.get("role") == "tool" and message.get("name") == "view_image"
+                    and not message.get("is_error")):
+                receipt = json.loads(message.get("content", "{}"))
+                # Earlier drafts may have been removed; reference images may live
+                # elsewhere in the project. Only final review entries need exist.
+                viewed.add((str((self._project / receipt["path"]).resolve()), receipt["sha256"]))
+        checked = {}
+        for review in reviews:
+            asset = local_file(review["asset"])
+            preview = local_file(review["preview"])
+            if asset in checked:
+                raise ArtifactValidationError(f"Duplicate visual check: {review['asset']}")
+            if preview.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+                raise ArtifactValidationError("Visual check preview must be PNG/JPEG")
+            for path, key in ((asset, "asset_sha256"), (preview, "preview_sha256")):
+                if hashlib.sha256(path.read_bytes()).hexdigest() != review.get(key):
+                    raise ArtifactValidationError(f"Figure changed after visual review: {path.name}; render and view again")
+            if (str(preview), review["preview_sha256"]) not in viewed:
+                raise ArtifactValidationError(f"View the final preview with view_image in this invocation: {review['preview']}")
+            if (review.get("status") != "passed" or not isinstance(review.get("findings"), str)
+                    or not review["findings"].strip()):
+                raise ArtifactValidationError(f"Visual review is incomplete: {review['asset']}; inspect and repair before finishing")
+            checked[asset] = review
+        missing = assets - checked.keys()
+        if missing:
+            raise ArtifactValidationError("Missing visual checks for: " + ", ".join(sorted(p.name for p in missing)))
+        return [checked[path] for path in sorted(assets)]
+
+    @artifact_contract
+    def _figure_receipts(self, messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         # Only receipts returned by this invocation count. The runner never generates.
         images: dict[str, dict[str, Any]] = {}
-        for message in getattr(result, "messages", []):
+        for message in messages:
             if (message.get("role") != "tool" or message.get("name") != "generate_image"
                     or message.get("is_error")):
                 continue
             job = json.loads(message.get("content", "{}"))
             if not isinstance(job, dict) or job.get("status") != "completed":
-                raise RuntimeError("Invalid generate_image success receipt")
+                raise ArtifactValidationError("Invalid generate_image success receipt")
             relative = job.get("output_path")
             if not isinstance(relative, str):
-                raise RuntimeError("Image receipt has no output_path")
+                raise ArtifactValidationError("Image receipt has no output_path")
             image_path = (self._project / relative).resolve()
             if not image_path.is_relative_to(self._project / "figures"):
-                raise RuntimeError("Image receipt output must be inside project figures/")
+                raise ArtifactValidationError("Image receipt output must be inside project figures/")
             images[str(image_path.relative_to(self._project))] = job
         for relative, job in images.items():
             data = self._require_file(relative).read_bytes()
             if len(data) < 100 or data[:8] != b"\x89PNG\r\n\x1a\n":
-                raise RuntimeError(f"Image receipt output is not a PNG: {relative}")
+                raise ArtifactValidationError(f"Image receipt output is not a PNG: {relative}")
             if hashlib.sha256(data).hexdigest() != job.get("sha256"):
-                raise RuntimeError(f"Image changed after generate_image: {relative}")
+                raise ArtifactValidationError(f"Image changed after generate_image: {relative}")
         expected = "figures/figure_1_motivation_architecture.png"
         if self.require_image_figure and expected not in images:
-            raise RuntimeError("Figure 1 requires a successful generate_image tool receipt from this invocation")
-        if images:
-            metadata.update(image_backend="project-mcp", images=list(images.values()))
-        return NodeResult("figures/latex_includes.tex", metadata)
+            raise ArtifactValidationError("Figure 1 requires a successful generate_image tool receipt from this invocation")
+        return images
 
     def _run_paper_write(self, state: WorkflowState, prompt: str) -> NodeResult:
         self._require_file("PAPER_PLAN.md")
         self._require_file("figures/latex_includes.tex")
-        result = self.agent.go(
+        result = self._go(
             f"{prompt}\nDraft the paper from PAPER_PLAN.md and verified results/. Use generated figures "
             "and verified citations only. Write paper/main.tex, paper/sections/*.tex, and "
             "paper/references.bib. Preserve an existing paper where practical.", phase="paper_write")
@@ -1664,105 +1069,32 @@ Approved proposal:
         self._require_file("paper/main.tex")
         try:
             pdf = self._compile_pdf()
-            attempts = 1
-        except RuntimeError as exc:
-            for attempts in range(2, 4):
-                self.agent.go(
-                    f"Fix the LaTeX compilation failure in paper/. If build tools or packages are missing, install them using bash and verify availability; otherwise read the LaTeX log and edit the source, "
-                    f"then leave a buildable paper. Error:\n{exc}", phase="paper_compile")
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+            def check():
                 try:
-                    pdf = self._compile_pdf()
-                    break
-                except RuntimeError as retry_exc:
-                    exc = retry_exc
-            else:
-                raise RuntimeError(f"paper compilation failed after 3 attempts: {exc}") from exc
-        return NodeResult(str(pdf.relative_to(self._project)), {"phase": "paper_compile", "attempts": attempts})
+                    self._compile_pdf()
+                except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
+                    raise ArtifactValidationError(str(error)) from error
 
-    def _run_paper_improvement(self, state: WorkflowState, prompt: str) -> NodeResult:
-        self._require_file("paper/main.pdf")
-        state.paper_status = "pdf_ready"
-        paper = self._project / "paper"
-        log = paper / "PAPER_IMPROVEMENT_LOG.md"
-        progress = state.node_results.get("auto_paper_improvement_loop", {})
-        completed_rounds = int(progress.get("completed_rounds", 0))
-        if (completed_rounds < 0 or completed_rounds > self.config.max_paper_review_rounds
-                or (completed_rounds and not log.is_file())):
-            raise RuntimeError("saved paper review progress is inconsistent; inspect the improvement log")
-        if not log.exists():
-            log.write_text("# Paper improvement log\n", encoding="utf-8")
-
-        def checkpoint(round_number: int, stage: str, **details: Any) -> None:
-            state.node_results["auto_paper_improvement_loop"] = {
-                "artifact": "paper/PAPER_IMPROVEMENT_LOG.md", "phase": "paper_improve",
-                "completed_rounds": completed_rounds, "round": round_number,
-                "stage": stage, **details,
-            }
-            if self.on_node_progress:
-                self.on_node_progress("auto_paper_improvement_loop", state,
-                                      state.node_results["auto_paper_improvement_loop"])
-
-        for round_number in range(completed_rounds + 1, self.config.max_paper_review_rounds + 1):
-            # review() starts a new Codex thread; no previous round's feedback is sent.
-            review_prompt = (
-                "Review paper/main.tex and paper/main.pdf as an independent scientific paper reviewer. "
-                "Check claims against results/ and PAPER_PLAN.md. Return concrete, prioritized fixes "
-                "for evidence, correctness, clarity, figures, and citations. Do not edit files."
-            )
-            stage = "reviewing"
-            checkpoint(round_number, stage)
-            try:
-                if self.reviewer is not None:
-                    review = self.reviewer.review(self._project, review_prompt)
-                    feedback = review.get("content")
-                    thread_id = review.get("threadId", "unknown")
-                else:
-                    tool_result = external_review(ToolContext(self._project), review_prompt)
-                    if tool_result.is_error:
-                        raise RuntimeError(tool_result.output)
-                    payload = json.loads(tool_result.output)
-                    feedback = payload.get("response")
-                    thread_id = payload.get("threadId", "unknown")
-                if not isinstance(feedback, str) or not feedback.strip():
-                    raise RuntimeError(f"empty independent review in round {round_number}")
-                stage = "improving"
-                checkpoint(round_number, stage, reviewer_thread=thread_id, feedback=feedback)
-                self.agent.go(
-                    f"{prompt}\nImprove the paper using this independent review (round {round_number}). "
-                    "Change only supported claims and writing/LaTeX. Do not invent evidence or citations. "
-                    f"Review:\n{feedback}", phase="paper_improve")
-                stage = "compiling"
-                checkpoint(round_number, stage, reviewer_thread=thread_id, feedback=feedback)
-                pdf = self._compile_pdf()
-                snapshot = paper / f"main_round{round_number}.pdf"
-                shutil.copy2(pdf, snapshot)
-                with log.open("a", encoding="utf-8") as stream:
-                    stream.write(f"\n## Round {round_number}\n\nReviewer thread: {thread_id}\n\n{feedback}\n\nCompiled: {snapshot.name}\n")
-                completed_rounds = round_number
-                checkpoint(round_number, "completed", reviewer_thread=thread_id)
-            except Exception as exc:
-                checkpoint(round_number, "failed", error=str(exc))
-                with log.open("a", encoding="utf-8") as stream:
-                    stream.write(f"\n## Round {round_number} interrupted\n\nStage: {stage}\n\nError: {exc}\n")
-                raise
-        return NodeResult("paper/PAPER_IMPROVEMENT_LOG.md", {"phase": "paper_improve", "rounds": self.config.max_paper_review_rounds})
+            result = self._go(
+                f"{prompt}\nFix the LaTeX build in paper/. Read the build log, repair the source "
+                f"or install missing dependencies, and verify compilation. Error:\n{exc}",
+                phase="paper_compile", completion_check=check)
+            pdf = self._require_file("paper/main.pdf")
+            return NodeResult(str(pdf.relative_to(self._project)),
+                              {"phase": "paper_compile", "iterations": result.iterations})
+        return NodeResult(str(pdf.relative_to(self._project)), {"phase": "paper_compile"})
 
     def _next_node(self, state: WorkflowState, node: str) -> str | None:
         if node == "literature":
             return "ideas"
         if node == "ideas":
-            return "novelty"
-        if node == "novelty":
             return "refine"
         if node == "refine":
             return "experiment_plan"
         if node == "experiment_plan":
             return "experiment_bridge"
         if node == "experiment_bridge":
-            return "experiment_check"
-        if node == "experiment_check":
-            return "experiment_run"
-        if node == "experiment_run":
             return "paper_plan"
         if node == "paper_plan":
             return "paper_figure"
@@ -1781,108 +1113,4 @@ Approved proposal:
         return state
 
 
-def parse_review_result(agent_state: Any) -> ReviewResult:
-    """Extract score/verdict from tool output or the final reviewer response."""
-    candidates: list[str] = []
-    reviewer_model: str | None = None
-    structured_score: float | None = None
-    structured_verdict: str | None = None
-    details: dict[str, Any] = {}
-    tool_error: str | None = None
-    for message in getattr(agent_state, "messages", []):
-        if message.get("role") != "tool" or message.get("name") != "external_review":
-            continue
-        content = str(message.get("content", ""))
-        if message.get("is_error"):
-            tool_error = content
-        candidates.append(content)
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError:
-            # External adapters sometimes prepend an error/status line while
-            # still returning the review JSON. Recover the JSON object so a
-            # valid local review is not discarded solely because the adapter
-            # failed after producing its response.
-            start, end = content.find("{"), content.rfind("}")
-            payload = None
-            if start >= 0 and end > start:
-                try:
-                    payload = json.loads(content[start:end + 1])
-                except json.JSONDecodeError:
-                    payload = None
-        if isinstance(payload, dict):
-            reviewer_model = payload.get("model") or payload.get("reviewer") or payload.get("reviewer_model")
-            structured_score, structured_verdict = _review_fields(
-                payload, structured_score, structured_verdict)
-            response = payload.get("response")
-            if isinstance(response, str):
-                candidates.insert(0, response)
-                try:
-                    nested = json.loads(response)
-                except json.JSONDecodeError:
-                    nested = None
-                if isinstance(nested, dict):
-                    structured_score, structured_verdict = _review_fields(
-                        nested, structured_score, structured_verdict)
-                    if nested.get("score") is not None or nested.get("rating") is not None:
-                        details = nested
-            elif payload.get("score") is not None or payload.get("rating") is not None:
-                details = payload
-    final = getattr(agent_state, "final", "") or ""
-    if final:
-        candidates.append(final)
-        try:
-            payload = json.loads(final)
-        except json.JSONDecodeError:
-            payload = None
-        if isinstance(payload, dict):
-            structured_score, structured_verdict = _review_fields(
-                payload, structured_score, structured_verdict)
-            if payload.get("score") is not None or payload.get("rating") is not None:
-                details = payload
-    raw = "\n\n".join(candidates)
-    score = structured_score if structured_score is not None else _find_score(raw)
-    verdict_match = re.search(
-        r"\b(PROCEED(?:\s+WITH\s+CAUTION)?|ABANDON|READY|REJECT(?:ED)?|"
-        r"MAJOR[_ ]REVISION|PROMISING[_ ]BUT[_ ]UNVALIDATED|ACCEPT[_ ]AS[_ ]IDEA)\b", raw, re.I)
-    verdict = structured_verdict or (verdict_match.group(1).upper().replace(" ", "_")
-                                     if verdict_match else None)
-    if verdict == "REJECTED":
-        verdict = "REJECT"
-    if score is not None and verdict is not None:
-        parse_error = None
-    elif tool_error:
-        parse_error = f"external reviewer failed: {tool_error}"
-    else:
-        parse_error = "review did not contain score and verdict"
-    return ReviewResult(score=score, verdict=verdict, reviewer_model=reviewer_model,
-                        raw_response=raw, parse_error=parse_error, details=details)
-
-
-def _review_fields(payload: dict[str, Any], score: float | None,
-                   verdict: str | None) -> tuple[float | None, str | None]:
-    value = payload.get("score", payload.get("rating"))
-    if score is None:
-        try:
-            numeric = float(value)
-            if 0 <= numeric <= 10:
-                score = numeric
-        except (TypeError, ValueError):
-            pass
-    candidate = payload.get("verdict")
-    if verdict is None and isinstance(candidate, str):
-        verdict = candidate.upper().replace(" ", "_")
-        if verdict == "REJECTED":
-            verdict = "REJECT"
-    return score, verdict
-
-
-def _find_score(text: str) -> float | None:
-    match = re.search(r"(?:score|rating)\s*[:=\-]?\s*(\d+(?:\.\d+)?)\s*(?:/\s*10)?", text, re.I)
-    if not match:
-        return None
-    value = float(match.group(1))
-    return value if 0 <= value <= 10 else None
-
-
-__all__ = ["ReviewResult", "WorkflowConfig", "WorkflowRunner", "WorkflowState", "parse_review_result"]
+__all__ = ["WorkflowConfig", "WorkflowRunner", "WorkflowState"]

@@ -10,7 +10,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob
 
 `research-refine -> experiment-plan -> experiment-bridge`
 
-- `research-refine` 读取已批准的 idea、review 和 novelty 产物，写入
+- `research-refine` 直接读取 idea 与相关文献，写入
   `refine-logs/FINAL_PROPOSAL.md`。
 - `experiment-plan` 读取最终方案，写入
   `refine-logs/EXPERIMENT_PLAN.md` 和 `refine-logs/EXPERIMENT_TRACKER.md`。

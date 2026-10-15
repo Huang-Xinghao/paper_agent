@@ -29,7 +29,7 @@ description: 基于 Idea Report 和可核验文献检查电池研究 Idea 的方
 2. **近期与经典工作**：关注最近 2 年电池、能源及相关方法领域的重要期刊和会议，检查最近 6 个月的 arXiv 预印本；同时检索可能已经包含核心机制或结果的早期工作。按本轮日期确定时间范围，不固定使用旧年份。
 3. **本地论文与 Wiki**：相关时使用 `discover_local_papers` / `read_local_paper` 和 `search_wiki` / `read_wiki`。Wiki 是检索线索，不是独立验证。
 4. **阅读潜在重叠论文**：阅读实际可获取的摘要、相关工作和方法部分，必要时追查实验设置。仅有搜索元数据时，记录未读到的内容，不冒充全文阅读。
-5. **核实书目身份**：对写入“最接近工作”的论文调用 `verify_papers`。核验失败的条目标记 `[UNVERIFIED]`，不得凭记忆补写 DOI、标题、venue、年份或结果。如果使用 `search_papers`，必须成功调用 `verify_papers`；工具失败时明确记录失败和不确定性，不声称已完成核验。
+5. **记录书目来源**：保留实际检索得到的标题、DOI、URL 和来源。缺失或冲突的信息明确标注，不凭记忆补写；只有搜索元数据时，不声称已独立核验或阅读全文。
 
 研究场景必须单独查新：实验室循环、车辆、固定式储能和退役/梯次利用之间不能直接互换。检查化学体系、温度、倍率、预测时点和数据划分是否构成真正差异。
 
@@ -70,4 +70,4 @@ description: 基于 Idea Report 和可核验文献检查电池研究 Idea 的方
 
 ## JSON 接口约定
 
-新输出使用 `idea_under_check`；旧字段 `idea_under_review` 仅由 workflow 兼容读取，不应继续输出。JSON 文本值可以使用中文或英文。workflow 生成的 Markdown 仅供展示，下游节点不解析它。`verdict` 只能取 `PROCEED`、`PROCEED_WITH_CAUTION` 或 `ABANDON`，不得使用带空格的变体。
+输出使用 `idea_under_check`。JSON 文本值可以使用中文或英文。workflow 生成的 Markdown 仅供展示，下游节点不解析它。`verdict` 只能取 `PROCEED`、`PROCEED_WITH_CAUTION` 或 `ABANDON`，不得使用带空格的变体。

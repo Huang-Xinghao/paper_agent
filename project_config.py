@@ -11,8 +11,8 @@ def load_compute_config(project):
     path = project / 'project-config.json'
     if path.exists():
         document = json.loads(path.read_text(encoding='utf-8'))
-        if not isinstance(document, dict) or set(document) - {'compute'}:
-            raise ValueError('project-config.json supports only the compute object')
+        if not isinstance(document, dict) or set(document) - {'compute', 'execution'}:
+            raise ValueError('project-config.json supports only compute and execution objects')
         config = document.get('compute', {})
         allowed = {'device', 'gpu_index', 'cpu_threads', 'max_job_seconds', 'total_experiment_seconds'}
     else:
@@ -38,6 +38,34 @@ def load_compute_config(project):
     return result
 
 
+def load_execution_config(project):
+    path = Path(project) / 'project-config.json'
+    document = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(document, dict) or set(document) - {'compute', 'execution'}:
+        raise ValueError('project-config.json supports only compute and execution objects')
+    config = document.get('execution', {})
+    defaults = dict(gpu_ids='auto', max_parallel_gpu_jobs=1,
+                    gpu_idle_memory_threshold_mib=500, oom_max_retries=2,
+                    oom_retry_delay_seconds=120, poll_seconds=2)
+    if not isinstance(config, dict) or set(config) - set(defaults):
+        raise ValueError('unsupported execution configuration')
+    result = defaults | config
+    ids = result['gpu_ids']
+    if ids != 'auto' and (not isinstance(ids, list) or not ids or
+                          any(type(i) is not int or i < 0 for i in ids) or len(set(ids)) != len(ids)):
+        raise ValueError('gpu_ids must be auto or distinct nonnegative GPU indices')
+    parallel = result['max_parallel_gpu_jobs']
+    if parallel != 'auto' and (type(parallel) is not int or parallel < 1):
+        raise ValueError('max_parallel_gpu_jobs must be auto or a positive integer')
+    for key in ('gpu_idle_memory_threshold_mib', 'oom_max_retries'):
+        if type(result[key]) is not int or result[key] < 0:
+            raise ValueError(f'{key} must be a nonnegative integer')
+    for key in ('oom_retry_delay_seconds', 'poll_seconds'):
+        if type(result[key]) not in (int, float) or not math.isfinite(result[key]) or result[key] <= 0:
+            raise ValueError(f'{key} must be finite and positive')
+    return result
+
+
 def effective_job_seconds(project):
     configured = load_compute_config(project)["max_job_seconds"]
     return min(MAX_JOB_SECONDS, configured) if configured is not None else MAX_JOB_SECONDS
@@ -56,6 +84,9 @@ def validate_job_timeout(project, job):
 def compute_context(project):
     return ('User-owned project compute policy (do not edit or override):\n' +
             json.dumps(load_compute_config(project), ensure_ascii=False) +
+            '\nUser-owned execution policy:\n' + json.dumps(load_execution_config(project), ensure_ascii=False) +
+            '\nManifest jobs may declare depends_on as a list of upstream job IDs. '
+            'Use explicit dependencies for parallel independent training; absent depends_on preserves sequential order. '
             '\nExecution limits: ' + json.dumps({'effective_max_job_seconds': effective_job_seconds(project),
                                                     'runner_max_job_seconds': MAX_JOB_SECONDS}) +
             '\nnull means no project-specific limit, not missing approval; the runner limit still applies. '
