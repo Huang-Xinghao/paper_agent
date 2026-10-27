@@ -8,3 +8,9 @@ __pycache__/
 !.env.example
 build/
 dist/
+
+*.swp
+.latex-env/
+.venv*/
+.paper-agent/
+node_modules/

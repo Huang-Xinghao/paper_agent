@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+runtime_prefix=/data/apps/micromamba/envs/xinghao
+runtime_python="$runtime_prefix/bin/python"
+if [[ ! -x "$runtime_python" ]]; then
+  echo "Required xinghao Python not found: $runtime_python" >&2
+  exit 1
+fi
+# Shell tools and experiment subprocesses must use the same environment.
+export PATH="$runtime_prefix/bin:$PATH"
+export CONDA_PREFIX="$runtime_prefix"
+export CONDA_DEFAULT_ENV=xinghao
+unset PYTHONHOME VIRTUAL_ENV
+cd "$repo_root"
+
+"$runtime_python" - <<'PY'
+import sys
+import openai, pypdf, httpx, PIL
+import torch
+
+print(f"Python: {sys.executable}", flush=True)
+print(f"PyTorch: {torch.__version__}; CUDA: {torch.version.cuda}; visible GPUs: {torch.cuda.device_count()}", flush=True)
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA unavailable in xinghao. Fix the environment/device visibility; CPU fallback is disabled at startup.")
+# Verify computation, rather than relying only on driver/device detection.
+assert (torch.ones(1, device="cuda") + 1).item() == 2
+print("CUDA computation check passed.", flush=True)
+PY
+
+if [[ "${1:-}" == --check-env ]]; then
+  exit 0
+fi
+exec "$runtime_python" -u -m paper_agent.agent.workflow_cli "$@"

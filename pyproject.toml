@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paper-agent-prototype"
+version = "0.1.0"
+description = "A file-backed agent for research paper workflows"
+requires-python = ">=3.11"
+dependencies = ["openai>=1.0", "pypdf>=4", "httpx>=0.27", "Pillow>=10", "black>=24"]
+
+[project.scripts]
+paper-agent = "paper_agent.agent.loop:main"
+paper-wiki = "paper_agent.tools.research_wiki:main"
+paper-threat-scan = "paper_agent.tools.threat_scan:main"
+paper-wiki-agent = "paper_agent.agent.wiki:main"
+paper-workflow = "paper_agent.agent.workflow_cli:main"
+paper-review = "paper_agent.agent.review_cli:main"
+paper-web-api = "paper_agent.api.app:main"
+
+[tool.setuptools.packages.find]
+include = ["paper_agent*"]
+
+[tool.setuptools.package-data]
+paper_agent = ["skills/TOOL_BOUNDARIES.md", "skills/*/SKILL.md", "skills/shared-references/*.md", "skills/paper-write/templates/*"]
+
+[project.optional-dependencies]
+web = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "psutil>=6,<8"]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

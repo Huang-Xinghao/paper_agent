@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+runtime_python="${PAPER_AGENT_RUNTIME_PYTHON:-/data/apps/micromamba/envs/xinghao/bin/python}"
+if [[ ! -x "$runtime_python" ]]; then
+  echo "Required Python not found: $runtime_python" >&2
+  exit 1
+fi
+export PAPER_AGENT_RUNTIME_PYTHON="$runtime_python"
+export PATH="$(dirname -- "$runtime_python"):$PATH"
+unset PYTHONHOME VIRTUAL_ENV
+cd "$repo_root"
+exec "$runtime_python" -u -m paper_agent.api.app
