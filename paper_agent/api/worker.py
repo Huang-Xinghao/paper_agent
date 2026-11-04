@@ -47,6 +47,7 @@ def execute(run_id):
     options.pop("message_prompt", None)
     action = options.pop("action")
     token = options.pop("checkpoint_token", None)
+    proposal_sha = options.pop("proposal_sha256", None)
     answer = options.pop("answer", "")
     if action == "review":
         from .app import checkpoint_token
@@ -56,15 +57,20 @@ def execute(run_id):
             project, state
         ):
             raise ValueError("审阅文件已变化，请刷新后重新确认")
+        if state.get("current_node") == "refine":
+            from paper_agent.proposal_review import guard_legacy_approval
+            guard_legacy_approval(Path(project["path"]))
         # Use the same semantic revision contract as the terminal entry point.
         if answer.strip():
-            options["advance_after_revision"] = True
+            proposal_review = (state.get("expert_checkpoint") or {}).get("node") == "refine"
+            options["advance_after_revision"] = not proposal_review
             options["revise"] = (
                 "用户已回答当前节点的专家审阅问题。先读取现有报告，将回答整合到当前节点全部相关产物，"
                 "消除与回答冲突的建议，保留有效证据及用户回答以供追溯。"
                 "不得仅改报告冒充新实验结果，不得篡改执行回执；实验变更须经现有工具执行验证。"
-                "修订完成后由工作流自动进入下游，无需再次提问确认。"
-                "\n当前审阅问题：\n" + "\n".join(
+                + ("修订后更新方案审阅摘要，交还用户决定是否批准。" if proposal_review else
+                   "修订完成后由工作流自动进入下游，无需再次提问确认。")
+                + "\n当前审阅问题：\n" + "\n".join(
                     f"{index + 1}. {question}" for index, question in enumerate(
                         (state.get("expert_checkpoint") or {}).get("questions", [])
                     )
@@ -74,7 +80,24 @@ def execute(run_id):
             options["continue_run"] = True
     options["max_iterations"] = options.pop("max_tool_rounds", 100)
     on_event = lambda record: event(project["id"], record["kind"], record, run_id)
-    if action == "revise":
+    if action == "proposal_revise":
+        from .proposal_revision import run_revision
+        state = run_revision(Path(project["path"]), proposal_sha, run_id,
+                             data_root() / "runs" / run_id, model=options.get("model"),
+                             timeout=options.get("timeout", 600), on_event=on_event)
+    elif action == "proposal_approve":
+        from .app import checkpoint_token
+        from paper_agent.proposal_review import pending_refine, require_candidate
+        root = Path(project["path"])
+        saved = read_json(root / "workflow-state.json", {})
+        if not pending_refine(saved) or token != checkpoint_token(project, saved):
+            raise ValueError("方案检查点已变化，未批准或启动实验规划")
+        require_candidate(root, proposal_sha)
+        # 只进入文本实验规划并停下，不执行实验，因此不要求本机先有 CUDA。
+        options.pop("node_task", None)
+        state = run_workflow(root, continue_run=True, proposal_review_sha=proposal_sha,
+                             stop_after="experiment_plan", on_event=on_event, **options)
+    elif action == "revise":
         from paper_agent.agent.node_task import run_node_task
         state = run_node_task(Path(project["path"]), options["node_task"], options["prompt"],
                               data_root() / "runs" / run_id, model=options.get("model"),

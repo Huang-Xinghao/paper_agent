@@ -25,6 +25,10 @@ class CheckpointView(BaseModel):
     questions: list[str] = Field(default_factory=list)
     report: str
     files: list[str] = Field(default_factory=list)
+    brief: dict[str, str] | None = None
+    previous_brief: dict[str, str] | None = None
+    decision_options: list[list[str]] | None = None
+    report_sha256: str | None = None
 
 
 class HistoryView(BaseModel):

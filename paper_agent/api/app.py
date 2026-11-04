@@ -23,6 +23,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .schemas import HealthView, ProjectView
 from . import auth
 from .library import router as library_router
+from .idea_canvas import router as idea_canvas_router
 from .intent import route_message
 from .dispatch import RevisionTask, dispatch_message
 from .store import (
@@ -203,6 +204,7 @@ app.add_middleware(
 )
 app.include_router(auth.router)
 app.include_router(library_router)
+app.include_router(idea_canvas_router)
 
 
 @app.middleware("http")
@@ -232,7 +234,7 @@ class ProjectCreate(BaseModel):
 
 
 class RunCreate(BaseModel):
-    action: Literal["start", "resume", "review", "revise"] = "start"
+    action: Literal["start", "resume", "review", "revise", "proposal_revise", "proposal_approve"] = "start"
     prompt: str = Field(default="", max_length=20000)
     mode: Literal["auto", "expert"] | None = None
     start_node: str | None = None
@@ -244,10 +246,18 @@ class RunCreate(BaseModel):
     model: str | None = Field(default=None, max_length=200)
     answer: str = Field(default="", max_length=20000)
     checkpoint_token: str | None = None
+    proposal_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     node_task: RevisionTask | None = None
 
     @model_validator(mode="after")
     def nodes(self):
+        if self.action in {"proposal_revise", "proposal_approve"}:
+            if not self.proposal_sha256:
+                raise ValueError("请先保存要提交的方案草稿")
+            if self.prompt or self.answer or self.mode is not None or self.start_node or self.stop_after:
+                raise ValueError("方案审阅操作不能混入其他研究指令")
+        elif self.proposal_sha256 is not None:
+            raise ValueError("proposal_sha256 仅用于方案审阅操作")
         if (self.action == "revise") != (self.node_task is not None):
             raise ValueError("局部修改需要且仅允许携带 node_task")
         for node in [self.start_node, self.stop_after]:
@@ -320,6 +330,10 @@ def detail(project, terminal_paths=None):
     latest = runs[0] if runs else None
     terminal_paths = terminal_projects() if terminal_paths is None else terminal_paths
     status = latest["status"] if latest else state.get("status", "idle")
+    if (latest and latest["options"].get("action") == "proposal_revise"
+            and status not in ACTIVE):
+        # 修订是旁路草稿任务，完成/失败都不能抹掉原研究的待审阅状态。
+        status = state.get("status", "idle")
     if project["path"] in terminal_paths:
         status = "external_running"
     elif not latest and status == "running":
@@ -483,9 +497,32 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
             raise HTTPException(409, "已有项目正在运行，请等待完成或先停止当前运行")
         state = read_json(Path(project["path"]) / "workflow-state.json", {})
         options = body.model_dump(exclude_none=True)
+        if (state.get("status") == "awaiting_user" and state.get("current_node") == "refine"
+                and body.action not in {"review", "proposal_revise", "proposal_approve"}):
+            raise HTTPException(409, "最终方案待审阅，请先提交修改意见或批准方案")
         if message_prompt is not None:
             options["message_prompt"] = message_prompt
-        if body.action == "revise":
+        if body.action in {"proposal_revise", "proposal_approve"}:
+            from paper_agent.proposal_review import load_draft, require_candidate, pending_refine
+            try:
+                root = Path(project["path"])
+                load_draft(root, body.proposal_sha256)
+                if body.action == "proposal_approve":
+                    if not pending_refine(state):
+                        raise ValueError("只有当前研究精炼阶段的专家检查点可以批准进入实验规划；历史提案仅可修订草稿")
+                    if body.checkpoint_token != checkpoint_token(project, state):
+                        raise ValueError("检查点已变化，请刷新后重新确认")
+                    require_candidate(root, body.proposal_sha256)
+            except (ValueError, OSError) as exc:
+                raise HTTPException(409, str(exc)) from exc
+            latest = db.execute("SELECT options FROM runs WHERE project_id=? ORDER BY created_at DESC LIMIT 1", (project_id,)).fetchone()
+            if latest and body.model is None:
+                previous = json.loads(latest["options"])
+                if previous.get("model"):
+                    options["model"] = previous["model"]
+            for key in ["mode", "prompt", "answer", "start_node", "stop_after"]:
+                options.pop(key, None)
+        elif body.action == "revise":
             if not state:
                 raise HTTPException(409, "项目尚无产物，请先开始研究")
             if not body.prompt.strip():
@@ -502,6 +539,12 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
                 raise HTTPException(409, "项目没有待审阅检查点")
             if body.checkpoint_token != checkpoint_token(project, state):
                 raise HTTPException(409, "报告或检查点已变化，请刷新后重新确认")
+            if state.get("current_node") == "refine":
+                from paper_agent.proposal_review import guard_legacy_approval
+                try:
+                    guard_legacy_approval(Path(project["path"]))
+                except (ValueError, OSError) as exc:
+                    raise HTTPException(409, str(exc)) from exc
             for key in ["mode", "prompt", "start_node", "stop_after"]:
                 options.pop(key, None)
             latest = db.execute(

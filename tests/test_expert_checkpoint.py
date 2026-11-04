@@ -480,34 +480,47 @@ def test_answer_revision_in_nonliterature_node_uses_current_files(tmp_path, monk
 
 
 @pytest.mark.parametrize("stop_after", [None, "refine"])
-def test_refine_skips_review_and_routes_in_expert_mode(tmp_path, stop_after):
+def test_final_proposal_needs_explicit_approval_again_after_revision(tmp_path, stop_after):
     runner = runner_for(tmp_path)
-    calls = []
+    report = tmp_path / "refine-logs/FINAL_PROPOSAL.md"
+    report.parent.mkdir()
+    versions = iter(["方法 A", "方法 B"])
 
     def refine(state, prompt):
-        assert runner._expert_node is None
-        calls.append("refine")
+        method = next(versions)
+        brief = {"研究问题": "跨电芯泛化", "方法与创新": method,
+                 "关键假设与证据": "尚待验证", "成败判据": "留出电芯误差降低"}
+        report.write_text("\n".join(brief.values()), encoding="utf-8")
+        (tmp_path / runner._checkpoint_path("refine")).write_text(json.dumps({
+            "summary": "研究跨电芯泛化", "questions": ["选哪种基线？", "接受哪个边界？"],
+            "brief": brief, "decision_options": [["线性", "非线性"], ["单批次", "跨批次"]]}), encoding="utf-8")
         return NodeResult("proposal")
 
-    def plan(state, prompt):
-        calls.append("experiment_plan")
-        root = tmp_path / "refine-logs"
-        root.mkdir(exist_ok=True)
-        (root / "EXPERIMENT_PLAN.md").write_text("Plan")
-        (root / "experiment_plan_EXPERT_CHECKPOINT.json").write_text(json.dumps({
-            "summary": "Plan ready", "questions": ["基线？", "预算？"]}))
-        return NodeResult("plan")
-
     runner._nodes["refine"] = refine
-    runner._nodes["experiment_plan"] = plan
     state = WorkflowState("test", mode="expert", current_node="refine", task_prompt="Research")
-    result = runner.run("Research", state=state, stop_after=stop_after)
-    if stop_after:
-        assert result.status == "completed"
-        assert calls == ["refine"]
-        assert result.expert_checkpoint is None
-    else:
-        assert result.status == "awaiting_user"
-        assert calls == ["refine", "experiment_plan"]
-        assert result.expert_checkpoint["node"] == "experiment_plan"
-    assert not runner.agent.calls
+    state = runner.run("Research", state=state, stop_after=stop_after)
+    assert state.status == "awaiting_user" and state.current_node == "refine"
+    state = runner.resume_checkpoint(state, revise=True, advance_after_revision=True)
+    state = runner.run("使用方法 B", state=state, stop_after=stop_after)
+    assert state.status == "awaiting_user" and state.current_node == "refine"
+    assert state.expert_checkpoint["previous_brief"]["方法与创新"] == "方法 A"
+    assert state.expert_checkpoint["brief"]["方法与创新"] == "方法 B"
+    state = runner.resume_checkpoint(state)
+    assert state.history[-1]["sha256"] == hashlib.sha256(report.read_bytes()).hexdigest()
+    assert state.current_node == ("refine" if stop_after else "experiment_plan")
+    assert state.status == ("completed" if stop_after else "running")
+    report.write_text("正文已更改", encoding="utf-8")
+    with pytest.raises(ValueError, match="尚未批准"):
+        runner._run_experiment_plan(state, "plan")
+
+
+def test_proposal_review_rejects_unsupported_quote(tmp_path):
+    runner = runner_for(tmp_path)
+    report = tmp_path / runner._review_files("refine")[0]
+    report.parent.mkdir()
+    report.write_text("原文", encoding="utf-8")
+    (tmp_path / runner._checkpoint_path("refine")).write_text(json.dumps({
+        "summary": "方案", "questions": ["问题一", "问题二"],
+        "brief": {field: "没有出现的引文" for field in ("研究问题", "方法与创新", "关键假设与证据", "成败判据")}}))
+    with pytest.raises(ValueError, match="逐字摘录"):
+        runner._read_checkpoint("refine")

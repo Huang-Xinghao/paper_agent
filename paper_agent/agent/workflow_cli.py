@@ -44,6 +44,7 @@ def run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
                  mode: str | None = None, continue_run: bool = False,
                  revise: str | None = None,
                  advance_after_revision: bool = False,
+                 proposal_review_sha: str | None = None,
                  model: str | None = None,
                  paper_review_timeout: float | None = None,
                  paper_review_round2_timeout: float | None = None,
@@ -57,6 +58,12 @@ def run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
                 return pending
         raise ValueError("首次运行需要任务 prompt；项目当前没有待审阅检查点")
     resuming = continue_run or revise is not None
+    if not resuming:
+        path = project / "workflow-state.json"
+        if path.is_file():
+            pending = json.loads(path.read_text(encoding="utf-8"))
+            if pending.get("status") == "awaiting_user" and pending.get("current_node") == "refine":
+                raise ValueError("最终方案待审阅，请先返回项目批准或修订方案")
     if resuming and (start_node or mode is not None or prompt.strip()):
         raise ValueError("--continue/--revise 不能与入口节点、mode 或新任务 prompt 组合")
     if continue_run and revise is not None:
@@ -165,7 +172,10 @@ def run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
             if stop_after is not None:
                 saved.expert_checkpoint["stop_after"] = stop_after
             state = runner.resume_checkpoint(saved, revise=revise is not None,
-                                             advance_after_revision=advance_after_revision)
+                                             advance_after_revision=advance_after_revision,
+                                             **({"proposal_review_sha": proposal_review_sha} if proposal_review_sha else {}))
+            # 先持久化批准与冻结版本，再调用下游；下游失败也不丢失批准记录。
+            _write_json(project / "workflow-state.json", state.to_dict())
             if state.status != "completed":
                 state = runner.run(prompt, state=state, stop_after=stop_after)
         elif start_node is None:
@@ -253,15 +263,21 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
     while state.status == "awaiting_user":
         checkpoint = state.expert_checkpoint
         print(f"\n{checkpoint['node']} 结果摘要：{checkpoint['summary']}")
+        proposal_review = checkpoint["node"] == "refine"
+        for label, quote in (checkpoint.get("brief") or {}).items():
+            print(f"{label}：{quote}")
         for number, question in enumerate(checkpoint["questions"], 1):
             print(f"{number}. {question}")
+            if checkpoint.get("decision_options"):
+                print("   " + " / ".join(checkpoint["decision_options"][number - 1]))
         print(f"可编辑报告：{project.resolve() / checkpoint['report']}")
         for relative in checkpoint.get("files", [])[1:]:
             print(f"相关产物：{project.resolve() / relative}")
         if not sys.stdin.isatty():
             print("当前无交互终端，已保存检查点。在终端重新运行 --project 项目目录 即可返回审阅。")
             break
-        print("直接输入回答（可按题号一起回答），将据此修订报告正文后自动继续下一节点。\n"
+        print(("输入修改意见，修订后会再次展示方案供你批准。\n" if proposal_review else
+               "直接输入回答（可按题号一起回答），将据此修订报告正文后自动继续下一节点。\n") +
               "直接回车表示接受当前报告，不修订并继续。\n"
               "也可先在编辑器直接修改报告，保存后回车，将按最新文件继续。Ctrl+C 保存退出。")
         try:
@@ -275,10 +291,11 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
             continue
         if answer:
             questions = "\n".join(f"{i}. {q}" for i, q in enumerate(checkpoint["questions"], 1))
-            with report.open("a", encoding="utf-8") as stream:
-                stream.write(f"\n\n## 专家审阅：用户确认的研究方向\n\n"
-                             f"本次问题：\n{questions}\n\n用户回答：\n{answer}\n")
-            print("正在根据你的回答修订当前节点产物，完成后自动继续……", flush=True)
+            if not proposal_review:
+                with report.open("a", encoding="utf-8") as stream:
+                    stream.write(f"\n\n## 专家审阅：用户确认的研究方向\n\n"
+                                 f"本次问题：\n{questions}\n\n用户回答：\n{answer}\n")
+            print("正在根据你的回答修订当前节点产物……", flush=True)
             state = run_workflow(project, revise=(
                 f"用户已回答 {checkpoint['node']} 的专家审阅问题，请据此修订当前节点产物。\n"
                 f"主要文件：{json.dumps(checkpoint.get('files', [checkpoint['report']]), ensure_ascii=False)}。\n"
@@ -288,11 +305,13 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
                 "未明确的事项保留为假设，不擅自声称已获得用户批准。"
                 "按当前节点职责同步修订相关代码、图、正文或计划，满足原有产物校验。"
                 "不得仅改实验报告冒充新实验结果，不得篡改执行回执；实验变更须经现有执行工具验证。"
-                "保留用户回答以供追溯。此次修订完成后运行器会自动进入下游，无需再次提问确认。\n\n"
+                "保留用户回答以供追溯。\n\n"
                 f"本次问题：\n{questions}\n\n用户回答：\n{answer}"
             ), **run_options)
             if state.status != "awaiting_user":
                 return state
+            if proposal_review:
+                continue
         state = run_workflow(project, continue_run=True, **run_options)
     return state
 

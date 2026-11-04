@@ -40,7 +40,7 @@ CUDA 可用并不保证每个算法使用 GPU：数据处理和 CPU 基线可以
 
 ### 专家模式（每个节点均可审阅）
 
-默认 `--mode auto` 自动运行。`--mode expert` 在需要审阅的节点完成后保存 `awaiting_user` 状态（refine 完成后直接进入 experiment_plan），在交互终端显示摘要和 2–3 个研究取舍问题，并提供统一输入入口：
+默认 `--mode auto` 自动运行。`--mode expert` 在需要审阅的节点完成后保存 `awaiting_user` 状态，在交互终端显示摘要和 2–3 个研究取舍问题，并提供统一输入入口：
 
 ```bash
 ./run-workflow --project ./demo-project22 --mode expert '你的研究目标'
@@ -59,7 +59,7 @@ CUDA 可用并不保证每个算法使用 GPU：数据处理和 CPU 基线可以
 
 已移除 CLI 的 --continue/--revise 及终端的斜杠命令。所有输入文字均作为回答；输入为空时使用当前磁盘文件。等待期间不设自动超时，手动编辑文件后需要回车提交。摘要和问题保存在各节点主产物目录的 `<节点>_EXPERT_CHECKPOINT.json`（literature 使用 `literature/EXPERT_CHECKPOINT.json`），检查点、原始研究目标、确认哈希和停止位置保存在 `workflow-state.json`。确认时更新内存中的报告副本供下游使用；所有节点均设置检查点，最后的 improvement 确认后完成工作流。主流程 skill 未修改。
 
-专家检查点覆盖 literature、data_search、ideas、experiment_plan、experiment_bridge、paper_plan、paper_figure、paper_write、paper_compile、improvement。refine 不生成专家问题或暂停审阅；显式设置 --stop-after refine 时，完成后直接停止。其他节点即使设置 --stop-after，也先审阅目标节点，确认后停止。实验计划问题围绕具体区块的增删、优先级和实验设置修改；paper_plan 在计划正文及审阅问题中展示全部计划图的完整图注草稿，供用户按图编号逐张确认或修改。每次确认重新读取磁盘文件、校验主要产物存在并非空，记录多个主要文件哈希；ideas 等以内存内容传递的产物同步刷新。experiment_plan 确认时刷新 tracker；experiment_bridge 核对 manifest、执行回执、依赖和产物，未完成任务不放行；paper_compile / improvement 确认时重新编译当前源码以同步 PDF。手动编辑实验结果不等于执行了实验，训练或任务变更须在回答中要求当前节点执行。
+专家检查点覆盖 literature、data_search、ideas、refine、experiment_plan、experiment_bridge、paper_plan、paper_figure、paper_write、paper_compile、improvement。refine 交付一句话摘要和四项可回查正文的摘录。提交意见只修订并返回复审，明确批准当前版本后才可进入实验规划。指定 --stop-after refine 时，确认后停止。其他节点即使设置 --stop-after，也先审阅目标节点，确认后停止。实验计划问题围绕具体区块的增删、优先级和实验设置修改；paper_plan 在计划正文及审阅问题中展示全部计划图的完整图注草稿，供用户按图编号逐张确认或修改。每次确认重新读取磁盘文件、校验主要产物存在并非空，记录多个主要文件哈希；ideas 等以内存内容传递的产物同步刷新。experiment_plan 确认时刷新 tracker；experiment_bridge 核对 manifest、执行回执、依赖和产物，未完成任务不放行；paper_compile / improvement 确认时重新编译当前源码以同步 PDF。手动编辑实验结果不等于执行了实验，训练或任务变更须在回答中要求当前节点执行。
 
 计算和执行策略只读取项目根目录的 `project-config.json`，分别放在 `compute` 和 `execution` 对象中；文件缺省时使用当前默认值。`experiments/resources.json` 不再读取，也不再作为用户计算策略文件保护或纳入策略证据快照。
 

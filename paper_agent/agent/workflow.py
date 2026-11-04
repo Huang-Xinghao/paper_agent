@@ -199,7 +199,7 @@ class WorkflowRunner:
                     and state.expert_checkpoint.get("status") == "revision_requested"
                     and state.expert_checkpoint.get("advance_after_revision")
                 )
-                review_required = state.mode == "expert" and node != "refine" and not advance_revision
+                review_required = state.mode == "expert" and not advance_revision
                 self._expert_node = node if review_required else None
                 if self._expert_node:
                     (self._project / self._checkpoint_path(node)).unlink(missing_ok=True)
@@ -211,6 +211,10 @@ class WorkflowRunner:
                                  completion_check=lambda: None)
                     checkpoint = self._read_checkpoint(node)
                     report = self._require_file(self._review_files(node)[0])
+                    if node == "refine":
+                        previous = state.expert_checkpoint or {}
+                        if previous.get("node") == node and previous.get("status") == "revision_requested":
+                            checkpoint["previous_brief"] = previous.get("brief", {})
                     state.expert_checkpoint = {
                         **checkpoint, "node": node, "next_node": self._next_node(state, node),
                         "report": self._review_files(node)[0],
@@ -284,15 +288,26 @@ class WorkflowRunner:
         return state
 
     def resume_checkpoint(self, state: WorkflowState, *, revise: bool = False,
-                          advance_after_revision: bool = False) -> WorkflowState:
+                          advance_after_revision: bool = False,
+                          proposal_review_sha: str | None = None) -> WorkflowState:
         """Approve current files, or prepare to revise the paused node."""
         checkpoint = state.expert_checkpoint
         if (state.status != "awaiting_user" or state.current_node not in self._nodes
                 or not checkpoint or checkpoint.get("status") != "pending"
                 or checkpoint.get("node") != state.current_node):
             raise ValueError("没有待确认的专家检查点")
+        if revise and state.current_node == "refine" and state.mode == "expert":
+            from paper_agent.proposal_review import guard_legacy_approval
+            guard_legacy_approval(self._project)
         if not revise:
             node = state.current_node
+            review_receipt = {}
+            if node == "refine" and state.mode == "expert":
+                from paper_agent.proposal_review import guard_legacy_approval, require_candidate
+                if proposal_review_sha:
+                    require_candidate(self._project, proposal_review_sha)
+                else:
+                    guard_legacy_approval(self._project)
             for relative in self._review_files(node):
                 path = self._require_file(relative)
                 if path.suffix != ".pdf" and not path.read_text(encoding="utf-8").strip():
@@ -307,6 +322,11 @@ class WorkflowRunner:
                 write_experiment_tracker(self._project, read_plan_blocks(self._project))
             if node in {"paper_compile", "improvement"}:
                 self._compile_pdf()
+            if proposal_review_sha:
+                if node != "refine" or state.mode != "expert":
+                    raise ValueError("方案审阅批准只能用于研究精炼的专家检查点")
+                from paper_agent.proposal_review import publish_candidate
+                review_receipt = publish_candidate(self._project, proposal_review_sha)
             report = self._require_file(checkpoint["report"])
             content = report.read_text(encoding="utf-8")
             if not content.strip():
@@ -323,6 +343,7 @@ class WorkflowRunner:
             state.history.append({
                 "event": "expert_approved", "node": node,
                 "report": checkpoint["report"], "sha256": checkpoint["confirmed_sha256"],
+                **review_receipt,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
             next_node = checkpoint["next_node"]
@@ -332,7 +353,8 @@ class WorkflowRunner:
                 state.current_node = next_node
         else:
             checkpoint["status"] = "revision_requested"
-            checkpoint["advance_after_revision"] = advance_after_revision
+            # 最终方案的修改意见只授权修订，新稿仍需人明确批准。
+            checkpoint["advance_after_revision"] = advance_after_revision and state.current_node != "refine"
         if state.status != "completed":
             state.status = "running"
         state.error = None
@@ -348,6 +370,16 @@ class WorkflowRunner:
             checkpoint_path = self._checkpoint_path(node)
             (self._project / checkpoint_path).unlink(missing_ok=True)
             question_focus = {
+                "refine": (
+                    "最终方案将由研究者决定能否进入实验规划。summary 用不超过120个字符讲清核心想法。"
+                    "在检查点 JSON 增加 brief 对象，键必须为「研究问题」「方法与创新」「关键假设与证据」「成败判据」。"
+                    "每个值从 FINAL_PROPOSAL.md 正文逐字摘录一句，每项最多160个字符。"
+                    "在正文中简明写出这些句子，区分已有证据与推测，明确什么观察会推翻方案。"
+                    "questions 每项最多100个字符，围绕需要人决定的取舍与替代路线，说明选择会改变什么。"
+                    "另写 decision_options：按 questions 顺序给出二维字符串数组，每题两种不同的可行选择，"
+                    "每个选择用60个字符以内点明具体路线与代价，不预设用户偏好。"
+                    "修改意见要落实到正文，再基于当前正文更新摘要和摘录。"
+                ),
                 "literature": (
                     "本节点问题围绕报告实际提出的研究 gap：点明具体 gap、最接近的已有工作及尚未解决的差异，"
                     "请用户判断哪个 gap 更值得优先研究、是否符合其领域经验、需要收窄或调整哪些边界。"
@@ -711,7 +743,28 @@ class WorkflowRunner:
         if (not isinstance(questions, list) or not 2 <= len(questions) <= 3
                 or any(not isinstance(q, str) or not q.strip() for q in questions)):
             raise ValueError("EXPERT_CHECKPOINT.json requires 2–3 nonempty questions")
-        return {"summary": data["summary"], "questions": questions}
+        result = {"summary": data["summary"], "questions": questions}
+        if node == "refine":
+            brief = data.get("brief")
+            fields = ("研究问题", "方法与创新", "关键假设与证据", "成败判据")
+            if not isinstance(brief, dict) or set(brief) != set(fields):
+                raise ValueError("最终方案 brief 须包含：" + "、".join(fields))
+            if len(data["summary"]) > 120 or any(len(question) > 100 for question in questions):
+                raise ValueError("最终方案摘要最多120个字符，每个决策问题最多100个字符")
+            proposal = self._require_file(self._review_files(node)[0]).read_text(encoding="utf-8")
+            for field in fields:
+                quote = brief[field]
+                if not isinstance(quote, str) or not 1 <= len(quote.strip()) <= 160 or quote.strip() not in proposal:
+                    raise ValueError(f"{field}须逐字摘录当前方案正文，最多160个字符")
+            result["brief"] = {field: brief[field].strip() for field in fields}
+            options = data.get("decision_options")
+            if (not isinstance(options, list) or len(options) != len(questions)
+                    or any(not isinstance(pair, list) or len(pair) != 2
+                           or any(not isinstance(value, str) or not 1 <= len(value.strip()) <= 60 for value in pair)
+                           or pair[0].strip() == pair[1].strip() for pair in options)):
+                raise ValueError("每个方案取舍问题须有两个不同的备选，每项最多60个字符")
+            result["decision_options"] = [[value.strip() for value in pair] for pair in options]
+        return result
 
 
     def _run_refine(self, state: WorkflowState, prompt: str) -> NodeResult:
@@ -743,7 +796,19 @@ class WorkflowRunner:
     def _run_experiment_plan(self, state: WorkflowState, prompt: str) -> NodeResult:
         """Turn the approved final proposal into an executable experiment plan."""
         self._validate_required_artifacts(["refine-logs/FINAL_PROPOSAL.md"])
-        proposal = self._require_file("refine-logs/FINAL_PROPOSAL.md").read_text(encoding="utf-8")
+        proposal_bytes = self._require_file("refine-logs/FINAL_PROPOSAL.md").read_bytes()
+        if state.mode == "expert":
+            approved = next((item for item in reversed(state.history)
+                             if item.get("event") == "expert_approved" and item.get("node") == "refine"), {})
+            if approved.get("sha256") != hashlib.sha256(proposal_bytes).hexdigest():
+                raise ValueError("当前版本方案尚未批准，请从研究精炼阶段生成审阅摘要并确认")
+            if approved.get("frozen_report"):
+                from paper_agent.proposal_review import owned_path, sha
+                frozen = owned_path(self._project, approved["frozen_report"]).read_bytes()
+                if sha(frozen) != approved["sha256"]:
+                    raise ValueError("已批准方案的冻结副本校验失败")
+                proposal_bytes = frozen
+        proposal = proposal_bytes.decode("utf-8")
         result = self._go(
             f"""{prompt}
 
@@ -755,6 +820,11 @@ class WorkflowRunner:
 """,
             phase="experiment_plan",
         )
+        if state.mode == "expert":
+            if self._require_file("refine-logs/FINAL_PROPOSAL.md").read_bytes() != proposal_bytes:
+                raise ValueError("实验规划期间改写了已批准方案，计划未通过校验")
+            if approved.get("frozen_report") and owned_path(self._project, approved["frozen_report"]).read_bytes() != proposal_bytes:
+                raise ValueError("实验规划期间改写了冻结方案，计划未通过校验")
         self._require_file("refine-logs/EXPERIMENT_PLAN.md")
         write_experiment_tracker(self._project, read_plan_blocks(self._project))
         return NodeResult(result.final, {"phase": "experiment_plan", "iterations": result.iterations,
