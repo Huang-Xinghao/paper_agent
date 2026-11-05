@@ -56,10 +56,18 @@ def run_revision(root, expected_sha, run_id, folder, *, model=None, timeout=600,
     atomic_bytes(folder / "submission.json", json_bytes(payload))
     load_env_file(REPO / ".env")
     adapter = ModelClient(model=model or os.environ.get("PAPER_AGENT_MODEL", "gpt-4o"), timeout=timeout)
+    from paper_agent.skill_registry import snapshot_for_phase, phase_skills, render_context, usage
+    snapshot = snapshot_for_phase("proposal_revision")
+    skills = phase_skills(snapshot, "proposal_revision")
+    if on_event:
+        on_event({"kind": "skills_loaded", "node": "refine", "phase": "proposal_revision",
+                  "skills": usage(skills), "captured_at": snapshot["captured_at"]})
     if on_event:
         on_event({"kind": "proposal_revision_start", "node": "refine", "model": adapter.model})
     # 单次无工具请求：不继承 refine 的整套执行权限，也不会因格式错误自动多轮耗费。
-    options = {"model": adapter.model, "messages": [{"role": "system", "content": SYSTEM},
+    # 用户 Skill 补充研究方法；固定协议最后重申，格式和批准边界仍由程序校验。
+    system = ("Additional workbench research guidance:\n" + render_context(skills) + "\n" + SYSTEM) if skills else SYSTEM
+    options = {"model": adapter.model, "messages": [{"role": "system", "content": system},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
         "stream": True, "timeout": timeout}
     if os.environ.get("PAPER_AGENT_MAX_TOKENS"):

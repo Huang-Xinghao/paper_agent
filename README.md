@@ -2,6 +2,10 @@
 
 用于研究项目的 Agent 工作流与 FastAPI 接口，包含阶段审阅、实验执行、论文图表、LaTeX 编译和知识库访问。
 
+## 使用与技术文档
+
+从 [平台模块文档](docs/README.md) 进入：[方案审阅](docs/guides/proposal-review.md)、[Skill 管理](docs/guides/skills.md)、[开发技术说明](docs/reference/skill-management.md) 和 [迭代记录](docs/CHANGELOG.md)。后续功能修改与文档在同一次 PR 中更新，见 [维护约定](docs/maintenance.md)。
+
 ## 安装与启动
 
 需要 Python 3.11 或更新版本。

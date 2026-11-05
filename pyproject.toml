@@ -22,7 +22,7 @@ paper-web-api = "paper_agent.api.app:main"
 include = ["paper_agent*"]
 
 [tool.setuptools.package-data]
-paper_agent = ["skills/TOOL_BOUNDARIES.md", "skills/*/SKILL.md", "skills/shared-references/*.md", "skills/paper-write/templates/*"]
+paper_agent = ["skills/release.json", "skills/TOOL_BOUNDARIES.md", "skills/*/SKILL.md", "skills/shared-references/*.md", "skills/paper-write/templates/*"]
 
 [project.optional-dependencies]
 web = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "psutil>=6,<8"]

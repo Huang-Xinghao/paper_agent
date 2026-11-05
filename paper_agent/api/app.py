@@ -24,6 +24,8 @@ from .schemas import HealthView, ProjectView
 from . import auth
 from .library import router as library_router
 from .idea_canvas import router as idea_canvas_router
+from .skills import router as skills_router
+from paper_agent import skill_registry
 from .intent import route_message
 from .dispatch import RevisionTask, dispatch_message
 from .store import (
@@ -172,6 +174,7 @@ async def lifespan(_):
     if os.environ.get("PAPER_AGENT_PUBLIC_HOSTS") and not auth.enabled():
         raise RuntimeError("Public access requires PAPER_AGENT_PASSWORD_HASH")
     initialize()
+    skill_registry.initialize()
     auth.initialize()
     for root in allowed_roots():
         if root.is_dir():
@@ -205,6 +208,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(library_router)
 app.include_router(idea_canvas_router)
+app.include_router(skills_router)
 
 
 @app.middleware("http")
@@ -580,6 +584,7 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
                 now(),
             ),
         )
+        skill_registry.capture_for_run(db, identifier)
     folder = data_root() / "runs" / identifier
     folder.mkdir(parents=True)
     try:

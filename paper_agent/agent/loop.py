@@ -101,7 +101,8 @@ class AgentLoop:
         self.last_state: AgentState | None = None
 
     async def _invoke(self, spec: ToolSpec, arguments: dict[str, Any]) -> ToolResult:
-        result = spec.handler(ToolContext(self.workspace, self.skill_dirs, self.knowledge_roots), **arguments)
+        result = spec.handler(ToolContext(self.workspace, self.skill_dirs, self.knowledge_roots,
+                                         getattr(self, "_skill_snapshot", None)), **arguments)
         if inspect.isawaitable(result):
             result = await result
         return result
@@ -264,20 +265,7 @@ class PhaseAgent(AgentLoop):
     runtime instead of being split between a configurator and ``AgentLoop``.
     """
 
-    SKILL_BY_PHASE = {
-        "literature": "research-lit",
-        "data_search": "data-search",
-        "ideas": "idea-creator",
-        "novelty": "novelty-check",
-        "research_refine": "research-refine",
-        "experiment_plan": "experiment-plan",
-        "experiment_bridge": "experiment-bridge",
-        "paper_plan": "paper-plan",
-        "paper_figure": "paper-figure",
-        "paper_write": "paper-write",
-        "paper_compile": "paper-compile",
-        "improvement": "auto-paper-improvement-loop",
-    }
+    from paper_agent.skill_registry import SKILL_BY_PHASE
     DEFAULT_BATTERY_KNOWLEDGE_ROOT = Path(__file__).resolve().parents[2] / "电池资源库"
 
     def __init__(self, project: str | Path, *, model: str | None = None,
@@ -303,6 +291,8 @@ class PhaseAgent(AgentLoop):
         self._custom_tools: set[str] = set()
         self._tool_phases: dict[str, tuple[str, ...]] = {}
         self._skills: list[str] = []
+        self._phase_snapshots = {}
+        self._skill_snapshot = None
         self.configure()
 
     def add_tool(self, api: ToolSpec, *, phases: tuple[str, ...] | None = None) -> None:
@@ -341,13 +331,15 @@ class PhaseAgent(AgentLoop):
         self.knowledge_roots = ((self.knowledge_root,) if self.knowledge_root else ())
 
     def _skill_prompt(self) -> str:
-        names = self._skills or [self.SKILL_BY_PHASE.get(self.phase, self.phase)]
-        text = []
-        for name in names:
-            path = self.skills_root / name / "SKILL.md"
-            if path.is_file():
-                text.append(f"\n## Skill: {name}\n{path.read_text(encoding='utf-8')}")
-        return "".join(text)
+        from paper_agent.skill_registry import phase_skills, render_context, snapshot_for_phase, usage
+        # 一个实例会服务多个阶段；只在该阶段第一次调用时取最新内容。
+        if self.phase not in self._phase_snapshots:
+            self._phase_snapshots[self.phase] = snapshot_for_phase(self.phase)
+        self._skill_snapshot = self._phase_snapshots[self.phase]
+        items = phase_skills(self._skill_snapshot, self.phase, self._skills)
+        self._progress("skills_loaded", phase=self.phase, skills=usage(items),
+                       captured_at=self._skill_snapshot["captured_at"])
+        return render_context(items)
 
     def _experiment_template_context(self) -> str:
         if self.phase not in {"experiment_plan", "experiment_bridge"}:

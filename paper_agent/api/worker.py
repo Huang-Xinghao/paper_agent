@@ -38,6 +38,13 @@ def stop_tree(process):
 
 
 def execute(run_id):
+    from paper_agent import skill_registry
+
+    with skill_registry.use_run(run_id):
+        _execute(run_id)
+
+
+def _execute(run_id):
     from paper_agent.agent.workflow_cli import run_workflow
     from .runtime import check_runtime
 

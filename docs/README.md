@@ -1,0 +1,29 @@
+# 平台模块文档
+
+本文档描述当前分支代码的能力，不代表线上服务已经部署。最近核对：2026-11-06。
+
+## 用户：从这里开始
+
+| 想完成的事情 | 阅读入口 |
+| --- | --- |
+| 理解、修改研究方案，再交给实验规划 | [方案审阅使用说明](guides/proposal-review.md) |
+| 创建研究规则、选择适用阶段、管理版本 | [Skill 管理使用说明](guides/skills.md) |
+| 查看这轮更新和兼容性 | [迭代记录](CHANGELOG.md) |
+
+## 开发者：理解实现与维护
+
+| 问题 | 阅读入口 |
+| --- | --- |
+| Skill 如何保存、选择、固定版本并交给 Agent | [Skill 管理技术说明](reference/skill-management.md) |
+| 方案如何统一修订、校验、批准和交付 | [方案审阅技术说明](reference/proposal-review.md) |
+| 后端启动、部署与已有 API | [Web 服务](web.md)、[运行环境](runtime.md) |
+| 前端组件、草稿和缓存如何处理 | [前端模块说明](https://github.com/Huang-Xinghao/paper-agent-frontend/blob/codex/idea-review/docs/modules.md) |
+| 后续改功能时，哪些文档一起更新 | [文档维护约定](maintenance.md) |
+
+跨仓链接当前指向 `codex/idea-review`。合并主分支时，两仓一起更新这些链接。
+
+## 设计参考：与已实现功能区分
+
+- [上游研究方案输出约定](proposal-output-contract-draft.md)：讨论稿，尚未实施。尤其“只有部分待决事项阻塞批准”仍是提案；当前只要修订结果存在待决问题，就不能批准。
+- [Skill 挂载源码调研](skill-mounting-research-2026-11-05.md)：记录开源系统机制、本次取舍和来源，不替代操作说明。
+- 历史审计文档描述其记录时点，当前部署情况应通过服务状态和运行记录核对。

@@ -242,4 +242,4 @@ def create_fixture():
 
 import uvicorn
 
-uvicorn.run(api.app, host="0.0.0.0", port=8001)
+uvicorn.run(api.app, host="0.0.0.0", port=int(os.environ.get("PAPER_AGENT_REVIEW_DEMO_PORT", "8001")))

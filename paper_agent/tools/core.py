@@ -33,6 +33,7 @@ class ToolContext:
     workspace: Path
     skill_dirs: tuple[Path, ...] = ()
     knowledge_roots: tuple[Path, ...] = ()
+    skill_snapshot: dict[str, Any] | None = None
 
     def resolve_read(self, path: str | Path | None = None) -> Path:
         from .data_access import resolve_data_read

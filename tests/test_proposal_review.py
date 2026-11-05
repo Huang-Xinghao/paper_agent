@@ -108,6 +108,35 @@ def test_revision_reports_real_stages_without_per_token_events(review, monkeypat
     assert reports[-1]['receivedChars'] == reports[3]['receivedChars']
 
 
+def test_revision_loads_frozen_bound_skills_without_granting_tools(review, monkeypatch, tmp_path):
+    from paper_agent import skill_registry as registry
+    _, root, _, _ = review
+    item = registry.save({'title': '核查目标', 'description': '修订时检查用户目标',
+        'instructions': 'UNIQUE_REVISION_GUIDANCE_V1', 'enabled': True, 'phases': ['proposal_revision']})
+    snapshot = registry.capture_snapshot()
+    registry.save({**item, 'instructions': 'UNIQUE_REVISION_GUIDANCE_V2'},
+                  identifier=item['id'], expected_etag=item['etag'])
+    fake_model(monkeypatch, root)
+    adapter = proposal_revision.ModelClient()
+    original = adapter.client.chat.completions.create
+    def create(**kwargs):
+        system = kwargs['messages'][0]['content']
+        assert 'UNIQUE_REVISION_GUIDANCE_V1' in system
+        assert 'UNIQUE_REVISION_GUIDANCE_V2' not in system
+        assert proposal_revision.SYSTEM in system
+        assert 'tools' not in kwargs
+        return original(**kwargs)
+    adapter.client.chat.completions.create = create
+    monkeypatch.setattr(proposal_revision, 'ModelClient', lambda **kwargs: adapter)
+    events = []
+    with registry.use_snapshot(snapshot):
+        proposal_revision.run_revision(root, sha((root / CANVAS).read_bytes()), 'skill-revision',
+                                       tmp_path / 'skill-revision', on_event=events.append)
+    loaded = next(event for event in events if event['kind'] == 'skills_loaded')
+    assert loaded['skills'][0]['version'] == 1
+    assert loaded['skills'][0]['content_hash'] == item['content_hash']
+
+
 def test_revision_repeats_without_changing_formal_or_workflow(review, monkeypatch, tmp_path):
     client, root, endpoint, project = review
     before = (root / PROPOSAL).read_bytes(), (root / 'workflow-state.json').read_bytes()

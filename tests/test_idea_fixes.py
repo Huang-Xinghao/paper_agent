@@ -37,13 +37,15 @@ def test_direct_ideas_cannot_finish_without_canonical_report(tmp_path):
     assert result.iterations == 3
 
 
-def test_skill_not_silently_truncated(tmp_path):
-    agent = PhaseAgent(tmp_path, model_client=object())
-    agent.skills_root = tmp_path
+def test_skill_not_silently_truncated(tmp_path, monkeypatch):
+    from paper_agent import skill_registry
     folder = tmp_path / 'idea-creator'
     folder.mkdir()
     (folder / 'SKILL.md').write_text('x' * 13000 + 'FINAL RULE')
-    assert agent._skill_prompt().endswith('FINAL RULE')
+    # 新入口先固定版本，再生成提示词；仍验证长正文末尾没有被截断。
+    monkeypatch.setattr(skill_registry, 'BUILTIN_ROOT', tmp_path)
+    agent = PhaseAgent(tmp_path, model_client=object())
+    assert agent._skill_prompt().rstrip().endswith('FINAL RULE')
 
 
 def test_idea_search_can_finish_without_metadata_verification(tmp_path):
