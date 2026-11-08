@@ -1,4 +1,6 @@
 import json
+import hashlib
+from copy import deepcopy
 
 import pytest
 
@@ -6,6 +8,8 @@ from paper_agent.agent.model_client import ModelResponse
 from paper_agent.agent.wiki import WikiAgent
 from paper_agent.tools import ToolContext, research_wiki
 from paper_agent.tools.literature import read_paper_pages
+from paper_agent.tools.paper_preprocessing import document_from_structured
+from paper_agent.tools.research_wiki import PAPER_SECTIONS
 
 
 def make_pdf(tmp_path, monkeypatch, texts=("Introduction", "Methods", "Results")):
@@ -14,7 +18,11 @@ def make_pdf(tmp_path, monkeypatch, texts=("Introduction", "Methods", "Results")
     source.write_bytes(b"%PDF-1.4")
     def read(project, path):
         assert path == source
+        document = document_from_structured({"pages": [
+            {"page_idx": i, "blocks": [{"type": "text", "content": text}]}
+            for i, text in enumerate(texts)]}, pdf_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
         return {"status": "completed", "figures": [],
+                "document": document,
                 "pages": [{"page": i + 1, "text": text} for i, text in enumerate(texts)]}
     monkeypatch.setattr("paper_agent.agent.wiki.read_mineru_paper", read)
     return source
@@ -29,10 +37,14 @@ def analysis(experiments=None, datasets=None, sections=None):
             "One-line thesis": "State estimation [p. 1]",
             "Dataset and Features": "Voltage features [p. 2]",
             "Experiments": "Overall and comparison [p. 3]",
+            "Method": "A state estimator [p. 1]",
+            "Problem / Gap": "State estimation gap [p. 1]",
+            "Key Results": "Lower error [p. 3]",
+            "Limitations / Failure Modes": "Evidence limited to the reported setting [p. 3]",
         },
         "datasets": datasets if datasets is not None else [
-            {"name": "MATR", "evidence": "Training set [p. 2]", "catalog_id": "MATR"},
-            {"name": "MATR", "evidence": "Same training set [p. 3]", "catalog_id": "MATR"},
+            {"name": "MATR", "evidence": "Training set [p. 2]", "catalog_id": None},
+            {"name": "MATR", "evidence": "Same training set [p. 3]", "catalog_id": None},
             {"name": "UL", "evidence": "External test [p. 3]", "catalog_id": None},
         ],
         "idea": {"title": "Battery state estimation",
@@ -47,6 +59,34 @@ def analysis(experiments=None, datasets=None, sections=None):
             for title in ("Overall evaluation", "Baseline comparison")
         ],
     }
+
+
+def review_response(messages):
+    """A fake reviewer for orchestration tests, NOT a factual validation oracle."""
+    payload = json.loads(messages[1]["content"])
+    if "claim_context" not in payload:
+        return None
+    supported = {"status": "supported", "reason": "Synthetic reviewer response for pipeline tests"}
+    return ModelResponse(content=json.dumps({
+        "claims": [{"id": c["id"], **supported} for c in payload["draft"]["critical_claims"]],
+        "sections": {s: supported for s in PAPER_SECTIONS}, "entities": supported,
+        "coverage": {**supported, "missing": []}, "issues": []}))
+
+
+def fixture_response(messages, draft):
+    result = deepcopy(draft)
+    payload = json.loads(messages[1]["content"])
+    block = payload["source_document"]["blocks"][0]
+    evidence = [{"block_id": block["id"], "quote": block["text"]}]
+    result["section_status"] = {s: {"status": "extracted", "origin": "author_reported",
+        "reason": "Synthetic extraction for orchestration tests", "evidence": evidence} for s in PAPER_SECTIONS}
+    kinds = {"Method": "input_condition", "Key Results": "main_result",
+             "Dataset and Features": "data_evaluation", "Experiments": "data_evaluation",
+             "Limitations / Failure Modes": "limitation"}
+    result["critical_claims"] = [{"id": f"c{i}", "kind": kind, "section": section,
+        "statement": result["sections"].get(section, "Synthetic claim"), "evidence": evidence}
+        for i, (section, kind) in enumerate(kinds.items())]
+    return ModelResponse(content=json.dumps(result))
 
 
 def test_mineru_failure_stops_before_analysis_and_wiki_writes(tmp_path, monkeypatch):
@@ -76,27 +116,31 @@ def test_wiki_agent_reads_full_pdf_once_and_deduplicates_datasets(tmp_path, monk
 
         def complete(self, messages, tools):
             self.calls += 1
+            if response := review_response(messages):
+                return response
             assert tools == []
             assert "2 to 5 broad experimental directions" in messages[0]["content"]
             payload = json.loads(messages[1]["content"])
-            assert payload["pages"] == [
-                {"page": 1, "text": "Introduction"},
-                {"page": 2, "text": "Methods"},
-                {"page": 3, "text": "Results"},
+            assert [(b["page"], b["text"]) for b in payload["source_document"]["blocks"]] == [
+                (1, "Introduction"), (2, "Methods"), (3, "Results"),
             ]
             assert payload["dataset_catalog"]["path"] == str(catalog)
             assert "UL_PUR catalog entries" in payload["dataset_catalog"]["index"]
             assert payload["dataset_catalog"]["catalog_ids"] == ["MATR", "UL_PUR"]
             assert payload["dataset_catalog"]["source_notes"] == {
                 "MATR": "Source record: example DOI"}
-            return ModelResponse(content=json.dumps(analysis()))
+            draft = analysis()
+            for dataset in draft["datasets"]:
+                if dataset["name"] == "MATR":
+                    dataset["catalog_id"] = "MATR"
+            return fixture_response(messages, draft)
 
     model = Model()
     agent = WikiAgent(tmp_path, model_client=model)
     result = agent.go("Record this paper", paper_path="papers/battery.pdf")
-    assert model.calls == 1
+    assert model.calls == 2
     assert result.page_count == 3
-    assert result.steps == ["select_paper", "read_full_paper", "extract_architecture_figures", "validate_analysis",
+    assert result.steps == ["select_paper", "read_full_paper", "extract_architecture_figures", "verify_evidence", "validate_analysis",
                             "ingest_paper", "upsert_idea", "add_reported_experiments",
                             "verify_write"]
     paper = (tmp_path / result.wiki_path).read_text()
@@ -120,7 +164,7 @@ def test_wiki_agent_reads_full_pdf_once_and_deduplicates_datasets(tmp_path, monk
              (tmp_path / "research-wiki" / "graph" / "edges.jsonl").read_text().splitlines()]
     assert len(edges) == 3
     again = agent.go("Record this paper", paper_path="papers/battery.pdf")
-    assert model.calls == 2
+    assert model.calls == 4
     assert again.experiment_paths == result.experiment_paths
     assert len(list((tmp_path / "research-wiki" / "papers").glob("*.md"))) == 1
     assert len((tmp_path / "research-wiki" / "graph" / "edges.jsonl").read_text().splitlines()) == 3
@@ -139,7 +183,7 @@ def test_wiki_agent_rejects_bad_analysis_before_writing(tmp_path, monkeypatch):
     assert not (tmp_path / "research-wiki").exists()
 
 
-def test_wiki_agent_corrects_sections_without_rereading_pdf(tmp_path, monkeypatch):
+def test_wiki_agent_repairs_sections_using_original_evidence_without_reparsing_pdf(tmp_path, monkeypatch):
     make_pdf(tmp_path, monkeypatch)
 
     class Model:
@@ -147,16 +191,18 @@ def test_wiki_agent_corrects_sections_without_rereading_pdf(tmp_path, monkeypatc
 
         def complete(self, messages, tools):
             self.calls += 1
+            if response := review_response(messages):
+                return response
             if self.calls == 1:
-                return ModelResponse(content=json.dumps(analysis(sections={"Methods": "x"})))
+                return fixture_response(messages, analysis(sections={"Methods": "x"}))
             payload = json.loads(messages[1]["content"])
-            assert "schema_errors" in payload
-            assert "pages" not in payload
-            return ModelResponse(content=json.dumps({"sections": analysis()["sections"]}))
+            assert "issues" in payload
+            assert payload["source_document"]["blocks"][0]["text"] == "Introduction"
+            return fixture_response(messages, analysis())
 
     model = Model()
     result = WikiAgent(tmp_path, model_client=model).go("Read", paper_path="papers/battery.pdf")
-    assert model.calls == 2
+    assert model.calls == 3
     assert "Voltage features" in (tmp_path / result.wiki_path).read_text()
 
 
@@ -170,14 +216,16 @@ def test_wiki_agent_consolidates_excessive_experiment_nodes(tmp_path, monkeypatc
 
         def complete(self, messages, tools):
             self.calls += 1
+            if response := review_response(messages):
+                return response
             if self.calls == 1:
-                return ModelResponse(content=json.dumps(many))
+                return fixture_response(messages, many)
             assert "Group the paper's reported experiments" in messages[0]["content"]
             return ModelResponse(content=json.dumps({"experiments": analysis()["experiments"]}))
 
     model = Model()
     result = WikiAgent(tmp_path, model_client=model).go("Read", paper_path="papers/battery.pdf")
-    assert model.calls == 2
+    assert model.calls == 3
     assert len(result.experiment_paths) == 2
     for relative in result.experiment_paths:
         text = (tmp_path / relative).read_text()
@@ -198,7 +246,7 @@ def test_wiki_agent_rejects_invalid_catalog_match_before_writing(
 
     class Model:
         def complete(self, messages, tools):
-            return ModelResponse(content=json.dumps(analysis(datasets=[invalid_dataset])))
+            return review_response(messages) or fixture_response(messages, analysis(datasets=[invalid_dataset]))
 
     with pytest.raises(ValueError, match="unknown catalog_id"):
         WikiAgent(tmp_path, model_client=Model()).go("Read", paper_path="papers/battery.pdf")
@@ -273,8 +321,10 @@ def test_pdf_classification_is_per_node_and_updates_existing_nodes(tmp_path, mon
 
     class Model:
         def complete(self, messages, tools):
+            if response := review_response(messages):
+                return response
             assert 'scenario and task arrays' in messages[0]['content']
-            return ModelResponse(content=json.dumps(draft))
+            return fixture_response(messages, draft)
 
     agent = WikiAgent(tmp_path, model_client=Model())
     result = agent.go('Read', paper_path='papers/battery.pdf')
@@ -314,7 +364,7 @@ def test_invalid_classification_fails_before_any_write(tmp_path, monkeypatch, ta
 
     class Model:
         def complete(self, messages, tools):
-            return ModelResponse(content=json.dumps(draft))
+            return review_response(messages) or fixture_response(messages, draft)
 
     with pytest.raises(ValueError, match=key + ' must be an array'):
         WikiAgent(tmp_path, model_client=Model()).go('Read', paper_path='papers/battery.pdf')

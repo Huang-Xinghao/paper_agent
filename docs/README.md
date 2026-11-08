@@ -1,6 +1,6 @@
 # 平台模块文档
 
-本文档描述当前分支代码的能力，不代表线上服务已经部署。最近核对：2026-11-06。
+本文档描述当前分支代码的能力，不代表线上服务已经部署。最近核对：2026-11-09。
 
 ## 用户：从这里开始
 
@@ -8,6 +8,7 @@
 | --- | --- |
 | 理解、修改研究方案，再交给实验规划 | [方案审阅使用说明](guides/proposal-review.md) |
 | 创建研究规则、选择适用阶段、管理版本 | [Skill 管理使用说明](guides/skills.md) |
+| 理解研究 Agent 如何找论文、引用证据和呈现缺口 | [Wiki 检索使用说明](guides/wiki-retrieval.md) |
 | 查看这轮更新和兼容性 | [迭代记录](CHANGELOG.md) |
 
 ## 开发者：理解实现与维护
@@ -16,6 +17,8 @@
 | --- | --- |
 | Skill 如何保存、选择、固定版本并交给 Agent | [Skill 管理技术说明](reference/skill-management.md) |
 | 方案如何统一修订、校验、批准和交付 | [方案审阅技术说明](reference/proposal-review.md) |
+| 论文如何清洗、保留原文位置、整理并核验证据 | [Wiki 预处理与核验](wiki.md#论文预处理与证据核验) |
+| 混合检索、图导航、取证预算、引用检查及缓存如何实现 | [Wiki 检索技术说明](reference/wiki-retrieval.md) |
 | 后端启动、部署与已有 API | [Web 服务](web.md)、[运行环境](runtime.md) |
 | 前端组件、草稿和缓存如何处理 | [前端模块说明](https://github.com/Huang-Xinghao/paper-agent-frontend/blob/codex/idea-review/docs/modules.md) |
 | 后续改功能时，哪些文档一起更新 | [文档维护约定](maintenance.md) |

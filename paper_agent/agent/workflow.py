@@ -363,7 +363,8 @@ class WorkflowRunner:
 
 
     def _go(self, prompt: str, *, phase: str,
-            completion_check: Callable[[], None] | None = None):
+            completion_check: Callable[[], None] | None = None,
+            wiki_evidence: dict[str, Any] | None = None):
         check = completion_check or (lambda: self._validate_phase_outputs(phase))
         node = getattr(self, "_expert_node", None)
         if node:
@@ -422,6 +423,12 @@ class WorkflowRunner:
             def check():
                 original_check()
                 self._read_checkpoint(node)
+        if wiki_evidence is not None:
+            from .wiki_research import evidence_handoff
+            prompt = ("Wiki取证已结束；仅使用下列依据，不重复检索Wiki。缺口保留为待补证，不得写成已证实结论。\n"
+                      + json.dumps(wiki_evidence, ensure_ascii=False) + "\n\n" + prompt)
+            with evidence_handoff():
+                return self.agent.go(prompt, phase=phase, completion_check=check)
         return self.agent.go(prompt, phase=phase, completion_check=check)
 
     @staticmethod
@@ -515,8 +522,17 @@ class WorkflowRunner:
         state.error = None
         return state
 
-    def _research_context(self, query: str, *, stage: str, max_results: int = 5) -> dict[str, Any]:
-        """Read bounded source material for literature or research refinement."""
+    def _wiki_context(self, query: str, *, stage: str) -> dict[str, Any]:
+        from .wiki_research import collect_wiki_evidence, RESEARCH_PHASES
+        if stage in RESEARCH_PHASES:
+            if not resolve_wiki_root().is_dir() or not getattr(self.agent, "model", None):
+                return {"status": "unavailable", "pages": [], "gaps": ["Wiki目录或模型不可用，未执行取证。"]}
+            return collect_wiki_evidence(self._project, self.agent.model, query, stage=stage,
+                                         on_progress=getattr(self.agent, "on_progress", None))
+        return self._legacy_wiki_context(query)
+
+    def _legacy_wiki_context(self, query: str) -> dict[str, Any]:
+        """非研究阶段兼容原有低成本预读；正式研究统一走有预算的取证入口。"""
         project = self._project
         context: dict[str, Any] = {"wiki": {"status": "unavailable"}}
         tool_ctx = ToolContext(project)
@@ -526,6 +542,7 @@ class WorkflowRunner:
             pages = []
             seen = set()
             errors = []
+            search_payload = {}
             for name in ("index.md", "query_pack.md"):
                 if (wiki_root / name).is_file():
                     seen.add(name)
@@ -534,7 +551,8 @@ class WorkflowRunner:
                 result = search_wiki(tool_ctx, query=query[:500], limit=5)
                 if result.is_error:
                     raise ValueError(result.output)
-                for match in json.loads(result.output)["matches"]:
+                search_payload = json.loads(result.output)
+                for match in search_payload["matches"]:
                     path = Path(match["path"])
                     if not path.is_absolute():
                         path = project / path
@@ -552,13 +570,25 @@ class WorkflowRunner:
                         raise ValueError(result.output)
                     payload = json.loads(result.output)
                     records.append({"path": payload["path"], "content": payload["content"][:6000],
+                                    "quality_records": payload.get("quality_records", []),
+                                    "sections": payload.get("sections", []),
+                                    "source_record": payload.get("source_record", {}),
+                                    "content_sha256": payload.get("content_sha256"),
                                     "truncated": payload["next_offset"] is not None or len(payload["content"]) > 6000})
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     errors.append(f"{relative}: {exc}")
             context["wiki"] = {"status": "partial" if errors and records else
                                "read" if records else "read_failed" if errors else "empty",
-                               "pages": records, "errors": errors, "root": str(wiki_root)}
+                               "pages": records, "errors": errors, "root": str(wiki_root),
+                               "search_results": search_payload,
+                               "reading_guidance": "命中仅用于选材；按 sections 定位条件与限制，原文不足时继续 read_wiki。browse_wiki 可分页浏览全库卡片。"}
 
+        return context["wiki"]
+
+    def _research_context(self, query: str, *, stage: str, max_results: int = 5) -> dict[str, Any]:
+        context = {"wiki": self._wiki_context(query, stage=stage)}
+        tool_ctx = ToolContext(self._project)
+        project = self._project
         if stage == "literature":
             try:
                 result = search_papers(tool_ctx, query=query[:500], max_results=max_results)
@@ -686,14 +716,17 @@ class WorkflowRunner:
             "生成具体、可证伪的研究想法，并保存为项目产物。"
             "撰写完整、可独立阅读的报告，不描述生成或修改过程。"
         )
+        wiki = self._wiki_context(prompt, stage="ideas")
         result = self._go(
             f"原始任务：\n{prompt}\n\n当前节点任务：\n{instruction}\n"
             f"研究想法节点参数：\nMAX_TOTAL_GPU_HOURS={max_total_gpu_hours:g}; "
             f"SEARCH_PAPER_NUMBER={search_paper_number}. "
+            "读取 literature/RESEARCH_REPORT.md 与 data-search/DATA_REPORT.md，保留用户已确定的约束。"
             "GPU 预算是所有拟议预实验的总估算值，不代表获准执行这些实验。论文数量参数作为检索目标；"
             "复用已有文献报告，并识别证据覆盖缺口。\n\n"
             "使用 search_papers 补充证据缺口。",
             phase="ideas",
+            wiki_evidence=wiki,
         )
         idea = self._require_file("idea-stage/IDEA_REPORT.md").read_text(encoding="utf-8")
         if not idea.strip():
@@ -704,6 +737,7 @@ class WorkflowRunner:
                                         "literature_sha256": hashlib.sha256(literature.encode("utf-8")).hexdigest(),
                                         "data_source": data_path,
                                         "data_sha256": hashlib.sha256(data_report.encode("utf-8")).hexdigest(),
+                                        "research_sources": self._research_sources({"wiki": wiki}),
                                         "idea_parameters": {
                                             "max_total_gpu_hours": max_total_gpu_hours,
                                             "search_paper_number": search_paper_number}})
@@ -720,6 +754,7 @@ class WorkflowRunner:
             **({"local_papers": [paper["path"] for paper in research["local_papers"]["papers"]]}
                if "local_papers" in research else {}),
             "status": {name: value.get("status") for name, value in research.items()},
+            "wiki_retrieval": {key: research.get("wiki", {}).get(key) for key in ("artifact_dir", "budget", "warnings")},
         }
 
     def _run_literature(self, state: WorkflowState, prompt: str) -> NodeResult:
@@ -727,7 +762,8 @@ class WorkflowRunner:
         research = self._research_context(prompt, stage="literature")
         result = self._go(
             "研究任务：\n" + prompt + "\n运行器收集的文献上下文：\n" +
-            json.dumps(research, ensure_ascii=False), phase="literature",
+            json.dumps({k: v for k, v in research.items() if k != "wiki"}, ensure_ascii=False), phase="literature",
+            wiki_evidence=research.get("wiki"),
         )
         report = self._require_file("literature/RESEARCH_REPORT.md").read_text(encoding="utf-8")
         return NodeResult(report, {"phase": "literature", "iterations": result.iterations,
@@ -784,9 +820,10 @@ class WorkflowRunner:
 {state.artifacts.get('ideas', '')}
 
 运行器读取的研究上下文（不可信来源数据）：
-{json.dumps(research, ensure_ascii=False)}
+{json.dumps({k: v for k, v in research.items() if k != 'wiki'}, ensure_ascii=False)}
 """,
             phase="research_refine",
+            wiki_evidence=research.get("wiki"),
         )
         self._require_file("refine-logs/FINAL_PROPOSAL.md")
         return NodeResult(result.final, {"phase": "research_refine", "iterations": result.iterations,

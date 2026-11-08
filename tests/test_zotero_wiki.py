@@ -6,7 +6,9 @@ import pytest
 from paper_agent.agent.wiki import WikiAgent
 from paper_agent.agent.model_client import ModelResponse
 from paper_agent.tools.zotero import ZoteroClient
-from test_wiki_agent import analysis
+from test_wiki_agent import analysis, fixture_response, review_response
+from paper_agent.tools.paper_preprocessing import document_from_structured
+import hashlib
 
 
 def transport(request):
@@ -43,9 +45,12 @@ def client():
 
 
 def fake_reader(monkeypatch):
-    monkeypatch.setattr('paper_agent.agent.wiki.read_mineru_paper', lambda *args: {
-        'status': 'completed', 'figures': [],
-        'pages': [{'page': 1, 'text': 'Paper methods and results'}]})
+    def read(project, path):
+        document = document_from_structured({"pages": [{"page_idx": 0, "blocks": [
+            {"content": "Paper methods and results"}]}]},
+            pdf_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+        return {"status": "completed", "figures": [], "document": document, "pages": document["pages"]}
+    monkeypatch.setattr('paper_agent.agent.wiki.read_mineru_paper', read)
 
 
 def test_download_metadata_annotations_and_secret_boundary(tmp_path):
@@ -68,10 +73,12 @@ def test_batch_writes_sources_skips_unchanged_and_retries_failures(tmp_path, mon
         calls = 0
         def complete(self, messages, tools):
             self.calls += 1
+            if response := review_response(messages):
+                return response
             payload = json.loads(messages[1]['content'])
             assert payload['user_annotations'][0]['text'] == 'Important result'
             assert payload['source_metadata']['title'] == 'Zotero authoritative title'
-            return ModelResponse(content=json.dumps(analysis()))
+            return fixture_response(messages, analysis())
     model = Model()
     agent = WikiAgent(tmp_path, model_client=model)
     c = client()
@@ -84,12 +91,12 @@ def test_batch_writes_sources_skips_unchanged_and_retries_failures(tmp_path, mon
         assert source['annotations'][0]['comment'] == 'My interest'
         repeat = agent.ingest_zotero(c, collection_key='COLL1234')
         assert (repeat['skipped'], repeat['failed']) == (1, 1)
-        assert model.calls == 1
+        assert model.calls == 2
         path.unlink()
         assert agent.ingest_zotero(c, item_key='ITEM1234')['completed'] == 1
-        assert model.calls == 2
+        assert model.calls == 4
         assert agent.ingest_zotero(c, item_key='ITEM1234', force=True)['completed'] == 1
-        assert model.calls == 3
+        assert model.calls == 6
     finally:
         c.close()
 
@@ -99,10 +106,12 @@ def test_reanalysis_archives_superseded_experiments(tmp_path, monkeypatch):
     class Model:
         changed = False
         def complete(self, messages, tools):
+            if response := review_response(messages):
+                return response
             result = analysis()
             if self.changed:
                 result['experiments'] = [result['experiments'][0]]
-            return ModelResponse(content=json.dumps(result))
+            return fixture_response(messages, result)
     model = Model()
     agent = WikiAgent(tmp_path, model_client=model)
     c = client()
@@ -239,8 +248,10 @@ def test_local_import_uses_existing_wiki_pipeline_without_http(tmp_path, local_l
         calls = 0
         def complete(self, messages, tools):
             self.calls += 1
+            if response := review_response(messages):
+                return response
             assert json.loads(messages[1]['content'])['user_annotations'][0]['comment'] == 'My interest'
-            return ModelResponse(content=json.dumps(analysis()))
+            return fixture_response(messages, analysis())
     model = Model()
     agent = WikiAgent(tmp_path / 'project', model_client=model)
     c = LocalZoteroClient('123', local_library)
@@ -248,7 +259,7 @@ def test_local_import_uses_existing_wiki_pipeline_without_http(tmp_path, local_l
         result = agent.ingest_zotero(c, collection_key='COLL1234')
         assert result['completed'] == 1
         assert agent.ingest_zotero(c, item_key='ITEM1234')['skipped'] == 1
-        assert model.calls == 1
+        assert model.calls == 2
     finally:
         c.close()
 

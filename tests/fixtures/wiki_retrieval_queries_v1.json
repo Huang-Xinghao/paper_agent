@@ -1,0 +1,143 @@
+{
+  "scope": "Fixed developer-selected 16 query regression; English rewrites authored after implementation, not held out. Candidate coverage only.",
+  "rows": [
+    {
+      "case": "battery_unknown_future",
+      "variant": "original",
+      "query": "没有历史循环记录，如何预测退役电池在未知未来负载下的退化轨迹？",
+      "expected_papers": [
+        "papers/huang2026_imoe_prediction_secondlife.md",
+        "papers/tan2026_batterymformer_multilevel_learning.md"
+      ]
+    },
+    {
+      "case": "battery_unknown_future",
+      "variant": "english_rewrite",
+      "query": "Estimate battery degradation from a single present-day measurement without past cycling logs when future operating loads are unknown.",
+      "expected_papers": [
+        "papers/huang2026_imoe_prediction_secondlife.md",
+        "papers/tan2026_batterymformer_multilevel_learning.md"
+      ]
+    },
+    {
+      "case": "named_baselines",
+      "variant": "original",
+      "query": "iMOE 的 PatchTST 与 Informer 基线分别采用什么方法，有什么限制？",
+      "expected_papers": [
+        "papers/huang2026_imoe_prediction_secondlife.md",
+        "papers/nie2023_time_series_worth.md",
+        "papers/zhou2021_informer_beyond_efficient.md"
+      ]
+    },
+    {
+      "case": "named_baselines",
+      "variant": "english_rewrite",
+      "query": "Which forecasting approaches were compared with interpretable mixture of experts and what are their modeling limitations?",
+      "expected_papers": [
+        "papers/huang2026_imoe_prediction_secondlife.md",
+        "papers/nie2023_time_series_worth.md",
+        "papers/zhou2021_informer_beyond_efficient.md"
+      ]
+    },
+    {
+      "case": "agent_experience",
+      "variant": "original",
+      "query": "如何让科研Agent更新技能和长期经验，同时避免错误反馈污染？",
+      "expected_papers": [
+        "papers/yang2026_aris_autonomous_research.md",
+        "papers/zhang2026_agentic_context_engineering.md"
+      ]
+    },
+    {
+      "case": "agent_experience",
+      "variant": "english_rewrite",
+      "query": "How can a research assistant accumulate reusable procedural knowledge without learning from unreliable feedback?",
+      "expected_papers": [
+        "papers/yang2026_aris_autonomous_research.md",
+        "papers/zhang2026_agentic_context_engineering.md"
+      ]
+    },
+    {
+      "case": "prompt_feedback",
+      "variant": "original",
+      "query": "不更新模型权重，怎样利用执行轨迹与自然语言反馈优化模块提示词？",
+      "expected_papers": [
+        "papers/agrawal2026_gepa_reflective_prompt.md",
+        "papers/zhang2026_agentic_context_engineering.md"
+      ]
+    },
+    {
+      "case": "prompt_feedback",
+      "variant": "english_rewrite",
+      "query": "Optimize modular instructions using execution traces and natural language critiques while leaving model parameters unchanged.",
+      "expected_papers": [
+        "papers/agrawal2026_gepa_reflective_prompt.md",
+        "papers/zhang2026_agentic_context_engineering.md"
+      ]
+    },
+    {
+      "case": "memory_graph_counterexample",
+      "variant": "original",
+      "query": "Mem0 加入知识图谱后，多跳问答一定更好吗，准确率和成本如何取舍？",
+      "expected_papers": [
+        "papers/chhikara2025_mem0_building_productionready.md"
+      ]
+    },
+    {
+      "case": "memory_graph_counterexample",
+      "variant": "english_rewrite",
+      "query": "Does representing long-term conversational memory as a graph always improve multi-hop question answering at a reasonable latency?",
+      "expected_papers": [
+        "papers/chhikara2025_mem0_building_productionready.md"
+      ]
+    },
+    {
+      "case": "physical_constraint_transfer",
+      "variant": "original",
+      "query": "给电池SOH预测加入单调性约束，跨化学体系迁移时是否还需要目标标签？",
+      "expected_papers": [
+        "papers/wang2024_physicsinformed_neural_network.md"
+      ]
+    },
+    {
+      "case": "physical_constraint_transfer",
+      "variant": "english_rewrite",
+      "query": "Can a monotonic health model transfer to another battery chemistry with no target-cell labels, even during capacity regeneration?",
+      "expected_papers": [
+        "papers/wang2024_physicsinformed_neural_network.md"
+      ]
+    },
+    {
+      "case": "field_capacity",
+      "variant": "original",
+      "query": "家庭光伏储能的现场容量估计，能否直接用于不完全放电的电动汽车？",
+      "expected_papers": [
+        "papers/figgener2024_multiyear_field_measurements.md"
+      ]
+    },
+    {
+      "case": "field_capacity",
+      "variant": "english_rewrite",
+      "query": "Can capacity estimation from household photovoltaic storage be used unchanged for electric vehicles that seldom fully discharge?",
+      "expected_papers": [
+        "papers/figgener2024_multiyear_field_measurements.md"
+      ]
+    },
+    {
+      "case": "action_memory",
+      "variant": "original",
+      "query": "冻结LLM，检索历史动作回报估计优势并重加权动作，而不是把经验都写进提示词，这怎么实现？",
+      "expected_papers": [
+        "papers/li2026_justintime_reinforcement_learning.md"
+      ]
+    },
+    {
+      "case": "action_memory",
+      "variant": "english_rewrite",
+      "query": "Keep the language model frozen but use retrieved rewards to estimate action advantages and rescale action probabilities instead of appending lessons to prompts.",
+      "expected_papers": [
+        "papers/li2026_justintime_reinforcement_learning.md"
+      ]
+    }
+  ]
+}

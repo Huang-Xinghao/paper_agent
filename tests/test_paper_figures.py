@@ -67,22 +67,26 @@ def test_configured_parser_failure_is_not_cached(tmp_path, monkeypatch):
 
 
 def test_wiki_writes_architecture_without_visual_model_call(tmp_path, monkeypatch):
-    from test_wiki_agent import make_pdf, analysis
+    from test_wiki_agent import make_pdf, analysis, fixture_response, review_response
+    from paper_agent.tools.paper_preprocessing import document_from_structured
+    import hashlib
     from paper_agent.agent.wiki import WikiAgent
     from paper_agent.agent.model_client import ModelResponse
     pdf = make_pdf(tmp_path, monkeypatch)
     data = extraction(tmp_path) | {'pages': [{'page': 1, 'text': 'MinerU full text'}]}
+    data['document'] = document_from_structured({'pages': [{'page_idx': 0, 'blocks': [
+        {'content': 'MinerU full text'}]}]}, pdf_sha256=hashlib.sha256(pdf.read_bytes()).hexdigest())
     monkeypatch.setattr('paper_agent.agent.wiki.read_mineru_paper', lambda *args: data)
     class Model:
         calls = 0
         def complete(self, messages, tools):
             self.calls += 1
             assert all(isinstance(m['content'], str) for m in messages)
-            return ModelResponse(content=json.dumps(analysis(datasets=[])))
+            return review_response(messages) or fixture_response(messages, analysis(datasets=[]))
     model = Model()
     state = WikiAgent(tmp_path, model_client=model).go('Read the paper', paper_path=pdf)
     note = (tmp_path/state.wiki_path).read_text()
-    assert model.calls == 1
+    assert model.calls == 2
     assert '## Architecture Figures' not in note
     assert 'Fig. 4 | Model architecture.' not in note
     assert 'Fig. 4 | Model architecture.' in (tmp_path / state.figure_paths[1]).read_text()

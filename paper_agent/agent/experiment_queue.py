@@ -1,7 +1,6 @@
 """Local one-job-per-GPU scheduling; only the coordinator writes queue state."""
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import subprocess
@@ -45,6 +44,9 @@ def atomic_json(path, value):
 
 
 def run_queue(executor, state, manifest, *, on_progress=None):
+    # GPU 队列使用 Linux 文件锁；延迟加载，避免 Windows 上仅导入 Wiki 也失败。
+    import fcntl
+
     project = executor.project
     directory = project / '.paper-agent'
     directory.mkdir(exist_ok=True)

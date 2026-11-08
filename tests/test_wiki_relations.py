@@ -6,7 +6,7 @@ from paper_agent.agent.model_client import ModelResponse
 from paper_agent.agent.wiki import WikiAgent
 from paper_agent.agent.wiki_relations import discover_relations, write_relations, ORIGIN
 from paper_agent.tools import research_wiki
-from test_wiki_agent import analysis, make_pdf
+from test_wiki_agent import analysis, make_pdf, fixture_response, review_response
 
 
 def seed(root):
@@ -55,10 +55,12 @@ def test_ingest_cross_field_relations_and_per_node_attributes(tmp_path, monkeypa
 
         def complete(self, messages, tools):
             self.calls += 1
+            if response := review_response(messages):
+                return response
             payload = json.loads(messages[1]["content"])
             if "documents" not in payload:
                 assert payload["existing_classification_labels"]["method"] == ["图神经网络"]
-                return ModelResponse(content=json.dumps(draft))
+                return fixture_response(messages, draft)
             assert old_id in payload["documents"]
             assert old_idea_id in payload["documents"]
             assert "Forecast interacting generic time series" in payload["documents"][old_id]
@@ -74,7 +76,7 @@ def test_ingest_cross_field_relations_and_per_node_attributes(tmp_path, monkeypa
     model = Model()
     agent = WikiAgent(tmp_path, model_client=model)
     result = agent.go("Read", paper_path="papers/battery.pdf")
-    assert model.calls == 2 and result.relationship_count == 3
+    assert model.calls == 3 and result.relationship_count == 3
     automatic = [e for e in edges(root) if e.get("origin") == ORIGIN]
     assert {e["type"] for e in automatic} == {"shares_method", "may_apply_to"}
     assert all(old.name in e["evidence"] or old_idea.name in e["evidence"] for e in automatic)

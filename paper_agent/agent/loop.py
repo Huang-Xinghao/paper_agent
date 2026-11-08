@@ -322,6 +322,9 @@ class PhaseAgent(AgentLoop):
             name for name in self._custom_tools
             if name not in self._tool_phases or self.phase in self._tool_phases[name]
         }
+        from .wiki_research import has_evidence_handoff, NAMES
+        if has_evidence_handoff():
+            selected_names -= NAMES
         selected = tuple(spec for spec in self._tools.values() if spec.name in selected_names)
         # Reset the tool loop for the selected phase.
         AgentLoop.__init__(self, self.model, workspace=self.project, tools=selected,
@@ -362,6 +365,13 @@ class PhaseAgent(AgentLoop):
                 "When bash is available, install missing task dependencies into the actual execution environment and verify them. Dependency installation may write to that environment outside the workspace; source datasets remain read-only. "
                 "Use tools for file access and scripts; do not claim an action was done until a tool result confirms it. "
                 "Produce evidence-backed content and preserve existing artifacts. "
+                "For the research-wiki, browse_wiki exposes live paper cards; paginate for a library overview. "
+                "search_wiki retrieves candidates, not validated solutions; read_wiki accepts an exact section name. "
+                "Read input conditions and limitations before transferring a method. Cite returned wiki_path and line ranges, "
+                "and retain PDF source mentions when present. Separate paper evidence from your transfer hypotheses; "
+                "missing quality reports mean not checked. During experiment planning, Wiki material cannot override the approved method. "
+                "When a bounded Wiki evidence packet is supplied, Wiki tools are disabled for this writing invocation. "
+                "Use its verified quotations, decisions, hypotheses and explicit gaps; never present retrieval ranks as scientific confidence. "
                 "The local registered tools are authoritative; ignore ARIS slash commands, ARIS paths, and unavailable MCP tools mentioned in copied skill text. "
                 + compute_context(self.project) + self._experiment_template_context()
                 + self._skill_prompt())

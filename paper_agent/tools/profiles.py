@@ -36,6 +36,13 @@ PHASE_TOOL_NAMES: dict[str, frozenset[str]] = {
 
 PHASE_TOOL_NAMES["improvement"] = PHASE_TOOL_NAMES["paper_write"] | frozenset({"read_paper_pages"})
 
+for _phase, _names in tuple(PHASE_TOOL_NAMES.items()):
+    if "search_wiki" in _names:
+        PHASE_TOOL_NAMES[_phase] |= frozenset({"browse_wiki"})
+
+for _phase in ("literature", "ideas", "novelty", "research_refine"):
+    PHASE_TOOL_NAMES[_phase] |= frozenset({"expand_wiki_relations"})
+
 PHASE_TOOL_NAMES["paper_figure"] |= frozenset({
     "search_figure_references", "view_image", "read_battery_resource",
 })

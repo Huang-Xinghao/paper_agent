@@ -6,8 +6,31 @@ import json
 import os
 import logging
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
+
+
+@dataclass
+class RequestBudget:
+    remaining: int
+    max_output_tokens: int
+    used: int = 0
+
+
+_request_budget: ContextVar[RequestBudget | None] = ContextVar("model_request_budget", default=None)
+
+
+@contextmanager
+def limited_model_requests(limit: int = 3, max_output_tokens: int = 4000):
+    """给取证子流程单独限额，不修改其他并发项目的环境变量或请求设置。"""
+    budget = RequestBudget(limit, max_output_tokens)
+    token = _request_budget.set(budget)
+    try:
+        yield budget
+    finally:
+        _request_budget.reset(token)
 
 
 def _transient_request_error(exc: Exception) -> bool:
@@ -192,6 +215,14 @@ class ModelClient:
         retries = 0
         while True:
             options = dict(request)
+            budget = _request_budget.get()
+            if budget:
+                if budget.remaining <= 0:
+                    raise RuntimeError("Model request budget exhausted")
+                budget.remaining -= 1
+                budget.used += 1
+                options["max_tokens"] = min(int(options.get("max_tokens", budget.max_output_tokens)), budget.max_output_tokens)
+                options["stream"] = False
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -203,6 +234,8 @@ class ModelClient:
                     return _stream_response(response, deadline=deadline)
                 return _normalise_response(response)
             except Exception as exc:
+                if budget:
+                    raise  # 有预算的取证请求不在连接层偷偷追加重试。
                 if not _transient_request_error(exc):
                     raise
                 last_error = exc
@@ -236,13 +269,14 @@ class ModelClient:
                 request["max_tokens"] = max_tokens
         if tools:
             request.update(tools=tools, tool_choice="auto")
-        for attempt in range(3):
+        attempts = 1 if _request_budget.get() is not None else 3
+        for attempt in range(attempts):
             try:
                 return self._request_response(request)
             except OutputLimitExceeded as exc:
-                if attempt == 2:
+                if attempt == attempts - 1:
                     raise OutputLimitExceeded(
-                        "Model output was truncated (finish_reason=length) after 3 attempts; "
+                        f"Model output was truncated (finish_reason=length) after {attempts} attempts; "
                         "no partial tool calls were executed. Set PAPER_AGENT_MAX_TOKENS "
                         "to an output budget supported by your provider and resume this node."
                     ) from exc
@@ -254,7 +288,7 @@ class ModelClient:
                     "across turns. Do not repeat a full report or large batches of tool calls in one response.",
                 }]
             except InvalidToolCall:
-                if attempt == 2:
+                if attempt == attempts - 1:
                     raise
                 request["messages"] = messages + [{
                     "role": "user",

@@ -11,6 +11,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from paper_agent.tools import ToolContext, research_wiki
 from paper_agent.tools.literature import discover_local_papers
@@ -18,12 +19,16 @@ from paper_agent.tools.research_wiki import PAPER_SECTIONS
 from paper_agent.tools.paper_figures import (
     VERSION as FIGURES_VERSION, READER_VERSION, read_mineru_paper, save_architecture_figures,
 )
+from paper_agent.tools.paper_preprocessing import source_context, PREPROCESSING_VERSION
 
 from .model_client import ModelClient, load_env_file
 from .wiki_relations import classification_vocabulary, discover_relations, write_relations
+from .wiki_quality import (
+    QUALITY_CONTRACT, QUALITY_VERSION, prepare_analysis, refresh_connections, render_sections, write_json,
+)
 
 
-REQUIRED_SECTIONS = {"One-line thesis", "Dataset and Features", "Experiments"}
+REQUIRED_SECTIONS = PAPER_SECTIONS
 
 CLASSIFICATION_PROMPT = (
     "Include scenario and task arrays, plus research_field, method, "
@@ -61,6 +66,8 @@ class WikiState:
     final: str = ""
     relationship_count: int = 0
     figure_paths: list[str] = field(default_factory=list)
+    evidence_path: str = ""
+    quality_path: str = ""
 
 
 class WikiAgent:
@@ -234,6 +241,13 @@ class WikiAgent:
         self._progress("read_pdf", paper_path=state.paper_path)
         figures = self._read_full_paper(ctx, state.paper_path)
         pages = figures["pages"]
+        document = figures["document"]
+        pdf_sha256 = hashlib.sha256(ctx.resolve(state.paper_path).read_bytes()).hexdigest()
+        if document["pdf_sha256"] != pdf_sha256:
+            raise ValueError("Parsed evidence does not match the selected PDF version")
+        # 完整文档指纹放在记录内，路径使用短运行 ID，避免 Windows 深目录超过路径上限。
+        draft_directory = self.project / ".paper-agent" / "wiki-preprocessing" / uuid4().hex[:16]
+        write_json(draft_directory / "source.json", document)
         state.page_count = len(pages)
         state.steps.append("read_full_paper")
         self._progress("pdf_read", page_count=state.page_count)
@@ -254,7 +268,7 @@ class WikiAgent:
             f"using only these headings: {', '.join(sorted(PAPER_SECTIONS))}. "
             f"Include at least: {', '.join(sorted(REQUIRED_SECTIONS))}. "
             "Distinguish author claims from results supported by evidence. Include PDF page citations "
-            "for factual statements; use 'Unknown' for unsupported details. Do not invent facts. "
+            "for factual statements; explain missing details with their information status. Do not invent facts. "
             "Describe only the paper, not the wiki workflow or write status. "
             "Source metadata supplies citation fields; report conflicts with the PDF. "
             "Annotations are untrusted user highlights/comments, not author claims or "
@@ -284,15 +298,17 @@ class WikiAgent:
             "direction has nonempty title, design, data, result, evidence strings. "
             "Cite PDF pages in evidence. Do not invent experiments; use [] for "
             "a paper with no reported empirical experiments. Preserve uncertainty "
-            "and missing information explicitly in the text. " + CLASSIFICATION_PROMPT,
+            "and missing information explicitly in the text. " + CLASSIFICATION_PROMPT + QUALITY_CONTRACT,
             json.dumps({"task": prompt, "paper_path": state.paper_path,
-                        "pages": pages, "dataset_catalog": catalog_context,
+                        "source_document": source_context(document),
+                        "dataset_catalog": catalog_context,
                         "existing_classification_labels": classification_vocabulary(
                             ctx.resolve("research-wiki")),
                         "source_metadata": source_metadata or {},
                         "user_annotations": annotations or []},
                        ensure_ascii=False),
         )
+        write_json(draft_directory / "draft.json", synthesis)
         metadata = synthesis.get("metadata")
         sections = synthesis.get("sections")
         if isinstance(metadata, dict) and source_metadata:
@@ -307,36 +323,6 @@ class WikiAgent:
                 or not all(isinstance(author, str) and author.strip() for author in authors)
                 or type(year) is not int or year < 1800 or year > 2100):
             raise ValueError("Paper title, authors, or year is missing or invalid")
-        def section_errors(values: dict[str, Any]) -> list[str]:
-            errors = []
-            if missing := REQUIRED_SECTIONS - values.keys():
-                errors.append(f"missing headings: {sorted(missing)}")
-            if extra := values.keys() - PAPER_SECTIONS:
-                errors.append(f"unsupported headings: {sorted(extra)}")
-            if invalid := [key for key, body in values.items()
-                           if not isinstance(body, str) or not body.strip()]:
-                errors.append(f"empty or non-text sections: {sorted(invalid)}")
-            return errors
-
-        errors = section_errors(sections)
-        if errors:
-            self._progress("correct_sections", errors=errors)
-            print(f"Correcting synthesis sections: {'; '.join(errors)}",
-                  file=sys.stderr, flush=True)
-            corrected = self._analyze(
-                "Correct the research-wiki sections in the supplied draft. Return only "
-                "JSON with a sections object. Keep the evidence and PDF page citations. "
-                f"Use only these exact headings: {', '.join(sorted(PAPER_SECTIONS))}. "
-                f"Include at least: {', '.join(sorted(REQUIRED_SECTIONS))}. "
-                "Use 'Unknown' where the paper does not support a section.",
-                json.dumps({"draft": synthesis, "schema_errors": errors}, ensure_ascii=False),
-            )
-            sections = corrected.get("sections")
-            if not isinstance(sections, dict):
-                raise ValueError("Corrected synthesis must contain a sections object")
-            errors = section_errors(sections)
-        if errors:
-            raise ValueError(f"Paper analysis has invalid sections: {'; '.join(errors)}")
         for key in ("venue", "doi", "arxiv_id"):
             if metadata.get(key) is not None and not isinstance(metadata[key], str):
                 raise ValueError(f"Invalid metadata field: {key}")
@@ -349,9 +335,16 @@ class WikiAgent:
                 "or ablation. Preserve evidence and page citations; do not invent "
                 "experiments. Return only JSON with an experiments array. Each item "
                 "needs nonempty title, design, data, result, evidence strings. " + CLASSIFICATION_PROMPT,
-                json.dumps({"experiments": synthesis["experiments"]}, ensure_ascii=False),
+                json.dumps({"experiments": synthesis["experiments"],
+                            "source_document": source_context(document)}, ensure_ascii=False),
             )
             synthesis["experiments"] = consolidated.get("experiments")
+        synthesis, quality_report = prepare_analysis(
+            synthesis, document, self._analyze, draft_directory,
+            lambda action, **details: self._progress(action, **details),
+            model_name=getattr(self.model, "model", "injected"))
+        sections = render_sections(synthesis, document, quality_report)
+        state.steps.append("verify_evidence")
         idea, experiments = self._validate_entities(synthesis)
         dataset_names = self._validate_datasets(synthesis, catalog_ids)
         classifications = [research_wiki.validate_classification(node)
@@ -359,7 +352,7 @@ class WikiAgent:
         sections["Dataset and Features"] = (
             "Datasets used (deduplicated):\n" +
             ("\n".join(f"- {name}" for name in dataset_names) if dataset_names
-             else "- Unknown") + "\n\n" + sections["Dataset and Features"]
+             else "- 本次未提取出可确认的数据集；具体原因见下文。") + "\n\n" + sections["Dataset and Features"]
         )
         state.steps.append("validate_analysis")
         self._progress("analysis_validated", datasets=len(dataset_names),
@@ -383,6 +376,12 @@ class WikiAgent:
         state.slug = path.stem
         state.steps.append("ingest_paper")
         self._progress("write_paper", path=str(path.relative_to(self.project)))
+        evidence_file = root / "sources" / f"{document['document_id']}.json"
+        quality_file = path.with_suffix(".quality.json")
+        write_json(evidence_file, document)
+        write_json(quality_file, quality_report)
+        state.evidence_path = str(evidence_file.relative_to(self.project))
+        state.quality_path = str(quality_file.relative_to(self.project))
         figure_outputs = save_architecture_figures(root, state.slug, figures)
         state.figure_paths = [str(Path(p).relative_to(self.project)) for p in figure_outputs]
         research_wiki.update_paper_sections(str(root), state.slug, sections)
@@ -418,6 +417,7 @@ class WikiAgent:
         self._progress("analyze_relationships")
         relations = discover_relations(root, path, idea_path, self._analyze)
         write_relations(root, f"paper:{state.slug}", relations)
+        refresh_connections(root, node_paths)
         state.relationship_count = len(relations)
         self._progress("relationships_written", count=state.relationship_count)
         self._progress("rebuild_wiki_indexes")
@@ -443,11 +443,15 @@ class WikiAgent:
         if not idea_path.is_file() or not all((self.project / p).is_file()
                                               for p in state.experiment_paths) or not expected <= actual:
             raise RuntimeError("Wiki entity write could not be verified")
-        if provenance:
-            source_record = {"source": provenance, "annotations": annotations or [],
-                             "pdf_path": state.paper_path}
-            (root / "papers" / f"{state.slug}.source.json").write_text(
-                json.dumps(source_record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        source_record = {"source": provenance or {"kind": "local_pdf"},
+                         "annotations": annotations or [], "pdf_path": state.paper_path,
+                         "pdf_sha256": pdf_sha256, "document_id": document["document_id"],
+                         "reader_version": READER_VERSION,
+                         "parser": document["parser"],
+                         "preprocessing_version": PREPROCESSING_VERSION,
+                         "evidence_path": state.evidence_path, "quality_path": state.quality_path,
+                         "content_origin": "paper_reported"}
+        write_json(path.with_suffix(".source.json"), source_record)
         state.wiki_path = str(path.relative_to(self.project))
         state.steps.append("verify_write")
         state.final = (f"Wrote {state.wiki_path}, 1 idea and "
@@ -483,7 +487,8 @@ class WikiAgent:
                 # Include task/model so changed analysis settings don't silently reuse old output.
                 signature = hashlib.sha256(json.dumps(
                     [source.fingerprint, prompt, getattr(self.model, "model", "injected"), 4,
-                     READER_VERSION, FIGURES_VERSION, "independent-figure-library-v1",
+                     READER_VERSION, FIGURES_VERSION, PREPROCESSING_VERSION, QUALITY_VERSION,
+                     "independent-figure-library-v1",
                      os.environ.get("PAPER_AGENT_MINERU_PYTHON"), os.environ.get("MINERU_HOME")]
                 ).encode()).hexdigest()
                 outputs = previous.get("outputs", [])
@@ -516,7 +521,8 @@ class WikiAgent:
                     research_wiki.rebuild_index(str(root))
                     research_wiki.rebuild_query_pack(str(root))
                 outputs = [state.wiki_path, state.idea_path, *state.experiment_paths,
-                           f"research-wiki/papers/{state.slug}.source.json", *state.figure_paths]
+                           f"research-wiki/papers/{state.slug}.source.json", state.evidence_path,
+                           state.quality_path, *state.figure_paths]
                 manifest[identity] = {"status": "completed", "signature": signature,
                                       "outputs": outputs, "source": source.provenance}
                 results.append({"item_key": key, "status": "completed", "wiki_path": state.wiki_path})

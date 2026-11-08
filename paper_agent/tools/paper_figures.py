@@ -11,8 +11,10 @@ import subprocess
 import tempfile
 import zipfile
 
+from paper_agent.tools.paper_preprocessing import document_from_structured
+
 VERSION = "architecture-captions-v1"
-READER_VERSION = "mineru-full-paper-v1"
+READER_VERSION = "mineru-full-paper-v2"
 ARCHITECTURE = re.compile(
     r"\b(?:architectur\w*|workflow|flowchart|schematic|pipeline)\b"
     r"|\b(?:overall|proposed|model|network|methodological)\s+framework\b"
@@ -45,31 +47,7 @@ def runtime_python() -> str | None:
 
 def pages_from_structured(data: dict) -> list[dict]:
     """Preserve MinerU reading order, physical pages, formulas, tables and captions."""
-    if data.get("is_full_document") is False:
-        raise ValueError("MinerU returned a partial document")
-    source_pages = data["pages"]
-    page_count = data.get("metadata", {}).get("document", {}).get("page_count")
-    if page_count is not None and page_count != len(source_pages):
-        raise ValueError("MinerU page count does not match the full PDF")
-    if not source_pages or [p["page_idx"] for p in source_pages] != list(range(len(source_pages))):
-        raise ValueError("MinerU output has missing or unordered PDF pages")
-
-    def text_parts(block):
-        content = block.get("content", "")
-        if not isinstance(content, str):
-            raise ValueError("Unsupported MinerU block content; expected text")
-        if content.strip():
-            yield content.strip()
-        for field in ("captions", "footnotes"):
-            for child in block.get(field, []):
-                yield from text_parts(child)
-
-    pages = [{"page": p["page_idx"] + 1,
-              "text": "\n\n".join(part for b in p["blocks"] for part in text_parts(b))}
-             for p in source_pages]
-    if not any(p["text"].strip() for p in pages):
-        raise ValueError("MinerU returned no readable paper content")
-    return pages
+    return document_from_structured(data)["pages"]
 
 
 def read_mineru_paper(project: Path, pdf: Path) -> dict:
@@ -120,13 +98,17 @@ def read_mineru_paper(project: Path, pdf: Path) -> dict:
             cache.mkdir(exist_ok=True)
             shutil.copytree(work, cache, dirs_exist_ok=True)
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    pages = pages_from_structured(json.loads(structured_path.read_text(encoding="utf-8")))
+    document = document_from_structured(
+        json.loads(structured_path.read_text(encoding="utf-8")), pdf_sha256=sha,
+        parser_identity={"name": "MinerU", "version": version,
+                         "reader_version": READER_VERSION, "settings_key": key})
     selected = []
     for figure in report["figures"]:
         reason = architecture_reason(figure["caption"])
         if reason:
             selected.append({**figure, "selection_reason": reason})
-    return {"status": "completed", "pages": pages, "reader_version": READER_VERSION,
+    return {"status": "completed", "pages": document["pages"], "document": document,
+            "reader_version": READER_VERSION,
             "pdf_sha256": sha, "mineru_version": version,
             "extraction_version": VERSION, "cache": str(cache / "grouped"),
             "total_figures": len(report["figures"]), "figures": selected,

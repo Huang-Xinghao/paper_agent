@@ -53,6 +53,8 @@ def run_revision(root, expected_sha, run_id, folder, *, model=None, timeout=600,
     schema = RevisionResult.model_json_schema()
     payload = {"originalProposal": source, "submittedDraft": incoming.model_dump(),
                "previousRevision": old_record, "requiredSchema": schema}
+    from paper_agent.agent.wiki_research import latest_evidence
+    payload["wikiEvidence"] = latest_evidence(root)
     atomic_bytes(folder / "submission.json", json_bytes(payload))
     load_env_file(REPO / ".env")
     adapter = ModelClient(model=model or os.environ.get("PAPER_AGENT_MODEL", "gpt-4o"), timeout=timeout)
