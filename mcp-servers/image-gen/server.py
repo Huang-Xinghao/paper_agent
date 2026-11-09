@@ -62,6 +62,9 @@ def _start(args: dict[str, Any]) -> dict[str, Any]:
             size=str(args.get("size", "1536x1024")),
             quality=str(args.get("quality", "high")),
         )
+        from paper_agent.agent.usage import record_usage
+        record_usage(root, source='image', model=os.environ.get('PAPER_AGENT_IMAGE_MODEL', 'gpt-image-2'),
+                     phase='paper_figure', usage=getattr(response, 'usage', None))
         encoded = getattr(response.data[0], "b64_json", None)
         if not encoded:
             raise RuntimeError("image API returned no b64_json image")

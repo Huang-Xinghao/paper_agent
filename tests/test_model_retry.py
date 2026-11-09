@@ -140,3 +140,66 @@ def test_failed_retry_request_time_counts_towards_window(clock):
         make_client(create).complete([], [])
     assert len(attempts) == 2
     assert clock.now == 300
+
+
+def test_evidence_budget_caps_transport_and_restores_context(monkeypatch):
+    from paper_agent.agent.model_client import limited_model_requests
+    requests = []
+    monkeypatch.setenv("PAPER_AGENT_STREAM", "true")
+    monkeypatch.setenv("PAPER_AGENT_MAX_TOKENS", "9000")
+
+    def create(**options):
+        requests.append(options)
+        return {"content": "done"}
+
+    client = make_client(create)
+    with limited_model_requests(1, 4000) as budget:
+        client.complete([], [])
+        with pytest.raises(RuntimeError, match="budget exhausted"):
+            client.complete([], [])
+        assert budget.used == 1
+    assert len(requests) == 1
+    assert requests[0]["max_tokens"] == 4000
+    assert requests[0]["stream"] is False
+    assert "stream_options" not in requests[0]
+    client.complete([], [])
+    assert requests[-1]["stream"] is True
+    assert requests[-1]["max_tokens"] == 9000
+
+
+@pytest.mark.parametrize("error", [TimeoutError("timeout"),
+    model_client.InvalidToolCall("broken"), model_client.OutputLimitExceeded("length")])
+def test_evidence_budget_disables_hidden_retry(clock, error):
+    from paper_agent.agent.model_client import limited_model_requests
+    requests = []
+
+    def create(**options):
+        requests.append(options)
+        raise error
+
+    with limited_model_requests(3):
+        with pytest.raises(type(error)):
+            make_client(create).complete([], [])
+    assert len(requests) == 1
+    assert clock.sleeps == []
+
+
+def test_public_deltas_arrive_before_stream_finishes_and_retry_resets(clock):
+    events = []
+    class Stream:
+        def __init__(self, fail=False):
+            self.fail = fail
+        def __iter__(self):
+            yield NS(choices=[NS(index=0, delta=NS(content='hello' * 25, tool_calls=[]), finish_reason=None)])
+            assert events[-1] == 'hello' * 25  # Called before requesting next chunk.
+            if self.fail:
+                raise httpx.ReadError('connection reset')
+            yield NS(choices=[NS(index=0, delta=NS(content=' done', tool_calls=[]), finish_reason='stop')])
+        def close(self):
+            pass
+    streams = iter([Stream(True), Stream()])
+    client = make_client(lambda **kw: next(streams))
+    response = client.complete([], [], on_delta=events.append,
+                               on_stream_reset=lambda: events.append('reset'))
+    assert response.content == 'hello' * 25 + ' done'
+    assert events == ['reset', 'hello' * 25, 'reset', 'hello' * 25, ' done']

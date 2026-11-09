@@ -63,8 +63,13 @@ def _schedule(executor, state, manifest, on_progress):
     config = load_execution_config(executor.project)
     compute = load_compute_config(executor.project)
     configured_ids = config['gpu_ids']
-    initial = discover_gpus(executor)
-    allowed = list(initial) if configured_ids == 'auto' else configured_ids
+    # CPU/MPS-only queues do not require NVIDIA management tooling. CUDA/auto
+    # workloads still use real discovery and never silently fall back to CPU.
+    needs_cuda = any(j.get('resources', {}).get('device', 'auto') == 'cuda' or
+                     j.get('resources', {}).get('device', 'auto') == 'auto'
+                     and compute['device'] in {'auto', 'cuda'} for j in jobs)
+    initial = discover_gpus(executor) if needs_cuda else {}
+    allowed = (list(initial) if configured_ids == 'auto' else configured_ids) if needs_cuda else []
     if compute['gpu_index'] is not None:
         allowed = [i for i in allowed if i == compute['gpu_index']]
     if any(i not in initial for i in allowed):
@@ -186,7 +191,7 @@ def _schedule(executor, state, manifest, on_progress):
                     else:
                         ready = [j for j in pending.values() if all(d in completed for d in dependencies[j['id']])
                                  and time.monotonic() >= retry_after.get(j['id'], 0)]
-                        devices = discover_gpus(executor) if ready else {}
+                        devices = discover_gpus(executor) if ready and needs_cuda else {}
                         occupied = {gpu for _, gpu in running.values() if gpu is not None}
                         free = [i for i in allowed if i not in occupied and i in devices
                                 and devices[i]['memory_used_mib'] < config['gpu_idle_memory_threshold_mib']]

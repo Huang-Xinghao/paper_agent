@@ -14,6 +14,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from .usage import record_usage
 
 ReviewKind = Literal["idea", "code", "paper"]
 RUBRICS = {
@@ -192,6 +193,7 @@ class ReviewRunner:
                 stderr = (diagnostic_dir / "stderr.log").read_text(encoding="utf-8", errors="replace")
 
         completed, failed, content = False, False, ""
+        usage_events = 0
         try:
             for line in stdout.splitlines():
                 if not line.strip():
@@ -210,6 +212,9 @@ class ReviewRunner:
                         content = text
                 elif event.get("type") == "turn.completed":
                     completed, usage = True, event.get("usage")
+                    usage_events += 1
+                    record_usage(self.workspace, source='review', model=self.model,
+                                 phase=request.kind, usage=usage)
                 elif event.get("type") in {"turn.failed", "error"}:
                     failed = True
                     error = error or json.dumps(event, ensure_ascii=False)
@@ -221,6 +226,8 @@ class ReviewRunner:
                 status = "completed"
             else:
                 error = error or f"Incomplete review (exit code {exit_code}): {stderr.strip()[-4000:]}"
+        if not usage_events:
+            record_usage(self.workspace, source='review', model=self.model, phase=request.kind)
         changed = []
         for item in inputs:
             try:

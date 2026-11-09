@@ -1,0 +1,631 @@
+{
+  "scope": "Targeted 2024–2026 AI conference battery-paper gap search; not an exhaustive review. Official cached ICML 2024/2025, ICLR 2024/2025/2026, NeurIPS 2024, IJCAI 2024/2025 indices plus OpenAlex metadata for AAAI/KDD. NeurIPS 2025 index returned no usable entries. ICML 2026 volume not verified and is not claimed searched. CIKM keyword search did not yield a confirmed direct battery candidate.",
+  "existing_pdf_count": 419,
+  "new_candidates": [
+    {
+      "title": "Battery Fault: A Comprehensive Dataset and Benchmark for Battery Fault Diagnosis",
+      "venue": "ICLR",
+      "year": 2026,
+      "priority": "高",
+      "relevance": "车载真实运行数据结合机理约束生成的电池故障诊断数据集 CH-BatteryGen，适合故障方向；并非纯实测数据集。",
+      "official_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/0d781fa5f639bf2caf728a68e9678362-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/0d781fa5f639bf2caf728a68e9678362-Paper-Conference.pdf",
+      "doi": null,
+      "abstract": "With the accelerated popularization of electric vehicles (EV), battery safety issues have become an important research focus. Data-driven battery fault diagnosis algorithms, built on real-world operational data, are critical methods for reducing safety risks. However, existing battery datasets have limitations such as insufficient scale, coarse-grained labels, and lack of coverage of real-world operating conditions, which seriously restrict the development of data-driven fault diagnosis algorithms. To address these issues, this paper introduces a large-scale benchmark dataset named CH-BatteryGen, which is, to the best of our knowledge, the first EV battery system fault diagnosis dataset based on real-world operating conditions. This dataset integrates real on-board operation data with mechanism-constrained generative modeling technology, balancing authenticity and scalability. It covers two mainstream battery chemistries, namely nickel-cobalt-manganese (NCM) lithium batteries and lithium iron phosphate (LFP) batteries, and involves charging, discharging, and operation data of 1000 electric vehicles. It provides four fault labels (normal, self-discharge, high-resistance, low-capacity) and three severity level annotations, supporting two benchmark tasks: fault classification and fault grading. Through systematic validation using traditional machine learning methods (random forest (RF), support vector machine (SVM)) and deep learning models (long short-term memory (LSTM), convolutional neural network (CNN)), the results show that the CNN model performs best in the fault classification task, achieving an F1-score of 0.9280 in the LFP discharging scenario; in the fault grading task, the F1-score reaches 0.8813. The CH-BatteryGen dataset has been open-sourced, aiming to provide a standardized evaluation platform for battery fault diagnosis algorithms, promote research development in this field, and contribute to the transformation of sustainable transportation systems.",
+      "source_status": "官方论文页面和出版信息已核实",
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "downloaded",
+      "downloaded_filename": "FaultDiagnosis_011_2026_ICLR_Battery-Fault-A-Comprehensive-Dataset-and-Benchmark-for-Battery.pdf",
+      "downloaded_version": "Official proceedings PDF"
+    },
+    {
+      "title": "LiPM: Foundation Model for Lithium-Ion Battery Analysis",
+      "venue": "KDD",
+      "year": 2025,
+      "priority": "高",
+      "relevance": "自监督电池基础模型，联合掩码重建、库仑积分约束和不规则序列编码，直接对应局部充放电曲线。",
+      "official_url": "https://doi.org/10.1145/3711896.3737027",
+      "doi": "https://doi.org/10.1145/3711896.3737027",
+      "openalex_id": "https://openalex.org/W4412825821",
+      "metadata_url": "https://api.openalex.org/works/W4412825821",
+      "abstract": "Current deep learning approaches for lithium-ion battery analysis are often specialized and limited to specific battery types or individual tasks. While recent advances in large language models (LLMs) highlight the potential of pretraining paradigms, existing time-series pretraining models inadequately address the physicochemical complexity and temporal irregularity inherent to battery operational data. We propose LiPM, a pretrained foundation model that unifies multi-dataset learning through physics-aware objectives and irregularity-tolerant temporal modeling. LiPM introduces three key innovations: (1) A Mix-Masked Autoencoder (MMAE) enforcing electrochemical consistency via joint reconstruction of temporally masked patches and cross-channel masked variables(2) A Coulombic Integration Regression (CIR) task explicitly encoding charge conservation laws, and (3) A dual-scale temporal encoder combining irregular intra-patch processing (preserving raw timestamps) with regular inter-patch attention (capturing macroscopic dynamics). Trained on eight heterogeneous battery datasets without cycle-label annotations, LiPM demonstrates universal applicability across partial charge-discharge segments and irregular sampling protocols. Extensive experiments show remarkable improvements over 9 state-of-the-art baselines in critical downstream tasks.",
+      "source_status": "索引元数据已确认；出版社页面本次访问受限",
+      "locations": [
+        {
+          "id": "doi:10.1145/3711896.3737027",
+          "doi": "https://doi.org/10.1145/3711896.3737027",
+          "is_oa": false,
+          "landing_page_url": "https://doi.org/10.1145/3711896.3737027",
+          "pdf_url": null,
+          "source": {
+            "id": "https://openalex.org/S4363608767",
+            "display_name": "ACM SIGKDD Conference on Knowledge Discovery and Data Mining (KDD)",
+            "issn_l": null,
+            "issn": null,
+            "is_oa": false,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [],
+            "host_organization": null,
+            "host_organization_name": null,
+            "host_organization_lineage": [],
+            "host_organization_lineage_names": [],
+            "type": "conference"
+          },
+          "license": null,
+          "license_id": null,
+          "version": "publishedVersion",
+          "is_accepted": true,
+          "is_published": true,
+          "raw_source_name": "Proceedings of the 31st ACM SIGKDD Conference on Knowledge Discovery and Data Mining V.2",
+          "raw_type": "proceedings-article"
+        }
+      ],
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "download_blocked"
+    },
+    {
+      "title": "Physics-Informed Multi-Task Learning for Battery State of Health Prediction with Uncertainty Quantification",
+      "venue": "AAAI",
+      "year": 2026,
+      "priority": "高",
+      "relevance": "PINN 与深度自编码高斯混合模型联合学习 SOH 和可靠性代理分数；代理分数不等同于有覆盖保证的预测区间。",
+      "official_url": "https://doi.org/10.1609/aaai.v40i2.37143",
+      "doi": "https://doi.org/10.1609/aaai.v40i2.37143",
+      "openalex_id": "https://openalex.org/W7138174836",
+      "metadata_url": "https://api.openalex.org/works/W7138174836",
+      "abstract": "Existing battery State of Health (SOH) prediction approaches often struggle to provide both accurate predictions and reliable uncertainty estimates. This paper presents a novel Multi-Task Learning (MTL) framework that jointly tackles SOH prediction and provides a proxy metric for uncertainty through a unified architecture. The framework combines a Physics-Informed Neural Network (PINN) for SOH prediction with a deep autoencoding Gaussian mixture model for uncertainty modeling. Particularly, the energy score from the Gaussian mixture model serves as a proxy metric for uncertainty, where a higher score indicates potential prediction unreliability. Moreover, to enhance task-specific learning, we employ a multi-head attention mechanism that adaptively captures distinct feature relationships. Our experiments show improvements in prediction performance compared to the state-of-the-art baseline. A comprehensive evaluation on six XJTU battery benchmark datasets demonstrates that our framework achieves a prediction accuracy of 99.50% (MAPE: 0.0050) while providing reliable uncertainty quantification through the proxy metric.",
+      "source_status": "索引元数据已确认；出版社页面本次访问受限",
+      "locations": [
+        {
+          "id": "doi:10.1609/aaai.v40i2.37143",
+          "doi": "https://doi.org/10.1609/aaai.v40i2.37143",
+          "is_oa": true,
+          "landing_page_url": "https://doi.org/10.1609/aaai.v40i2.37143",
+          "pdf_url": "https://ojs.aaai.org/index.php/AAAI/article/download/37143/41105",
+          "source": {
+            "id": "https://openalex.org/S4210191458",
+            "display_name": "Proceedings of the AAAI Conference on Artificial Intelligence",
+            "issn_l": "2159-5399",
+            "issn": [
+              "2159-5399",
+              "2374-3468"
+            ],
+            "is_oa": true,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [
+              "jufo-2",
+              "norway-1"
+            ],
+            "host_organization": "https://openalex.org/P4310320058",
+            "host_organization_name": "Association for the Advancement of Artificial Intelligence",
+            "host_organization_lineage": [
+              "https://openalex.org/P4310320058"
+            ],
+            "host_organization_lineage_names": [
+              "Association for the Advancement of Artificial Intelligence"
+            ],
+            "type": "conference"
+          },
+          "license": "other-oa",
+          "license_id": "https://openalex.org/licenses/other-oa",
+          "version": "publishedVersion",
+          "is_accepted": true,
+          "is_published": true,
+          "raw_source_name": "Proceedings of the AAAI Conference on Artificial Intelligence",
+          "raw_type": "journal-article"
+        },
+        {
+          "id": "pmh:oai:ojs.aaai.org:article/37143",
+          "doi": null,
+          "is_oa": false,
+          "landing_page_url": "https://ojs.aaai.org/index.php/AAAI/article/view/37143",
+          "pdf_url": null,
+          "source": {
+            "id": "https://openalex.org/S4306400155",
+            "display_name": "AAAI Publications (The Association for the Advancement of Artificial Intelligence (AAAI))",
+            "issn_l": null,
+            "issn": null,
+            "is_oa": false,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [],
+            "host_organization": "https://openalex.org/I2801652627",
+            "host_organization_name": "Association for the Advancement of Artificial Intelligence",
+            "host_organization_lineage": [
+              "https://openalex.org/I2801652627"
+            ],
+            "host_organization_lineage_names": [],
+            "type": "repository"
+          },
+          "license": null,
+          "license_id": null,
+          "version": "submittedVersion",
+          "is_accepted": false,
+          "is_published": false,
+          "raw_source_name": "2159-5399",
+          "raw_type": "info:eu-repo/semantics/article"
+        }
+      ],
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "download_blocked"
+    },
+    {
+      "title": "RUL-QMoE: Multiple Non-crossing Quantile Mixture-of-Experts for Probabilistic Remaining Useful Life Predictions of Varying Battery Materials",
+      "venue": "AAAI proceedings",
+      "year": 2026,
+      "priority": "高",
+      "relevance": "不同材料的专家网络与非交叉分位数回归，适合与 iMOE 比较，并研究寿命预测不确定性。",
+      "official_url": "https://doi.org/10.1609/aaai.v40i47.41472",
+      "doi": "https://doi.org/10.1609/aaai.v40i47.41472",
+      "openalex_id": "https://openalex.org/W7138910183",
+      "metadata_url": "https://api.openalex.org/works/W7138910183",
+      "abstract": "Lithium-ion (Li-ion) batteries are the major type of battery used in a variety of everyday applications, including electric vehicles (EVs), mobile devices, and energy storage systems. Predicting the Remaining Useful Life (RUL) of Li-ion batteries is crucial for ensuring their reliability, safety, and cost-effectiveness in battery-powered systems. The materials used for the battery cathodes and their designs play a significant role in determining the degradation rates and RUL, as they lead to distinct electrochemical reactions. Unfortunately, RUL prediction models often overlook the cathode materials and designs to simplify the model-building process, ignoring the effects of these electrochemical reactions. Other reasons are that specifications related to battery materials may not always be readily available, and a battery might consist of a mix of different materials. As a result, the predictive models that are developed often lack generalizability. To tackle these challenges, this paper proposes a novel material-based Mixture-of-Experts (MoE) approach for predicting the RUL of batteries, specifically addressing the complexities associated with heterogeneous battery chemistries. The MoE is integrated into a probabilistic framework, called Multiple Non-crossing Quantile Mixture-of-Experts for Probabilistic Prediction (RUL-QMoE), which accommodates battery operational conditions and enables uncertainty quantification. The RUL-QMoE model integrates specialized expert networks for five battery types: LFP, NCA, NMC, LCO, and NMC-LCO, within a gating mechanism that dynamically assigns relevance based on the battery's input features. Furthermore, by leveraging non-crossing quantile regression, the proposed RUL-QMoE produces coherent and interpretable predictive distributions of the battery's RUL, enabling robust uncertainty quantification in the battery's RUL prediction. Trained on seven real-world datasets, the proposed RUL-QMoE achieves strong predictive performance across all battery types, with MAE = 65 (cycles), MAPE = 9.59%, RMSE = 100 (cycles), and R2=96.84%. Compared to traditional models like XGBoost, Random Forest, CNN, and LSTM, the proposed RUL-QMoE model consistently delivers lower RMSE and superior probabilistic insights, including survival probabilities and prediction intervals. The model has been integrated into our Battery AI platform in collaboration with Toyota Motor Engineering & Manufacturing North America, Inc., as part of a broader Battery Foundation Model initiative. This RUL-QMoE model will serve future Toyota EVs' users and battery system designers.",
+      "source_status": "索引元数据已确认；出版社页面本次访问受限",
+      "locations": [
+        {
+          "id": "doi:10.1609/aaai.v40i47.41472",
+          "doi": "https://doi.org/10.1609/aaai.v40i47.41472",
+          "is_oa": true,
+          "landing_page_url": "https://doi.org/10.1609/aaai.v40i47.41472",
+          "pdf_url": "https://ojs.aaai.org/index.php/AAAI/article/download/41472/45433",
+          "source": {
+            "id": "https://openalex.org/S4210191458",
+            "display_name": "Proceedings of the AAAI Conference on Artificial Intelligence",
+            "issn_l": "2159-5399",
+            "issn": [
+              "2159-5399",
+              "2374-3468"
+            ],
+            "is_oa": true,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [
+              "jufo-2",
+              "norway-1"
+            ],
+            "host_organization": "https://openalex.org/P4310320058",
+            "host_organization_name": "Association for the Advancement of Artificial Intelligence",
+            "host_organization_lineage": [
+              "https://openalex.org/P4310320058"
+            ],
+            "host_organization_lineage_names": [
+              "Association for the Advancement of Artificial Intelligence"
+            ],
+            "type": "conference"
+          },
+          "license": null,
+          "license_id": null,
+          "version": "publishedVersion",
+          "is_accepted": true,
+          "is_published": true,
+          "raw_source_name": "Proceedings of the AAAI Conference on Artificial Intelligence",
+          "raw_type": "journal-article"
+        },
+        {
+          "id": "pmh:oai:ojs.aaai.org:article/41472",
+          "doi": null,
+          "is_oa": false,
+          "landing_page_url": "https://ojs.aaai.org/index.php/AAAI/article/view/41472",
+          "pdf_url": null,
+          "source": {
+            "id": "https://openalex.org/S4306400155",
+            "display_name": "AAAI Publications (The Association for the Advancement of Artificial Intelligence (AAAI))",
+            "issn_l": null,
+            "issn": null,
+            "is_oa": false,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [],
+            "host_organization": "https://openalex.org/I2801652627",
+            "host_organization_name": "Association for the Advancement of Artificial Intelligence",
+            "host_organization_lineage": [
+              "https://openalex.org/I2801652627"
+            ],
+            "host_organization_lineage_names": [],
+            "type": "repository"
+          },
+          "license": null,
+          "license_id": null,
+          "version": "submittedVersion",
+          "is_accepted": false,
+          "is_published": false,
+          "raw_source_name": "2159-5399",
+          "raw_type": "info:eu-repo/semantics/article"
+        }
+      ],
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "downloaded",
+      "downloaded_filename": "RUL_050_2026_IAAI_RUL-QMoE-Multiple-Non-crossing-Quantile-Mixture-of-Experts-for.pdf",
+      "downloaded_version": "Author extended preprint of IAAI 2026 conference paper; first-page attribution verified"
+    },
+    {
+      "title": "TA-TFN: Task-Adaptive Frequency Decoupling for Generalizable Battery State Estimation across Chemistries",
+      "venue": "KDD",
+      "year": 2026,
+      "priority": "高",
+      "relevance": "任务自适应时频分解，联合 SOC/SOH 估计，重点研究跨化学体系泛化。",
+      "official_url": "https://doi.org/10.1145/3770855.3818162",
+      "doi": "https://doi.org/10.1145/3770855.3818162",
+      "openalex_id": "https://openalex.org/W7196966260",
+      "metadata_url": "https://api.openalex.org/works/W7196966260",
+      "abstract": "Achieving generalizable battery state estimation across heterogeneous chemistries is fundamentally challenged by severe non-stationarity and the entanglement of short-term electrochemical dynamics with long-term aging-induced drifts in voltage signals. Existing data-driven approaches largely ignore the intrinsic frequency mismatch between state-of-charge (SOC) estimation and state-of-health (SOH) monitoring, leading to degraded robustness under chemistry shifts and complex operating conditions. We propose TA-TFN, a Task-Adaptive Time-Frequency Network that explicitly models task-specific frequency allocation for unified SOC/SOH estimation. TA-TFN introduces an end-to-end differentiable parameterized time-frequency convolution with learnable center frequencies and bandwidths, enabling adaptive decomposition of non-stationary current-voltage sequences without handcrafted features. Building on this representation, a task-adaptive gating mechanism dynamically regulates the contribution of distinct frequency components, directing SOC prediction toward aging-insensitive transient dynamics while enhancing SOH sensitivity to low-frequency degradation patterns. Extensive experiments on the large-scale BatteryLife benchmark, covering multiple chemistries and operating regimes, demonstrate that TA-TFN consistently outperforms existing methods in joint SOC/SOH estimation on heterogeneous and mixed-chemistry datasets, while achieving strong cross-chemistry generalization for SOC estimation, highlighting frequency-aware task decoupling as an effective pathway toward generalizable battery state estimation.",
+      "source_status": "索引元数据已确认；出版社页面本次访问受限",
+      "locations": [
+        {
+          "id": "doi:10.1145/3770855.3818162",
+          "doi": "https://doi.org/10.1145/3770855.3818162",
+          "is_oa": true,
+          "landing_page_url": "https://doi.org/10.1145/3770855.3818162",
+          "pdf_url": null,
+          "source": {
+            "id": "https://openalex.org/S4363608767",
+            "display_name": "ACM SIGKDD Conference on Knowledge Discovery and Data Mining (KDD)",
+            "issn_l": null,
+            "issn": null,
+            "is_oa": false,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [],
+            "host_organization": null,
+            "host_organization_name": null,
+            "host_organization_lineage": [],
+            "host_organization_lineage_names": [],
+            "type": "conference"
+          },
+          "license": "cc-by",
+          "license_id": "https://openalex.org/licenses/cc-by",
+          "version": "publishedVersion",
+          "is_accepted": true,
+          "is_published": true,
+          "raw_source_name": "Proceedings of the 32nd ACM SIGKDD Conference on Knowledge Discovery and Data Mining V.2",
+          "raw_type": "proceedings-article"
+        },
+        {
+          "id": "pmh:oai:repository.hkust.edu.hk:1783.1-175641",
+          "doi": null,
+          "is_oa": false,
+          "landing_page_url": "http://repository.hkust.edu.hk/ir/Record/1783.1-175641",
+          "pdf_url": null,
+          "source": {
+            "id": "https://openalex.org/S4306401796",
+            "display_name": "Rare & Special e-Zone (The Hong Kong University of Science and Technology)",
+            "issn_l": null,
+            "issn": null,
+            "is_oa": false,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [],
+            "host_organization": "https://openalex.org/I200769079",
+            "host_organization_name": "Hong Kong University of Science and Technology",
+            "host_organization_lineage": [
+              "https://openalex.org/I200769079"
+            ],
+            "host_organization_lineage_names": [],
+            "type": "repository"
+          },
+          "license": null,
+          "license_id": null,
+          "version": "submittedVersion",
+          "is_accepted": false,
+          "is_published": false,
+          "raw_source_name": null,
+          "raw_type": "Conference paper"
+        }
+      ],
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "download_blocked"
+    },
+    {
+      "title": "LiBrain: LLM-Powered Li-ion Battery Diagnostics with Time-Series-Aware Retrieval-Augmented Framework for E-bikes",
+      "venue": "AAAI proceedings; also AI Magazine",
+      "year": 2026,
+      "priority": "中",
+      "relevance": "时序诊断与检索增强的大模型系统，适合电池诊断助手；与纯电芯退化回归有所不同。",
+      "official_url": "https://ojs.aaai.org/index.php/AAAI/article/view/41439",
+      "doi": "https://doi.org/10.1609/aaai.v40i47.41439",
+      "openalex_id": "https://openalex.org/W7139051221",
+      "metadata_url": "https://api.openalex.org/works/W7139051221",
+      "abstract": "Abstract The rapid proliferation of smart‐city ecosystems has significantly amplified the demand for Li‐ion batteries, which now serve as the primary energy source for sustainable transportation systems such as e‐bikes. Ensuring battery safety and optimal performance is crucial, yet challenging due to complex intrinsic dynamics and extrinsic operating conditions. This paper presents LiBrain, an innovative LLM‐powered, time‐series‐aware retrieval‐augmented framework designed to simultaneously address both safety and performance challenges through three synergistic components: (1) a distributed IoT‐enabled edge network for continuous real‐time battery monitoring and data acquisition, (2) a pretrained deep multi‐task diagnostic engine capable of comprehensive battery performance forecasting, and (3) a knowledge‐base augmentation module that transforms technical diagnostics into clear, actionable guidance tailored for e‐bike users. Functioning as an intelligent battery management assistant, LiBrain effectively bridges the gap between expert‐level real‐time analytics and practical, user‐friendly instructions. Extensive validation across a real‐world operational e‐bike battery‐swap network demonstrates LiBrain's exceptional capabilities, achieving a 95% adoption rate in hazardous alarm detection and 92% in battery‐status prediction. In real application, LiBrain has processed over 500 million battery events, managed almost 10 million inquiries and 1 million alarms annually, and identified 10% of on‐site batteries daily for proactive replacement, thereby maintaining operational safety and reliability.",
+      "source_status": "索引元数据已确认；出版社页面本次访问受限",
+      "locations": [
+        {
+          "id": "doi:10.1002/aaai.70067",
+          "doi": "https://doi.org/10.1002/aaai.70067",
+          "is_oa": true,
+          "landing_page_url": "https://doi.org/10.1002/aaai.70067",
+          "pdf_url": "https://onlinelibrary.wiley.com/doi/pdfdirect/10.1002/aaai.70067",
+          "source": {
+            "id": "https://openalex.org/S163019073",
+            "display_name": "AI Magazine",
+            "issn_l": "0738-4602",
+            "issn": [
+              "0738-4602",
+              "2371-9621"
+            ],
+            "is_oa": false,
+            "is_in_doaj": false,
+            "is_core": true,
+            "listed_in": [
+              "cwts-core",
+              "dongbi-c",
+              "doyens",
+              "jufo-1",
+              "norway-1",
+              "poland-100",
+              "russia-white-list-2"
+            ],
+            "host_organization": "https://openalex.org/P4310320058",
+            "host_organization_name": "Association for the Advancement of Artificial Intelligence",
+            "host_organization_lineage": [
+              "https://openalex.org/P4310320058"
+            ],
+            "host_organization_lineage_names": [
+              "Association for the Advancement of Artificial Intelligence"
+            ],
+            "type": "journal"
+          },
+          "license": "cc-by-nc-nd",
+          "license_id": "https://openalex.org/licenses/cc-by-nc-nd",
+          "version": "publishedVersion",
+          "is_accepted": true,
+          "is_published": true,
+          "raw_source_name": "AI Magazine",
+          "raw_type": "journal-article"
+        },
+        {
+          "id": "doi:10.1609/aaai.v40i47.41439",
+          "doi": "https://doi.org/10.1609/aaai.v40i47.41439",
+          "is_oa": true,
+          "landing_page_url": "https://doi.org/10.1609/aaai.v40i47.41439",
+          "pdf_url": "https://ojs.aaai.org/index.php/AAAI/article/download/41439/45400",
+          "source": {
+            "id": "https://openalex.org/S4210191458",
+            "display_name": "Proceedings of the AAAI Conference on Artificial Intelligence",
+            "issn_l": "2159-5399",
+            "issn": [
+              "2159-5399",
+              "2374-3468"
+            ],
+            "is_oa": true,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [
+              "jufo-2",
+              "norway-1"
+            ],
+            "host_organization": "https://openalex.org/P4310320058",
+            "host_organization_name": "Association for the Advancement of Artificial Intelligence",
+            "host_organization_lineage": [
+              "https://openalex.org/P4310320058"
+            ],
+            "host_organization_lineage_names": [
+              "Association for the Advancement of Artificial Intelligence"
+            ],
+            "type": "conference"
+          },
+          "license": null,
+          "license_id": null,
+          "version": "publishedVersion",
+          "is_accepted": true,
+          "is_published": true,
+          "raw_source_name": "Proceedings of the AAAI Conference on Artificial Intelligence",
+          "raw_type": "journal-article"
+        },
+        {
+          "id": "pmh:oai:ojs.aaai.org:article/41439",
+          "doi": null,
+          "is_oa": false,
+          "landing_page_url": "https://ojs.aaai.org/index.php/AAAI/article/view/41439",
+          "pdf_url": null,
+          "source": {
+            "id": "https://openalex.org/S4306400155",
+            "display_name": "AAAI Publications (The Association for the Advancement of Artificial Intelligence (AAAI))",
+            "issn_l": null,
+            "issn": null,
+            "is_oa": false,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [],
+            "host_organization": "https://openalex.org/I2801652627",
+            "host_organization_name": "Association for the Advancement of Artificial Intelligence",
+            "host_organization_lineage": [
+              "https://openalex.org/I2801652627"
+            ],
+            "host_organization_lineage_names": [],
+            "type": "repository"
+          },
+          "license": null,
+          "license_id": null,
+          "version": "submittedVersion",
+          "is_accepted": false,
+          "is_published": false,
+          "raw_source_name": "2159-5399",
+          "raw_type": "info:eu-repo/semantics/article"
+        }
+      ],
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "download_blocked"
+    },
+    {
+      "title": "Efficient Cost-Minimization Schemes for Electrical Energy Demand Satisfaction by Prosumers in Microgrids with Battery Storage Capabilities",
+      "venue": "IJCAI",
+      "year": 2024,
+      "priority": "扩展",
+      "relevance": "微电网含储能的用能成本优化，偏调度与优化。",
+      "official_url": "https://ijcai.org/proceedings/2024/207",
+      "pdf_url": "https://ijcai.org/proceedings/2024/0207.pdf",
+      "doi": "10.24963/ijcai.2024/207",
+      "abstract": "",
+      "source_status": "官方论文页面和出版信息已核实",
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "downloaded",
+      "downloaded_filename": "BatteryControl_001_2024_IJCAI_Efficient-Cost-Minimization-Schemes-for-Electrical-Energy-Demand.pdf",
+      "downloaded_version": "Official proceedings PDF"
+    },
+    {
+      "title": "Enabling Delayed-Full Charging Through Transformer-Based Real-Time-to-Departure Modeling for EV Battery Longevity",
+      "venue": "AAAI",
+      "year": 2026,
+      "priority": "扩展",
+      "relevance": "以离开时间预测支持延迟充满，偏充电策略与寿命管理。",
+      "official_url": "https://doi.org/10.1609/aaai.v40i45.41228",
+      "doi": "https://doi.org/10.1609/aaai.v40i45.41228",
+      "openalex_id": "https://openalex.org/W7138961717",
+      "metadata_url": "https://api.openalex.org/works/W7138961717",
+      "abstract": "Electric vehicles (EVs) are key to sustainable mobility, yet their lithium-ion batteries (LIBs) degrade more rapidly under prolonged high states of charge (SOC). This can be mitigated by delaying full charging DFC until just before departure, which requires accurate prediction of user departure times. In this work, we propose Transformer-based real-time-to-event (TTE) model for accurate EV departure prediction. Our approach represents each day as a TTE sequence by discretizing time into grid-based tokens. Unlike previous methods primarily dependent on temporal dependency from historical patterns, our method leverages streaming contextual information to predict departures. Evaluation on a real-world study involving 93 users and passive smartphone data demonstrates that our method effectively captures irregular departure patterns within individual routines, outperforming baseline models. These results highlight the potential for practical deployment of the DFC algorithm and its contribution to sustainable transportation systems.",
+      "source_status": "索引元数据已确认；出版社页面本次访问受限",
+      "locations": [
+        {
+          "id": "doi:10.1609/aaai.v40i45.41228",
+          "doi": "https://doi.org/10.1609/aaai.v40i45.41228",
+          "is_oa": true,
+          "landing_page_url": "https://doi.org/10.1609/aaai.v40i45.41228",
+          "pdf_url": "https://ojs.aaai.org/index.php/AAAI/article/download/41228/45189",
+          "source": {
+            "id": "https://openalex.org/S4210191458",
+            "display_name": "Proceedings of the AAAI Conference on Artificial Intelligence",
+            "issn_l": "2159-5399",
+            "issn": [
+              "2159-5399",
+              "2374-3468"
+            ],
+            "is_oa": true,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [
+              "jufo-2",
+              "norway-1"
+            ],
+            "host_organization": "https://openalex.org/P4310320058",
+            "host_organization_name": "Association for the Advancement of Artificial Intelligence",
+            "host_organization_lineage": [
+              "https://openalex.org/P4310320058"
+            ],
+            "host_organization_lineage_names": [
+              "Association for the Advancement of Artificial Intelligence"
+            ],
+            "type": "conference"
+          },
+          "license": null,
+          "license_id": null,
+          "version": "publishedVersion",
+          "is_accepted": true,
+          "is_published": true,
+          "raw_source_name": "Proceedings of the AAAI Conference on Artificial Intelligence",
+          "raw_type": "journal-article"
+        },
+        {
+          "id": "pmh:oai:ojs.aaai.org:article/41228",
+          "doi": null,
+          "is_oa": false,
+          "landing_page_url": "https://ojs.aaai.org/index.php/AAAI/article/view/41228",
+          "pdf_url": null,
+          "source": {
+            "id": "https://openalex.org/S4306400155",
+            "display_name": "AAAI Publications (The Association for the Advancement of Artificial Intelligence (AAAI))",
+            "issn_l": null,
+            "issn": null,
+            "is_oa": false,
+            "is_in_doaj": false,
+            "is_core": false,
+            "listed_in": [],
+            "host_organization": "https://openalex.org/I2801652627",
+            "host_organization_name": "Association for the Advancement of Artificial Intelligence",
+            "host_organization_lineage": [
+              "https://openalex.org/I2801652627"
+            ],
+            "host_organization_lineage_names": [],
+            "type": "repository"
+          },
+          "license": null,
+          "license_id": null,
+          "version": "submittedVersion",
+          "is_accepted": false,
+          "is_published": false,
+          "raw_source_name": "2159-5399",
+          "raw_type": "info:eu-repo/semantics/article"
+        }
+      ],
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "downloaded",
+      "downloaded_filename": "BatteryControl_002_2026_AAAI_Enabling-Delayed-Full-Charging-Through-Transformer-Based-Real.pdf",
+      "downloaded_version": "author preprint; conference publication metadata retained"
+    },
+    {
+      "title": "Optimize Battery Control: A Multi-Objective Evolutionary Ensemble Reinforcement Learning Approach",
+      "venue": "IJCAI",
+      "year": 2025,
+      "priority": "扩展",
+      "relevance": "多目标进化集成强化学习的电池控制，偏控制策略。",
+      "official_url": "https://ijcai.org/proceedings/2025/1024",
+      "pdf_url": "https://ijcai.org/proceedings/2025/1024.pdf",
+      "doi": "10.24963/ijcai.2025/1024",
+      "abstract": "",
+      "source_status": "官方论文页面和出版信息已核实",
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "downloaded",
+      "downloaded_filename": "BatteryControl_003_2025_IJCAI_Optimize-Battery-Control-A-Multi-Objective-Evolutionary-Ensemble.pdf",
+      "downloaded_version": "Official proceedings PDF"
+    },
+    {
+      "title": "Optimizing the Battery-Swapping Problem in Urban E-Bike Systems with Reinforcement Learning",
+      "venue": "IJCAI",
+      "year": 2025,
+      "priority": "扩展",
+      "relevance": "电动自行车换电系统的强化学习调度，偏运营优化。",
+      "official_url": "https://ijcai.org/proceedings/2025/1029",
+      "pdf_url": "https://ijcai.org/proceedings/2025/1029.pdf",
+      "doi": "10.24963/ijcai.2025/1029",
+      "abstract": "",
+      "source_status": "官方论文页面和出版信息已核实",
+      "existing_registry_matches": [],
+      "existing_pdf_firstpage_matches": [],
+      "download_status": "downloaded",
+      "downloaded_filename": "BatteryControl_004_2025_IJCAI_Optimizing-the-Battery-Swapping-Problem-in-Urban-E-Bike-Systems.pdf",
+      "downloaded_version": "Official proceedings PDF"
+    }
+  ],
+  "excluded_existing": [
+    {
+      "title": "BatteryLife: A Comprehensive Dataset and Benchmark for Battery Life Prediction",
+      "existing_files": [
+        "RUL_031_2025_KDD_BatteryLife-A-Comprehensive-Dataset-and-Benchmark-for-Battery.pdf"
+      ]
+    },
+    {
+      "title": "BatteryMFormer: Multi-level Learning for Battery Degradation Trajectory Forecasting",
+      "existing_files": [
+        "Trajectory_009_2026_arXiv_BatteryMFormer-Multi-level-Learning-for-Battery-Degradation.pdf"
+      ]
+    },
+    {
+      "title": "Battery-Sim-Agent: Leveraging LLM-Agent for Inverse Battery Parameter Estimation",
+      "existing_files": [
+        "BatteryModeling_001_2026_arXiv_Battery-Sim-Agent-Leveraging-LLM-Agent-for-Inverse-Battery.pdf"
+      ]
+    },
+    {
+      "title": "BatteryML: An Open-source Platform for Machine Learning on Battery Degradation",
+      "existing_files": [
+        "BatteryModeling_004_2023_arXiv_BatteryML-An-Open-source-platform-for-Machine-Learning-on-Battery.pdf"
+      ]
+    }
+  ],
+  "verification": "Normalized registry titles and freshly extracted first-page text of actual PDFs. Publisher-blocked entries remain metadata-verified candidates; full text and specific conference track not verified. No PDFs downloaded; no files renamed.",
+  "download_result": {
+    "downloaded": 6,
+    "blocked": 4,
+    "manifest": "research-wiki/raw-paper/battery-ai-conference-manifest.json"
+  }
+}

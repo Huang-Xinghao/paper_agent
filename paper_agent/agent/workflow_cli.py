@@ -36,7 +36,7 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
-def run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
+def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
                  timeout: float = 300, start_node: str | None = None,
                  config: WorkflowConfig | None = None,
                  idea_config: IdeaNodeConfig | None = None,
@@ -46,6 +46,8 @@ def run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
                  advance_after_revision: bool = False,
                  proposal_review_sha: str | None = None,
                  model: str | None = None,
+                 role: str | None = None,
+                 instruction: str = "",
                  paper_review_timeout: float | None = None,
                  paper_review_round2_timeout: float | None = None,
                  on_event: Callable[[dict[str, Any]], None] | None = None) -> WorkflowState:
@@ -78,27 +80,19 @@ def run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
         if resuming:
             if saved is None or saved.status != "awaiting_user":
                 raise ValueError("项目没有等待用户确认的专家检查点")
-            prompt = ("请根据以下审阅意见修订当前节点产物：\n" + revise
-                      if revise is not None else saved.task_prompt)
+            prompt = saved.project_goal
+            instruction = revise if revise is not None else ""
             if stop_after is None and saved.expert_checkpoint:
                 stop_after = saved.expert_checkpoint.get("stop_after")
     if paper_review_timeout is not None:
         config = replace(config or WorkflowConfig(), paper_review_timeout=paper_review_timeout)
     if paper_review_round2_timeout is not None:
         config = replace(config or WorkflowConfig(), paper_review_round2_timeout=paper_review_round2_timeout)
-    if (start_node == "improvement" and saved is not None
-            and saved.status in {"failed", "running", "interrupted"}
-            and (saved.improvement_checkpoint or
-                 ((project / "paper/main_round0_original.pdf").is_file()
-                  and (project / "paper/PAPER_IMPROVEMENT_LOG.md").is_file()))):
-        config = replace(config or WorkflowConfig(), improvement_resume=True)
     # Preserve the structured stage checkpoint across web and terminal resumes.
     if (start_node == "improvement" and saved is not None
-            and saved.status == "failed" and saved.failed_node == "improvement"
-            and not saved.improvement_checkpoint
-            and "Paper review round 2 did not complete:" in (saved.error or "")):
-        # Compatibility with failures saved before structured checkpoints existed.
-        config = replace(config or WorkflowConfig(), improvement_start_round=2, improvement_resume=True)
+            and saved.status in {"failed", "running", "interrupted"}
+            and saved.improvement_checkpoint):
+        config = replace(config or WorkflowConfig(), improvement_resume=True)
     if mode is not None:
         config = replace(config or WorkflowConfig(), mode=mode)
         if saved is not None:
@@ -158,6 +152,7 @@ def run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
         event("node_progress", node=node, **details)
 
     agent = PhaseAgent(project, model=model, max_iterations=max_iterations, timeout=timeout,
+                       assignment_role=role,
                        on_progress=lambda kind, data: event(kind, **data))
     runner_options = {"config": config} if config is not None else {}
     if idea_config is not None:
@@ -177,14 +172,15 @@ def run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
             # 先持久化批准与冻结版本，再调用下游；下游失败也不丢失批准记录。
             _write_json(project / "workflow-state.json", state.to_dict())
             if state.status != "completed":
-                state = runner.run(prompt, state=state, stop_after=stop_after)
+                state = runner.run(prompt, state=state, stop_after=stop_after, instruction=instruction)
         elif start_node is None:
-            state = runner.run(prompt, **({"stop_after": stop_after} if stop_after else {}))
+            state = runner.run(prompt, **({"stop_after": stop_after} if stop_after else {}),
+                               **({"instruction": instruction} if instruction else {}))
         else:
             run_options = {"state": runner.start_from_project(start_node, prompt, saved)}
             if stop_after:
                 run_options["stop_after"] = stop_after
-            state = runner.run(prompt, **run_options)
+            state = runner.run(prompt, **run_options, **({"instruction": instruction} if instruction else {}))
     except Exception as exc:
         progress["status"] = "failed"
         event("workflow_error", error=str(exc))
@@ -193,6 +189,96 @@ def run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
     progress["status"] = state.status
     progress["paper_status"] = state.paper_status
     event("workflow_end", node=state.current_node, error=state.error or "")
+    return state
+
+
+def execute_stage(project: Path, node: str, instruction: str, *, role: str, project_goal: str,
+                  revise: str | None = None, **options) -> WorkflowState:
+    """Main's executor API: exactly one node, never automatic downstream work."""
+    if node not in WORKFLOW_NODE_NAMES:
+        raise ValueError("unknown workflow node")
+    if revise is not None:
+        saved = json.loads((project / "workflow-state.json").read_text())
+        if saved.get("current_node") != node:
+            raise ValueError("Revision must match the pending checkpoint node")
+    return _run_workflow(project, "" if revise is not None else project_goal,
+                         instruction=instruction,
+                         start_node=None if revise is not None else node,
+                         stop_after=node, role=role, revise=revise, **options)
+
+
+def run_coordinated_workflow(project: Path, prompt: str = "", *, start_node=None,
+                             stop_after=None, mode=None, continue_run=False, revise=None, resume_run=False,
+                             advance_after_revision=False, proposal_review_sha=None,
+                             model=None, max_iterations=100, timeout=300, on_event=None,
+                             execution_guard=None, **workflow_options):
+    """All user-facing advancement goes through main; runner only supplies stages."""
+    from types import SimpleNamespace
+    from .coordinator import CoordinatorAgent
+    from .role_sessions import PHASE_ROLES
+
+    project = project.resolve()
+    if stop_after is not None and stop_after not in WORKFLOW_NODE_NAMES:
+        raise ValueError("unknown workflow node")
+    path = project / "workflow-state.json"
+    saved = WorkflowState.from_dict(json.loads(path.read_text())) if path.is_file() else None
+    if continue_run and revise is not None:
+        raise ValueError("继续与修订不能同时使用")
+    if continue_run or revise is not None:
+        if start_node or mode is not None or prompt.strip():
+            raise ValueError("审批/修订不能与入口节点、mode 或新任务 prompt 组合")
+        if saved is None or saved.status != "awaiting_user":
+            raise ValueError("项目没有等待用户确认的专家检查点")
+        if revise is not None and not revise.strip():
+            raise ValueError("审阅修改意见不能为空")
+        if continue_run:
+            # Approval validates and freezes files, but never executes a stage.
+            runner = WorkflowRunner(SimpleNamespace(project=project))
+            checkpoint = saved.expert_checkpoint
+            # Single-stage executor's stop boundary is not the user's new request.
+            stop_after = stop_after or saved.workflow_stop_after
+            checkpoint["stop_after"] = stop_after
+            saved = runner.resume_checkpoint(saved, proposal_review_sha=proposal_review_sha)
+            _write_json(path, saved.to_dict())
+            if saved.status == "completed":
+                return saved
+        start_node = saved.current_node
+        prompt = revise if revise is not None else saved.project_goal
+    elif saved and saved.status == "awaiting_user":
+        if not prompt.strip() and start_node is None:
+            return saved
+        raise ValueError("项目存在待审阅检查点，请先批准或修订")
+    if not prompt.strip():
+        prompt = saved.project_goal if saved else ""
+    if not prompt.strip():
+        raise ValueError("首次运行需要任务 prompt")
+    if resume_run:
+        if saved is None:
+            raise ValueError("项目没有可恢复的流程状态")
+        start_node = start_node or saved.failed_node or saved.current_node
+    if saved and (resume_run or continue_run or revise is not None):
+        stop_after = stop_after or saved.workflow_stop_after
+    node = start_node or (workflow_options.get("config") or WorkflowConfig()).start_node
+    if node not in WORKFLOW_NODE_NAMES or (stop_after and stop_after not in WORKFLOW_NODE_NAMES):
+        raise ValueError("unknown workflow node")
+    mode = mode or (saved.mode if saved else "auto")
+    task = None
+    approve_revision = bool(revise is not None and advance_after_revision and node != "refine")
+    if (revise is not None and not approve_revision) or node == stop_after:
+        task = {"node": node, "role": PHASE_ROLES["research_refine" if node == "refine" else node],
+                "instruction": (revise if revise is not None else
+                                f"完成 {node} 阶段并交付该阶段产物，验收后停止。"
+                                if saved is None or continue_run or resume_run else prompt)}
+    agent = CoordinatorAgent(project, model=model, worker_max_iterations=max_iterations,
+                             timeout=timeout, mode=mode, on_event=on_event,
+                             execution_guard=execution_guard, stage_task=task,
+                             checkpoint_revision=revise, stop_after=stop_after,
+                             workflow_options=workflow_options, first_node=node,
+                             project_goal=saved.project_goal if saved else prompt,
+                             approve_revision=approve_revision)
+    result = agent.go(prompt)
+    state = WorkflowState.from_dict(json.loads(path.read_text())) if path.is_file() else WorkflowState("main")
+    state.status, state.error = result.status, result.error
     return state
 
 
@@ -245,7 +331,7 @@ def main() -> None:
                                                improvement_start_round=args.improvement_start_round,
                                                paper_review_timeout=args.paper_review_timeout,
                                                paper_review_round2_timeout=args.paper_review_round2_timeout))
-    state = run_workflow(args.project, " ".join(args.prompt),
+    state = run_coordinated_workflow(args.project, " ".join(args.prompt),
                          start_node=args.single_node or args.start_node,
                          stop_after=args.single_node or args.stop_after,
                          mode=args.mode,
@@ -296,7 +382,7 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
                     stream.write(f"\n\n## 专家审阅：用户确认的研究方向\n\n"
                                  f"本次问题：\n{questions}\n\n用户回答：\n{answer}\n")
             print("正在根据你的回答修订当前节点产物……", flush=True)
-            state = run_workflow(project, revise=(
+            state = run_coordinated_workflow(project, revise=(
                 f"用户已回答 {checkpoint['node']} 的专家审阅问题，请据此修订当前节点产物。\n"
                 f"主要文件：{json.dumps(checkpoint.get('files', [checkpoint['report']]), ensure_ascii=False)}。\n"
                 "先读取现有报告，将用户明确选择整合到任务边界、研究范围、方法建议及验证方案；"
@@ -312,7 +398,7 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
                 return state
             if proposal_review:
                 continue
-        state = run_workflow(project, continue_run=True, **run_options)
+        state = run_coordinated_workflow(project, continue_run=True, **run_options)
     return state
 
 

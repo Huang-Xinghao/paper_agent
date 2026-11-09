@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from paper_agent.tools import BUILTIN_TOOLS, ToolContext, invoke, tools_for_phase
+from paper_agent.tools import BUILTIN_TOOLS, PHASE_TOOL_NAMES, ToolContext, invoke, tools_for_phase
 
 
 def test_paper_templates_can_be_read_outside_project(tmp_path):
@@ -142,11 +142,18 @@ def test_literature_local_discovery(tmp_path):
     assert payload["papers"][0]["path"] == "papers/battery_models.pdf"
 
 
-def test_literature_tools_are_visible_only_in_literature_phase():
+def test_local_literature_tools_remain_available_without_external_retrieval():
     names = {tool.name for tool in tools_for_phase("literature", BUILTIN_TOOLS)}
-    assert {"discover_local_papers", "read_local_paper", "search_papers"} <= names
+    assert {"discover_local_papers", "read_local_paper"} <= names
     assert "verify_papers" not in {tool.name for tool in BUILTIN_TOOLS}
     assert "search_papers" not in {tool.name for tool in tools_for_phase("paper_compile", BUILTIN_TOOLS)}
+
+
+@pytest.mark.parametrize("phase", PHASE_TOOL_NAMES)
+def test_workflow_phases_do_not_expose_external_paper_retrieval(phase):
+    external = {"search_papers", "download_arxiv_paper", "download_openalex_paper"}
+    assert not external & PHASE_TOOL_NAMES[phase]
+    assert not external & {spec.name for spec in tools_for_phase(phase, BUILTIN_TOOLS)}
 
 
 def test_battery_resource_tools_search_and_read(tmp_path):

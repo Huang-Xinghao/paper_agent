@@ -78,7 +78,7 @@ def test_bridge_runs_then_adds_postprocessing_without_retraining(tmp_path):
     assert len(result.experiment_completed_receipts)==2
     assert [r['node'] for r in result.history]==['experiment_bridge']
     assert runner._next_node(result,'experiment_bridge')=='paper_plan'
-    assert result.artifacts['experiment_bridge']=='refine-logs/EXPERIMENT_RESULTS.md'
+    assert result.artifacts['experiment_bridge'][0]['path']=='refine-logs/EXPERIMENT_RESULTS.md'
     assert events and all(node=='experiment_bridge' for node,_ in events)
     agent.configure(phase='paper_plan')
     assert 'run_experiments' not in agent._by_name

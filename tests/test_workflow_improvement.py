@@ -140,14 +140,14 @@ def test_structured_resume_reuses_review_and_only_recompiles(tmp_path, monkeypat
                  'review_round1.md', 'review_round2.md', 'PAPER_IMPROVEMENT_LOG.md'):
         (paper / name).write_text(name)
     saved = WorkflowState('test', status='failed', current_node='improvement',
-                          failed_node='improvement', error='compiler failed', task_prompt='task',
+                          failed_node='improvement', error='compiler failed', project_goal='task',
                           improvement_checkpoint={'round': 2, 'stage': 'compile'})
     (tmp_path / 'workflow-state.json').write_text(json.dumps(saved.to_dict()))
     monkeypatch.setattr(workflow_cli, 'PhaseAgent', lambda *a, **k: SimpleNamespace(project=tmp_path))
     monkeypatch.setattr(ReviewRunner, 'run', lambda *a: pytest.fail('must not repeat review'))
     monkeypatch.setattr(WorkflowRunner, '_go', lambda *a, **k: pytest.fail('must not repeat revision'))
     monkeypatch.setattr(WorkflowRunner, '_compile_pdf', lambda self: paper / 'main.pdf')
-    result = workflow_cli.run_workflow(tmp_path, 'task', start_node='improvement')
+    result = workflow_cli._run_workflow(tmp_path, 'task', start_node='improvement')
     assert result.status == 'completed', result.error
     assert result.improvement_checkpoint == {'round': 2, 'stage': 'completed'}
     assert (paper / 'main_round0_original.pdf').read_text() == 'main_round0_original.pdf'

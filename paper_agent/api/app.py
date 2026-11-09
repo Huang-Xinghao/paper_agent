@@ -26,6 +26,7 @@ from .library import router as library_router
 from .idea_canvas import router as idea_canvas_router
 from .intent import route_message
 from .dispatch import RevisionTask, dispatch_message
+from paper_agent.agent.coordinator import StageAssignment
 from .store import (
     REPO,
     connection,
@@ -234,7 +235,7 @@ class ProjectCreate(BaseModel):
 
 
 class RunCreate(BaseModel):
-    action: Literal["start", "resume", "review", "revise", "proposal_revise", "proposal_approve"] = "start"
+    action: Literal["start", "resume", "review", "revise", "coordinate", "proposal_revise", "proposal_approve"] = "start"
     prompt: str = Field(default="", max_length=20000)
     mode: Literal["auto", "expert"] | None = None
     start_node: str | None = None
@@ -248,9 +249,17 @@ class RunCreate(BaseModel):
     checkpoint_token: str | None = None
     proposal_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     node_task: RevisionTask | None = None
+    stage_task: StageAssignment | None = None
+    revision_task: RevisionTask | None = None
 
     @model_validator(mode="after")
     def nodes(self):
+        if (self.stage_task is not None or self.revision_task is not None) and self.action != "coordinate":
+            raise ValueError("阶段委派仅用于主控任务")
+        if self.stage_task is not None and self.revision_task is not None:
+            raise ValueError("一次只能提交一个明确任务")
+        if self.action == "coordinate" and (self.start_node or self.stop_after or self.answer or self.checkpoint_token):
+            raise ValueError("主控任务不能混入工作流恢复或审阅参数")
         if self.action in {"proposal_revise", "proposal_approve"}:
             if not self.proposal_sha256:
                 raise ValueError("请先保存要提交的方案草稿")
@@ -444,14 +453,17 @@ def send_message(project_id: str, body: MessageCreate):
     if tool == "run_workflow":
         if state:
             raise HTTPException(409, "此项目已有研究成果；新研究请新建项目，修改现有成果请说明目标")
-        request = RunCreate(prompt=body.prompt + "\n任务上下文：\n" + arguments["instruction"],
+        request = RunCreate(action="coordinate", prompt=body.prompt + "\n任务上下文：\n" + arguments["instruction"],
                             mode=body.mode, model=body.model)
     elif tool == "resume_workflow":
         if state.get("status") not in {"failed", "running", "interrupted", "awaiting_results"}:
             raise HTTPException(409, "没有可恢复的失败或中断任务；请说明需要修改的具体产物")
-        request = RunCreate(action="resume", mode=body.mode, model=body.model)
+        request = RunCreate(action="coordinate", prompt=body.prompt, mode=body.mode, model=body.model)
     elif tool == "revise_artifact":
-        request = RunCreate(action="revise", prompt=body.prompt, node_task=arguments, model=body.model)
+        request = RunCreate(action="coordinate", prompt=body.prompt, revision_task=arguments, model=body.model)
+    elif tool == "delegate_stage":
+        request = RunCreate(action="coordinate", prompt=body.prompt, stage_task=arguments,
+                            mode=body.mode, model=body.model)
     else:
         raise HTTPException(503, "无效的调度结果，未启动任务")
     result = create_run(project_id, request, route_initial=False, message_prompt=body.prompt)
@@ -479,7 +491,8 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
             turn = {"prompt": body.prompt, "reply": decision["reply"], "intent": decision["intent"]}
             event(project_id, "conversation_turn", turn)
             return JSONResponse({"intent": decision["intent"], "reply": decision["reply"]}, status_code=200)
-        body = body.model_copy(update={"prompt": decision["research_prompt"]})
+        body = body.model_copy(update={"prompt": decision["research_prompt"],
+                                     **({"action": "coordinate"} if not body.start_node and not body.stop_after else {})})
     reconcile()
     terminal_paths = terminal_projects()
     registered_paths = {item["path"] for item in rows("SELECT path FROM projects")}
@@ -522,6 +535,11 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
                     options["model"] = previous["model"]
             for key in ["mode", "prompt", "answer", "start_node", "stop_after"]:
                 options.pop(key, None)
+        elif body.action == "coordinate":
+            if not body.prompt.strip():
+                raise HTTPException(400, "请输入主控任务")
+            if state.get("status") == "awaiting_user":
+                raise HTTPException(409, "请先通过审阅入口确认当前检查点")
         elif body.action == "revise":
             if not state:
                 raise HTTPException(409, "项目尚无产物，请先开始研究")
@@ -564,7 +582,7 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
             options["start_node"] = (
                 body.start_node or state.get("failed_node") or state.get("current_node")
             )
-            options["prompt"] = body.prompt.strip() or state.get("task_prompt", "")
+            options["prompt"] = body.prompt.strip() or state.get("project_goal", "")
             # The CLI supports changing collaboration mode at a resume node.
         elif not body.prompt.strip():
             raise HTTPException(400, "请输入研究目标")

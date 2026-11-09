@@ -1,7 +1,7 @@
 ---
 name: paper-write
 description: 根据论文规划、真实实验结果、图表和核实文献生成中文或指定语言的 LaTeX 论文源文件。
-allowed-tools: Read, Write, Edit, Grep, Glob, Bash, search_papers, search_wiki, read_wiki
+allowed-tools: Read, Write, Edit, Grep, Glob, Bash, search_papers, search_wiki
 ---
 
 # 论文写作

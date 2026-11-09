@@ -13,7 +13,7 @@ def project(tmp_path):
     (tmp_path / 'figures/figure_1.pdf').write_bytes(b'%PDF-original')
     (tmp_path / 'figures/plot.py').write_text('plot()')
     (tmp_path / 'workflow-state.json').write_text(json.dumps({
-        'status': 'completed', 'current_node': 'improvement', 'task_prompt': 'study'}))
+        'status': 'completed', 'current_node': 'improvement', 'project_goal': 'study'}))
     return {'name': 'study', 'path': str(tmp_path)}
 
 
@@ -41,7 +41,7 @@ def test_completed_project_routes_figure_change_through_tool_call(tmp_path, monk
     assert captured[1][0][-1]['role'] == 'tool'
     assert 'figures/figure_1.pdf' in captured[1][0][-1]['content']
     names = {tool['function']['name'] for tool in captured[0][1]}
-    assert names == {'get_project_context', 'run_workflow', 'resume_workflow', 'revise_artifact'}
+    assert names == {'get_project_context', 'run_workflow', 'resume_workflow', 'revise_artifact', 'delegate_stage'}
     assert '图一换一个布局' in str(captured[0][0])
 
 

@@ -1,7 +1,7 @@
 ---
 name: experiment-plan
 description: 根据 FINAL_PROPOSAL.md 分别规划电池数据集分析与方法实验，生成按 D/B 块组织的实验计划；runner 自动生成块级进度 tracker。
-allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, search_battery_resources, read_battery_resource, list_battery_data_sources, inspect_battery_data
+allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, search_battery_resources, read_battery_resource, list_battery_data_sources, inspect_battery_data
 ---
 ## 概述
 

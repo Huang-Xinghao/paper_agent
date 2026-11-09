@@ -10,6 +10,29 @@ from paper_agent.agent.loop import ArtifactValidationError
 from paper_agent.agent.workflow import NodeResult, WorkflowConfig, WorkflowRunner, WorkflowState
 
 
+def scripted_main(monkeypatch):
+    """Keep the real main/executor handoff; replace only model responses."""
+    from paper_agent.agent import coordinator
+    from paper_agent.agent.model_client import ModelResponse, ToolCall
+    from paper_agent.agent.role_sessions import PHASE_ROLES
+    original = coordinator.CoordinatorAgent
+
+    def factory(*args, **kwargs):
+        node = kwargs["first_node"]
+        task = kwargs.get("stage_task") or {
+            "node": node, "role": PHASE_ROLES["research_refine" if node == "refine" else node],
+            "instruction": "Complete the authorized next stage"}
+        class Model:
+            called = False
+            def complete(self, messages, tools):
+                if not self.called:
+                    self.called = True
+                    return ModelResponse(tool_calls=(ToolCall("stage", "delegate_stage", {"assignment": task}),))
+                return ModelResponse(content="已检查结果。")
+        return original(*args, model_client=Model(), **kwargs)
+    monkeypatch.setattr(coordinator, "CoordinatorAgent", factory)
+
+
 class LiteratureAgent:
     def __init__(self, project):
         self.project = project
@@ -73,7 +96,8 @@ def test_approval_reads_edited_file_without_rerunning_literature(tmp_path):
     def data_search(state, prompt):
         self = resumed
         prompts.append(prompt)
-        assert report.read_text() == state.artifacts["literature"] == "User narrowed scope to A"
+        assert report.read_text() == "User narrowed scope to A"
+        assert state.artifacts["literature"] == resumed._artifact_refs("literature")
         checkpoint = self._project / self._checkpoint_path("data_search")
         checkpoint.parent.mkdir(exist_ok=True)
         checkpoint.write_text(json.dumps({"summary": "Data ready", "questions": ["范围？", "输入？"]}))
@@ -82,7 +106,7 @@ def test_approval_reads_edited_file_without_rerunning_literature(tmp_path):
 
     resumed._nodes["data_search"] = data_search
     state = resumed.resume_checkpoint(state)
-    state = resumed.run(state.task_prompt, state=state, stop_after="data_search")
+    state = resumed.run(state.project_goal, state=state, stop_after="data_search")
     assert state.status == "awaiting_user"
     assert prompts == ["Research"]
     assert not resumed.agent.calls
@@ -94,11 +118,11 @@ def test_revision_preserves_goal_and_pauses_again(tmp_path):
     runner = runner_for(tmp_path)
     state = runner.run("Original goal")
     state = runner.resume_checkpoint(state, revise=True)
-    state = runner.run("Focus on A", state=state)
+    state = runner.run(state.project_goal, instruction="Focus on A", state=state)
     assert state.status == "awaiting_user"
-    assert state.task_prompt == "Original goal"
+    assert state.project_goal == "Original goal"
     assert "Focus on A" in runner.agent.calls[-1]
-    assert state.node_results["literature"]["node_instructions"] == "Focus on A"
+    assert state.node_results["literature"]["instruction"] == "Focus on A"
     assert state.expert_checkpoint["status"] == "pending"
 
 
@@ -107,7 +131,7 @@ def test_stale_checkpoint_cannot_satisfy_revision(tmp_path):
     state = runner.run("Research")
     runner.agent.valid_checkpoint = False
     state = runner.resume_checkpoint(state, revise=True)
-    state = runner.run("Revise", state=state)
+    state = runner.run(state.project_goal, instruction="Revise", state=state)
     assert state.status == "failed"
     assert "EXPERT_CHECKPOINT.json" in state.error
 
@@ -124,18 +148,18 @@ def test_web_revision_advances_once_and_next_node_still_requires_review(tmp_path
         assert prompt == "Original goal"
         assert state.expert_checkpoint["status"] == "approved"
         assert state.expert_checkpoint["confirmed_files"]
-        assert state.artifacts["literature"] == "Literature evidence"
+        assert state.artifacts["literature"] == runner._artifact_refs("literature")
         path = tmp_path / runner._checkpoint_path("data_search")
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps({"summary": "Data ready", "questions": ["范围？", "输入？"]}))
         (tmp_path / "data-search/DATA_REPORT.md").write_text("Data report")
         return NodeResult("data")
     runner._nodes["data_search"] = data_search
-    state = runner.run("Focus on A", state=state, stop_after="literature" if stop_here else None)
-    assert state.task_prompt == "Original goal"
+    state = runner.run(state.project_goal, instruction="Focus on A", state=state, stop_after="literature" if stop_here else None)
+    assert state.project_goal == "Original goal"
     assert len(runner.agent.calls) == 2
     assert "专家模式" not in runner.agent.calls[-1]
-    assert state.node_results["literature"]["node_instructions"] == "Focus on A"
+    assert state.node_results["literature"]["instruction"] == "Focus on A"
     assert any(entry.get("event") == "expert_approved" and entry.get("node") == "literature" for entry in state.history)
     if stop_here:
         assert state.status == "completed"
@@ -152,7 +176,7 @@ def test_web_revision_cannot_advance_with_invalid_artifacts(tmp_path):
     state = runner.resume_checkpoint(state, revise=True, advance_after_revision=True)
     runner._nodes["literature"] = lambda state, prompt: NodeResult("invalid")
     (tmp_path / "literature/RESEARCH_REPORT.md").write_text("")
-    state = runner.run("Revise", state=state)
+    state = runner.run(state.project_goal, instruction="Revise", state=state)
     assert state.status == "failed"
     assert state.current_node == "literature"
     assert state.failed_node == "literature"
@@ -181,8 +205,10 @@ def test_cannot_approve_empty_report_or_nonpaused_state(tmp_path):
 
 
 def test_cli_resume_without_prompt_returns_to_same_review(tmp_path, monkeypatch):
+    scripted_main(monkeypatch)
     runner = runner_for(tmp_path)
     state = runner.run("Research", stop_after="literature")
+    state.workflow_stop_after = "literature"
     (tmp_path / "workflow-state.json").write_text(json.dumps(state.to_dict()))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: "")
@@ -190,7 +216,7 @@ def test_cli_resume_without_prompt_returns_to_same_review(tmp_path, monkeypatch)
     monkeypatch.setattr(sys, "argv", ["workflow", "--project", str(tmp_path)])
     workflow_cli.main()
     saved = json.loads((tmp_path / "workflow-state.json").read_text())
-    assert saved["task_prompt"] == "Research"
+    assert saved["project_goal"] == "Research"
     assert saved["status"] == "completed"
     assert saved["expert_checkpoint"]["status"] == "approved"
 
@@ -205,13 +231,13 @@ def test_removed_cli_review_commands_are_rejected(tmp_path, monkeypatch, option)
 
 def test_cli_continue_without_checkpoint_fails_before_agent(tmp_path):
     with pytest.raises(ValueError, match="检查点"):
-        workflow_cli.run_workflow(tmp_path, continue_run=True)
+        workflow_cli._run_workflow(tmp_path, continue_run=True)
 
 
 def test_cli_expert_start_and_continue_to_data_search(tmp_path, monkeypatch):
     monkeypatch.setattr(workflow_cli, "PhaseAgent", lambda project, **kw: LiteratureAgent(project))
     monkeypatch.setattr(WorkflowRunner, "_research_context", lambda *a, **kw: {})
-    paused = workflow_cli.run_workflow(tmp_path, "Original goal", mode="expert")
+    paused = workflow_cli._run_workflow(tmp_path, "Original goal", mode="expert")
     assert paused.status == "awaiting_user"
     progress = json.loads((tmp_path / "workflow-progress.json").read_text())
     assert progress["status"] == "awaiting_user"
@@ -220,7 +246,8 @@ def test_cli_expert_start_and_continue_to_data_search(tmp_path, monkeypatch):
 
     def data_search(self, state, prompt):
         assert prompt == "Original goal"
-        assert report.read_text() == state.artifacts["literature"] == "Confirmed scope"
+        assert report.read_text() == "Confirmed scope"
+        assert state.artifacts["literature"] == self._artifact_refs("literature")
         checkpoint = self._project / self._checkpoint_path("data_search")
         checkpoint.parent.mkdir(exist_ok=True)
         checkpoint.write_text(json.dumps({"summary": "Data ready", "questions": ["范围？", "输入？"]}))
@@ -228,7 +255,7 @@ def test_cli_expert_start_and_continue_to_data_search(tmp_path, monkeypatch):
         return NodeResult("data")
 
     monkeypatch.setattr(WorkflowRunner, "_run_data_search", data_search)
-    completed = workflow_cli.run_workflow(tmp_path, continue_run=True, stop_after="data_search")
+    completed = workflow_cli._run_workflow(tmp_path, continue_run=True, stop_after="data_search")
     assert completed.status == "awaiting_user"
     assert completed.mode == "expert"
     assert completed.current_node == "data_search"
@@ -238,8 +265,10 @@ def test_cli_expert_start_and_continue_to_data_search(tmp_path, monkeypatch):
 
 
 def test_interactive_answer_is_saved_and_automatically_continues(tmp_path, monkeypatch):
+    scripted_main(monkeypatch)
     runner = runner_for(tmp_path)
     state = runner.run("Original goal", stop_after="data_search")
+    state.workflow_stop_after = "data_search"
     (tmp_path / "workflow-state.json").write_text(json.dumps(state.to_dict()))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     answers = iter(["1. 聚焦方向 A；2. 暂不补充 B", ""])
@@ -264,10 +293,10 @@ def test_interactive_answer_is_saved_and_automatically_continues(tmp_path, monke
         report = (tmp_path / "literature/RESEARCH_REPORT.md").read_text()
         assert "聚焦方向 A" in report
         assert "研究范围：聚焦方向 A，不研究 B" in report
-        assert state.artifacts["literature"] == report
-        assert state.expert_checkpoint["confirmed_sha256"] == hashlib.sha256(
+        assert state.artifacts["literature"] == self._artifact_refs("literature")
+        assert state.history[-1]["sha256"] == hashlib.sha256(
             (tmp_path / "literature/RESEARCH_REPORT.md").read_bytes()).hexdigest()
-        assert prompt == "Original goal"
+        assert "Original goal" in prompt
         checkpoint = self._project / self._checkpoint_path("data_search")
         checkpoint.parent.mkdir(exist_ok=True)
         checkpoint.write_text(json.dumps({"summary": "Data ready", "questions": ["范围？", "输入？"]}))
@@ -302,8 +331,10 @@ def test_interactive_exit_keeps_checkpoint(tmp_path, monkeypatch, exit_kind):
 
 
 def test_directly_edited_report_continues_without_model_revision(tmp_path, monkeypatch):
+    scripted_main(monkeypatch)
     runner = runner_for(tmp_path)
     state = runner.run("Research", stop_after="data_search")
+    state.workflow_stop_after = "data_search"
     (tmp_path / "workflow-state.json").write_text(json.dumps(state.to_dict()))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     report = tmp_path / "literature/RESEARCH_REPORT.md"
@@ -316,7 +347,8 @@ def test_directly_edited_report_continues_without_model_revision(tmp_path, monke
     monkeypatch.setattr(workflow_cli, "PhaseAgent", lambda project, **kw: LiteratureAgent(project))
 
     def data_search(self, state, prompt):
-        assert state.artifacts["literature"] == report.read_text() == "User edited final scope"
+        assert report.read_text() == "User edited final scope"
+        assert state.artifacts["literature"] == self._artifact_refs("literature")
         checkpoint = self._project / self._checkpoint_path("data_search")
         checkpoint.parent.mkdir(exist_ok=True)
         checkpoint.write_text(json.dumps({"summary": "Data ready", "questions": ["范围？", "输入？"]}))
@@ -341,7 +373,7 @@ def test_empty_answer_accepts_report_without_revision(tmp_path, monkeypatch):
         calls.append(kwargs)
         return WorkflowState("done", status="completed")
 
-    monkeypatch.setattr(workflow_cli, "run_workflow", run)
+    monkeypatch.setattr(workflow_cli, "run_coordinated_workflow", run)
     result = workflow_cli._interact_at_checkpoint(tmp_path, state, {})
     assert result.status == "completed"
     assert calls == [{"continue_run": True}]
@@ -359,7 +391,7 @@ def test_failed_answer_revision_does_not_enter_next_node(tmp_path, monkeypatch):
         calls.append(kwargs)
         return WorkflowState("failed", status="failed", error="revision failed")
 
-    monkeypatch.setattr(workflow_cli, "run_workflow", run)
+    monkeypatch.setattr(workflow_cli, "run_coordinated_workflow", run)
     result = workflow_cli._interact_at_checkpoint(tmp_path, state, {})
     assert result.status == "failed"
     assert len(calls) == 1
@@ -407,7 +439,7 @@ def test_every_node_pauses_reads_edited_files_and_routes(tmp_path, monkeypatch, 
         assert state.status == "running"
         assert state.current_node == next_node
     if node in {"literature", "ideas"}:
-        assert state.artifacts[node] == "User updated scope"
+        assert state.artifacts[node] == runner._artifact_refs(node)
     assert bool(compiled) == (node in {"paper_compile", "improvement"})
 
 
@@ -473,7 +505,7 @@ def test_answer_revision_in_nonliterature_node_uses_current_files(tmp_path, monk
             return state
         return WorkflowState("done", status="completed")
 
-    monkeypatch.setattr(workflow_cli, "run_workflow", run)
+    monkeypatch.setattr(workflow_cli, "run_coordinated_workflow", run)
     assert workflow_cli._interact_at_checkpoint(tmp_path, state, {}).status == "completed"
     assert len(calls) == 2
     assert "突出低温泛化" in report.read_text()
@@ -497,11 +529,11 @@ def test_final_proposal_needs_explicit_approval_again_after_revision(tmp_path, s
         return NodeResult("proposal")
 
     runner._nodes["refine"] = refine
-    state = WorkflowState("test", mode="expert", current_node="refine", task_prompt="Research")
+    state = WorkflowState("test", mode="expert", current_node="refine", project_goal="Research")
     state = runner.run("Research", state=state, stop_after=stop_after)
     assert state.status == "awaiting_user" and state.current_node == "refine"
     state = runner.resume_checkpoint(state, revise=True, advance_after_revision=True)
-    state = runner.run("使用方法 B", state=state, stop_after=stop_after)
+    state = runner.run(state.project_goal, instruction="使用方法 B", state=state, stop_after=stop_after)
     assert state.status == "awaiting_user" and state.current_node == "refine"
     assert state.expert_checkpoint["previous_brief"]["方法与创新"] == "方法 A"
     assert state.expert_checkpoint["brief"]["方法与创新"] == "方法 B"

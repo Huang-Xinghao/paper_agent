@@ -34,7 +34,7 @@ def review(tmp_path, monkeypatch):
         root = Path(project['path'])
         (root / 'refine-logs').mkdir()
         (root / PROPOSAL).write_text('# Original\n\n## Goal\nOriginal goal and protected evidence.\n\n## Method\nOriginal method.\n')
-        state = WorkflowState(run_id='origin', task_prompt='Preserve research question', mode='expert',
+        state = WorkflowState(run_id='origin', project_goal='Preserve research question', mode='expert',
             current_node='refine', status='awaiting_user', expert_checkpoint={
                 'node': 'refine', 'status': 'pending', 'next_node': 'experiment_plan',
                 'report': PROPOSAL, 'files': [PROPOSAL], 'summary': 'Original proposal', 'questions': [],
@@ -241,7 +241,7 @@ def test_worker_revision_skips_cuda_and_workflow_and_keeps_checkpoint(review, mo
     from paper_agent.api import runtime
     from paper_agent.agent import workflow_cli
     monkeypatch.setattr(runtime,'check_runtime',lambda: pytest.fail('revision must not require CUDA'))
-    monkeypatch.setattr(workflow_cli,'run_workflow',lambda *a,**kw: pytest.fail('revision must not run workflow'))
+    monkeypatch.setattr(workflow_cli,'run_coordinated_workflow',lambda *a,**kw: pytest.fail('revision must not run workflow'))
     fake_model(monkeypatch,root)
     current = client.get(endpoint+'/idea-canvas').json()
     submitted = client.post(endpoint+'/runs',json={'action':'proposal_revise','proposal_sha256':current['sha256']})
@@ -274,7 +274,7 @@ def test_worker_approval_hands_off_once_and_stops_after_planning(review, monkeyp
         assert kwargs['proposal_review_sha'] == current['sha256']
         assert 'prompt' not in kwargs and 'mode' not in kwargs
         return SimpleNamespace(status='awaiting_user',error=None)
-    monkeypatch.setattr(workflow_cli,'run_workflow',run)
+    monkeypatch.setattr(workflow_cli,'run_coordinated_workflow',run)
     worker.execute(submitted.json()['id'])
     assert len(called) == 1
 
@@ -301,7 +301,7 @@ def test_real_cli_persists_approval_before_planning_and_never_executes_experimen
         return NodeResult('Plan ready',{'phase':'experiment_plan'})
     monkeypatch.setattr(WorkflowRunner,'_run_experiment_plan',plan)
     monkeypatch.setattr(WorkflowRunner,'_run_experiment_bridge',lambda *args:pytest.fail('must never execute experiments'))
-    state=workflow_cli.run_workflow(root,continue_run=True,proposal_review_sha=sha((root/CANVAS).read_bytes()),stop_after='experiment_plan')
+    state=workflow_cli._run_workflow(root,continue_run=True,proposal_review_sha=sha((root/CANVAS).read_bytes()),stop_after='experiment_plan')
     assert called==['plan']
     assert state.current_node=='experiment_plan'
     assert state.status==('failed' if planning_fails else 'awaiting_user')

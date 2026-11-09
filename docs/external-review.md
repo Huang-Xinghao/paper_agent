@@ -115,5 +115,6 @@ inputs.
 preserve the original and completed-round snapshots, reuse a completed report,
 and skip a completed revision when only compilation failed. An interrupted review
 restarts that review with a fresh session; partial reports are diagnostic only.
-Failures from older versions retain a compatibility fallback. The project API's
+Failures without a structured checkpoint are not inferred from filenames or error
+text. Select the restart round explicitly with `--improvement-start-round`. The project API's
 `progress.improvement` includes round, stage, review time budget and elapsed time.

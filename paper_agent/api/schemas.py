@@ -41,7 +41,7 @@ class WorkflowView(BaseModel):
     model_config = ConfigDict(extra="ignore")
     status: str | None = None
     current_node: str | None = None
-    task_prompt: str = ""
+    project_goal: str = ""
     mode: str | None = None
     history: list[HistoryView] = Field(default_factory=list)
     expert_checkpoint: CheckpointView | None = None

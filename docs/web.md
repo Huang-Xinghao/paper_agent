@@ -11,6 +11,12 @@
 
 仅监听 `127.0.0.1:8000`。前端开发代理 `/api` 到该地址。API 文档为 `/api/docs`，OpenAPI 为 `/api/openapi.json`。
 
+使用 Herdr 常驻角色执行阶段时，先进入 Herdr 终端，再运行 `./run-herdr-web SESSION_NAME`。
+新项目会在首次文献派发时自动绑定此会话。若要与现有服务同时测试，可设
+`PAPER_AGENT_API_PORT=8010` 和独立的 `PAPER_AGENT_WEB_DATA`；前端用
+`PAPER_AGENT_API_URL=http://127.0.0.1:8010 npm run dev -- --port 5174` 启动。
+对话进度会显示“已交给 Herdr 执行”。所有节点派发到对应的常驻角色，复用独立分屏及角色会话。
+
 环境变量：
 
 | 变量 | 默认 / 用途 |
@@ -33,6 +39,12 @@
 项目内原有 `workflow-state.json`、`workflow-progress.json`、实验回执和报告仍为研究事实来源；不在数据库复制一套可编辑的科学状态。数据库记录 Web 请求、运行生命周期和操作历史。
 
 ## 运行约束
+
+默认新研究进入 `coordinate` 后台任务，由持续主控会话串行委派单阶段任务、接收结果和安排后续。
+已有研究的对话入口也支持指定阶段委派或范围明确的局部修改；后端绑定单项任务，完成即停止。
+主控事件沿用现有 SSE 和 activity 接口。显式节点运行、检查点批准/修订继续使用原工作流入口；
+它们不会由模型自动批准。最终方案的主控委派强制专家审阅，其他阶段遵循所选协作模式。
+主控调用方式和预算见 [runtime.md](runtime.md#主控-agent)。
 
 新项目的 `start` 请求先判断意图：身份和问候直接回答，其他消息由无工具权限的模型结合最近 8 轮普通对话判断。普通知识问答返回 `200 {intent: "chat", reply}`，目标不明确返回 `200 {intent: "clarify", reply}`；回复作为 `conversation_turn` 事件持久化，不创建运行或工作流状态。明确研究请求合并上下文目标后创建运行并返回 `202 {id}`。判断失败返回 503，绝不自动启动研究。已有工作流的恢复和专家审阅维持原有语义。
 
@@ -74,6 +86,18 @@ Web 测试使用临时根目录，并替换模型执行，覆盖发现已有项�
 服务为 `systemctl --user` 管理的 `paper-agent-api.service` 与 `paper-agent-tunnel.service`。已启用用户 linger，在注销后继续运行并随用户管理器开机启动。API 服务保留 `KillMode=process`，重启不主动终止分离的研究进程。
 
 凭据、Tunnel 配置及初始登录信息位于所有者权限保护的 `~/.config/paper-agent/` 和 `~/.cloudflared/`，不在代码仓库内。`~/.cloudflared/cert.pem` 为管理凭据，权限范围大于单个 Tunnel；保管好它。隧道服务实际使用专用 JSON 凭据。
+
+### Herdr 独立测试入口（2026-11-09）
+
+`https://herdr.xora.top` 通过现有 Cloudflare Tunnel 转发至本机 5175 的构建版前端，
+同源 `/api` 代理到 8010 的 Herdr 测试 API。原 `www.xora.top` / `api.xora.top` 路由保留。
+该入口沿用 `web.env` 中的账号密码，独立数据库位于 `.paper-agent/herdr-web`，
+项目根目录为 `/data/xinghao/paper-agent-projects/herdr-tests`，所有节点使用对应的 Herdr 常驻角色。
+
+前端由用户级 `paper-agent-herdr-web.service` 运行；这是当前启动的 transient unit。
+测试 API 从 `paper-agent-roles` 的受管终端启动，重启时在该终端运行
+`/data/apps/micromamba/envs/xinghao/bin/python /data/xinghao/config/paper-agent/start-herdr-api.py`。
+此入口未配置开机自动恢复 API 与 Herdr 会话。Tunnel ingress 配置已有修改前备份。
 
 ### 协作方式切换
 

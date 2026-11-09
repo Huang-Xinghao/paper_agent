@@ -6,7 +6,7 @@ import pytest
 from paper_agent.agent.wiki import WikiAgent
 from paper_agent.agent.model_client import ModelResponse
 from paper_agent.tools.zotero import ZoteroClient
-from test_wiki_agent import analysis
+from test_wiki_agent import analysis, mock_independent_review
 
 
 def transport(request):
@@ -43,9 +43,15 @@ def client():
 
 
 def fake_reader(monkeypatch):
-    monkeypatch.setattr('paper_agent.agent.wiki.read_mineru_paper', lambda *args: {
-        'status': 'completed', 'figures': [],
-        'pages': [{'page': 1, 'text': 'Paper methods and results'}]})
+    import hashlib
+    from paper_agent.tools.paper_preprocessing import document_from_structured
+    def read(project, pdf):
+        doc = document_from_structured({'pages': [{'page_idx': 0, 'blocks': [
+            {'type': 'text', 'content': 'Introduction'}]}]},
+            pdf_sha256=hashlib.sha256(pdf.read_bytes()).hexdigest())
+        return {'status': 'completed', 'figures': [], 'pages': doc['pages'], 'document': doc}
+    monkeypatch.setattr('paper_agent.agent.wiki.read_mineru_paper', read)
+    mock_independent_review(monkeypatch)
 
 
 def test_download_metadata_annotations_and_secret_boundary(tmp_path):

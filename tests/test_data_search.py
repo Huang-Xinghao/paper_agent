@@ -30,8 +30,8 @@ def test_literature_data_search_ideas_handoff(tmp_path, monkeypatch):
     state = runner.run("Study battery degradation", stop_after="ideas")
     assert state.status == "completed", state.error
     assert [phase for phase, _ in agent.calls] == ["literature", "data_search", "ideas"]
-    assert "data-search/DATA_REPORT.md" in agent.calls[-1][1]
-    assert state.artifacts["data_search"] == "data-search/DATA_REPORT.md"
+    assert "先读取当前上游报告" not in agent.calls[-1][1]
+    assert state.artifacts["data_search"][0]["path"] == "data-search/DATA_REPORT.md"
     assert state.node_results["ideas"]["data_source"] == "data-search/DATA_REPORT.md"
     assert state.node_results["ideas"]["data_sha256"] == hashlib.sha256(b"Verified complete package").hexdigest()
     assert "data_search" in WORKFLOW_NODE_NAMES

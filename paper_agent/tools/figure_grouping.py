@@ -164,7 +164,7 @@ def group_page(page):
 
 def run(pdf_path, input_path, output):
     import pypdfium2 as pdfium
-    from PIL import Image, ImageDraw
+    from PIL import ImageDraw
     data = json.loads(input_path.read_text())
     output.mkdir(parents=True, exist_ok=True)
     (output/'figures').mkdir(exist_ok=True)

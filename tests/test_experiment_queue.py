@@ -38,6 +38,24 @@ def run(runner, jobs, state=None):
                            on_progress=runner.on_node_progress)
 
 
+def test_cpu_queue_does_not_probe_nvidia_devices(tmp_path, monkeypatch):
+    r = setup_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(queue, 'discover_gpus', lambda r: pytest.fail('CPU jobs need no NVIDIA probe'))
+    receipts = run(r, [job('cpu-only', device='cpu')])
+    assert receipts[0]['status'] == 'completed'
+    assert receipts[0]['resources']['allocated_device'] == 'cpu'
+
+
+def test_cuda_probe_failure_is_not_a_cpu_fallback(tmp_path, monkeypatch):
+    r = setup_queue(tmp_path, monkeypatch)
+    def broken_probe(executor):
+        raise RuntimeError('NVIDIA unavailable')
+    monkeypatch.setattr(queue, 'discover_gpus', broken_probe)
+    with pytest.raises(RuntimeError, match='NVIDIA unavailable'):
+        run(r, [job('gpu-only')])
+    assert not (tmp_path / 'results/gpu-only.json').exists()
+
+
 def test_parallel_gpu_assignment_and_success_dependencies(tmp_path, monkeypatch):
     r = setup_queue(tmp_path, monkeypatch)
     barrier = threading.Barrier(2)

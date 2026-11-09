@@ -6,8 +6,32 @@ import json
 import os
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Callable, Mapping
+from .usage import record_usage
+
+
+@dataclass
+class RequestBudget:
+    remaining: int
+    max_output_tokens: int
+    used: int = 0
+
+
+_request_budget: ContextVar[RequestBudget | None] = ContextVar("model_request_budget", default=None)
+
+
+@contextmanager
+def limited_model_requests(limit: int = 3, max_output_tokens: int = 4000):
+    """给取证子流程单独限额，不修改其他并发项目的环境变量或请求设置。"""
+    budget = RequestBudget(limit, max_output_tokens)
+    token = _request_budget.set(budget)
+    try:
+        yield budget
+    finally:
+        _request_budget.reset(token)
 
 
 def _transient_request_error(exc: Exception) -> bool:
@@ -53,12 +77,15 @@ class OutputLimitExceeded(RuntimeError):
     """The response reached its output limit; partial tool calls must not run."""
 
 
-def _stream_response(stream: Any, *, deadline: float | None = None) -> ModelResponse:
+def _stream_response(stream: Any, *, deadline: float | None = None, on_usage=None, on_delta=None) -> ModelResponse:
     """Assemble deltas before exposing any tool call to the execution loop."""
     content, calls = [], {}
     finished = False
+    pending, last_flush = [], time.monotonic()
     try:
         for chunk in stream:
+            if on_usage and getattr(chunk, 'usage', None) is not None:
+                on_usage(chunk.usage)
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("Model connection retry window exhausted (300 seconds)")
             for choice in chunk.choices:
@@ -67,6 +94,12 @@ def _stream_response(stream: Any, *, deadline: float | None = None) -> ModelResp
                 delta = choice.delta
                 if delta.content:
                     content.append(delta.content)
+                    if on_delta:
+                        pending.append(delta.content)
+                        if time.monotonic() - last_flush >= .05 or sum(map(len, pending)) >= 96:
+                            on_delta(''.join(pending))
+                            pending.clear()
+                            last_flush = time.monotonic()
                 for call in delta.tool_calls or ():
                     item = calls.setdefault(call.index, {
                         "id": "", "function": {"name": "", "arguments": ""}})
@@ -83,6 +116,8 @@ def _stream_response(stream: Any, *, deadline: float | None = None) -> ModelResp
                     finished = True
         if not finished:
             raise RuntimeError("Model stream ended without a completion marker; no tools were executed")
+        if pending and on_delta:
+            on_delta(''.join(pending))
         try:
             return _normalise_response({"content": "".join(content),
                                         "tool_calls": [calls[i] for i in sorted(calls)]})
@@ -167,6 +202,8 @@ class ModelClient:
         except (TypeError, ValueError):
             self.timeout = 120.0
         self._responder = responder
+        self.usage_workspace = None
+        self.usage_phase = None
         if responder is not None:
             self.client = client
             return
@@ -185,24 +222,42 @@ class ModelClient:
             client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout, max_retries=0)
         self.client = client
 
-    def _request_response(self, request: dict[str, Any]) -> ModelResponse:
+    def _request_response(self, request: dict[str, Any], *, on_delta=None, on_stream_reset=None) -> ModelResponse:
         """Retry the same model request; partial streams never reach tool execution."""
         deadline = None
         last_error = None
         retries = 0
         while True:
             options = dict(request)
+            budget = _request_budget.get()
+            if budget is not None:
+                if budget.remaining <= 0:
+                    raise RuntimeError("Model request budget exhausted")
+                budget.remaining -= 1
+                budget.used += 1
+                options["max_tokens"] = min(int(options.get("max_tokens", budget.max_output_tokens)), budget.max_output_tokens)
+                options["stream"] = False
+                options.pop("stream_options", None)
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError("Model connection retry window exhausted (300 seconds)") from last_error
                 options["timeout"] = min(self.timeout, remaining)
+            usage = None
+            def capture(value):
+                nonlocal usage
+                usage = value
             try:
+                if on_stream_reset:
+                    on_stream_reset()
                 response = self.client.chat.completions.create(**options)
                 if options["stream"] and not isinstance(response, Mapping) and not hasattr(response, "choices"):
-                    return _stream_response(response, deadline=deadline)
+                    return _stream_response(response, deadline=deadline, on_usage=capture, on_delta=on_delta)
+                capture(response.get('usage') if isinstance(response, Mapping) else getattr(response, 'usage', None))
                 return _normalise_response(response)
             except Exception as exc:
+                if budget is not None:
+                    raise
                 if not _transient_request_error(exc):
                     raise
                 last_error = exc
@@ -217,15 +272,26 @@ class ModelClient:
                     "模型连接失败，%.1f 秒后重试（第 %d 次，剩余重试窗口 %.1f 秒）：%s",
                     delay, retries, remaining, exc)
                 time.sleep(delay)
+            finally:
+                record_usage(self.usage_workspace, source='model', model=self.model,
+                             phase=self.usage_phase, usage=usage)
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
-                 *, temperature: float = 0) -> ModelResponse:
+                 *, temperature: float = 0, on_delta=None, on_stream_reset=None) -> ModelResponse:
         if self._responder is not None:
+            budget = _request_budget.get()
+            if budget is not None:
+                if budget.remaining <= 0:
+                    raise RuntimeError("Model request budget exhausted")
+                budget.remaining -= 1
+                budget.used += 1
             return _normalise_response(self._responder(messages=messages, tools=tools,
                                                        model=self.model, temperature=temperature))
         streaming = os.environ.get("PAPER_AGENT_STREAM", "true").lower() not in {"0", "false", "no"}
         request = {"model": self.model, "messages": messages,
                    "temperature": temperature, "timeout": self.timeout, "stream": streaming}
+        if streaming:
+            request['stream_options'] = {'include_usage': True}
         configured_max_tokens = os.environ.get("PAPER_AGENT_MAX_TOKENS")
         if configured_max_tokens:
             try:
@@ -236,13 +302,14 @@ class ModelClient:
                 request["max_tokens"] = max_tokens
         if tools:
             request.update(tools=tools, tool_choice="auto")
-        for attempt in range(3):
+        attempts = 1 if _request_budget.get() is not None else 3
+        for attempt in range(attempts):
             try:
-                return self._request_response(request)
+                return self._request_response(request, on_delta=on_delta, on_stream_reset=on_stream_reset)
             except OutputLimitExceeded as exc:
-                if attempt == 2:
+                if attempt == attempts - 1:
                     raise OutputLimitExceeded(
-                        "Model output was truncated (finish_reason=length) after 3 attempts; "
+                        f"Model output was truncated (finish_reason=length) after {attempts} attempts; "
                         "no partial tool calls were executed. Set PAPER_AGENT_MAX_TOKENS "
                         "to an output budget supported by your provider and resume this node."
                     ) from exc
@@ -254,7 +321,7 @@ class ModelClient:
                     "across turns. Do not repeat a full report or large batches of tool calls in one response.",
                 }]
             except InvalidToolCall:
-                if attempt == 2:
+                if attempt == attempts - 1:
                     raise
                 request["messages"] = messages + [{
                     "role": "user",

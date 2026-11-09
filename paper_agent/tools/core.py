@@ -57,15 +57,6 @@ class ToolContext:
             raise ValueError("a file path is required")
         return candidate
 
-    def resolve_knowledge(self, path: str | Path) -> Path:
-        """Resolve a read-only path below one of the configured knowledge roots."""
-        candidate = Path(path).resolve()
-        for root in self.knowledge_roots:
-            root = root.resolve()
-            if candidate.is_relative_to(root):
-                return candidate
-        raise ValueError(f"path is outside configured knowledge roots: {path}")
-
 
 _TOOLS: dict[str, ToolSpec] = {}
 

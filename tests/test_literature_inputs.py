@@ -42,13 +42,13 @@ def test_runner_collects_local_evidence_without_downloading(tmp_path, monkeypatc
 
     def read(ctx, path, max_pages):
         calls.append(("read", path, max_pages))
-        return result({"path": path, "text": "Evidence", "pages_read": max_pages, "page_count": 12})
+        return result({"path": path, "text": "Evidence" * 500, "pages_read": max_pages, "page_count": 12})
 
     def unexpected_download(*args, **kwargs):
         raise AssertionError("The workflow must leave downloads to the model")
 
     monkeypatch.setattr(literature.urllib.request, "urlopen", unexpected_download)
-    monkeypatch.setattr(workflow, "search_papers", search)
+    monkeypatch.setattr(literature, "search_papers", search)
     monkeypatch.setattr(workflow, "discover_local_papers", lambda *a, **k: result(
         {"found": 1, "papers": [{"path": "papers/local.pdf"}]}))
     monkeypatch.setattr(workflow, "read_local_paper", read)
@@ -57,12 +57,18 @@ def test_runner_collects_local_evidence_without_downloading(tmp_path, monkeypatc
     output = runner._run_literature(WorkflowState("test"), "Battery SOH")
     context = json.loads(agent.prompt.split("运行器收集的文献上下文：\n")[1])
     assert calls[-1] == ("agent", "literature")
-    assert ("search", "openalex", 5) in calls
+    assert not any(c[0] == "search" for c in calls)
     assert ("read", "papers/local.pdf", 3) in calls
     assert "Battery SOH" in agent.prompt
-    assert (tmp_path / "literature/RESEARCH_REPORT.md").read_text() == output.artifact
-    assert [c for c in calls if c[0] == "search"] == [("search", "openalex", 5)]
+    assert output.artifact == "literature/RESEARCH_REPORT.md"
+    assert (tmp_path / output.artifact).read_text() == "Literature report"
+    assert "online_papers" not in context
+    assert "online_papers" not in output.metadata["research_sources"]
     assert context["local_papers"]["status"] == "read"
+    assert "text" not in context["local_papers"]["papers"][0]
+    assert len(context["local_papers"]["papers"][0]["excerpt_preview"]) <= 400
+    archived = json.loads((tmp_path / context["source_context_path"]).read_text())
+    assert archived["local_papers"]["papers"][0]["text"] == "Evidence" * 500
     assert output.metadata["research_sources"]["local_papers"] == ["papers/local.pdf"]
     assert not (tmp_path / "papers").exists()
 
@@ -119,7 +125,8 @@ def test_arxiv_atom_metadata_and_invalid_xml(tmp_path, monkeypatch):
 
 def test_literature_can_read_later_pages():
     available = {tool.name for tool in tools_for_phase("literature", BUILTIN_TOOLS)}
-    assert {"read_paper_pages", "download_arxiv_paper", "download_openalex_paper"} <= available
+    assert "read_paper_pages" in available
+    assert not {"search_papers", "download_arxiv_paper", "download_openalex_paper"} & available
 
 
 def test_interrupted_download_leaves_no_cache(tmp_path, monkeypatch):

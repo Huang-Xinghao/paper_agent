@@ -38,11 +38,13 @@ def stop_tree(process):
 
 
 def execute(run_id):
-    from paper_agent.agent.workflow_cli import run_workflow
+    from paper_agent.agent.workflow_cli import run_coordinated_workflow
     from .runtime import check_runtime
 
     run = rows("SELECT * FROM runs WHERE id=?", (run_id,))[0]
     project = rows("SELECT * FROM projects WHERE id=?", (run["project_id"],))[0]
+    from paper_agent.agent.herdr import ensure_no_pending
+    ensure_no_pending(Path(project["path"]))
     options = json.loads(run["options"])
     options.pop("message_prompt", None)
     action = options.pop("action")
@@ -69,7 +71,7 @@ def execute(run_id):
                 "消除与回答冲突的建议，保留有效证据及用户回答以供追溯。"
                 "不得仅改报告冒充新实验结果，不得篡改执行回执；实验变更须经现有工具执行验证。"
                 + ("修订后更新方案审阅摘要，交还用户决定是否批准。" if proposal_review else
-                   "修订完成后由工作流自动进入下游，无需再次提问确认。")
+                   "修订完成后交还主控验收。")
                 + "\n当前审阅问题：\n" + "\n".join(
                     f"{index + 1}. {question}" for index, question in enumerate(
                         (state.get("expert_checkpoint") or {}).get("questions", [])
@@ -95,8 +97,24 @@ def execute(run_id):
         require_candidate(root, proposal_sha)
         # 只进入文本实验规划并停下，不执行实验，因此不要求本机先有 CUDA。
         options.pop("node_task", None)
-        state = run_workflow(root, continue_run=True, proposal_review_sha=proposal_sha,
+        state = run_coordinated_workflow(root, continue_run=True, proposal_review_sha=proposal_sha,
                              stop_after="experiment_plan", on_event=on_event, **options)
+    elif action == "coordinate":
+        from paper_agent.agent.coordinator import CoordinatorAgent
+
+        def guard(node):
+            if node == "experiment_bridge":
+                check_runtime()
+
+        agent = CoordinatorAgent(Path(project["path"]), model=options.get("model"),
+                                 worker_max_iterations=options["max_iterations"],
+                                 timeout=options.get("timeout", 600), mode=options.get("mode") or "auto",
+                                 on_event=on_event, execution_guard=guard,
+                                 stage_task=options.get("stage_task"), revision_task=options.get("revision_task"))
+        prompt = options["prompt"]
+        state = agent.go(prompt)
+        event(project["id"], "conversation_turn", {"prompt": "主控执行结果", "reply": state.final,
+              "intent": "coordinator_result"}, run_id)
     elif action == "revise":
         from paper_agent.agent.node_task import run_node_task
         state = run_node_task(Path(project["path"]), options["node_task"], options["prompt"],
@@ -105,8 +123,11 @@ def execute(run_id):
                               max_iterations=options["max_iterations"], on_event=on_event)
     else:
         options.pop("node_task", None)
-        check_runtime()
-        state = run_workflow(Path(project["path"]), on_event=on_event, **options)
+        options.pop("stage_task", None)
+        options.pop("revision_task", None)
+        state = run_coordinated_workflow(Path(project["path"]), on_event=on_event, resume_run=action == "resume",
+                                         execution_guard=lambda node: check_runtime() if node == "experiment_bridge" else None,
+                                         **options)
     output = data_root() / "runs" / run_id / "result.json"
     output.write_text(
         json.dumps({"status": state.status, "error": state.error}), encoding="utf-8"

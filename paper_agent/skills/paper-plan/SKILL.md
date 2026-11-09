@@ -1,7 +1,7 @@
 ---
 name: paper-plan
 description: 根据最终研究方案、实验计划和实际结果生成中文论文结构、主张证据矩阵、图表计划和引用计划。
-allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, search_battery_resources, read_battery_resource
+allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, search_battery_resources, read_battery_resource
 ---
 
 # 论文规划

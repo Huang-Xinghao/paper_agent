@@ -71,7 +71,12 @@ def test_wiki_writes_architecture_without_visual_model_call(tmp_path, monkeypatc
     from paper_agent.agent.wiki import WikiAgent
     from paper_agent.agent.model_client import ModelResponse
     pdf = make_pdf(tmp_path, monkeypatch)
-    data = extraction(tmp_path) | {'pages': [{'page': 1, 'text': 'MinerU full text'}]}
+    from paper_agent.tools.paper_preprocessing import document_from_structured
+    import hashlib
+    doc = document_from_structured({'pages': [{'page_idx': 0, 'blocks': [
+        {'type': 'text', 'content': 'Introduction'}]}]},
+        pdf_sha256=hashlib.sha256(pdf.read_bytes()).hexdigest())
+    data = extraction(tmp_path) | {'pages': doc['pages'], 'document': doc}
     monkeypatch.setattr('paper_agent.agent.wiki.read_mineru_paper', lambda *args: data)
     class Model:
         calls = 0

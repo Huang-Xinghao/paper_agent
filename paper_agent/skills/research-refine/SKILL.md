@@ -1,7 +1,7 @@
 ---
 name: research-refine
 description: 将电池研究想法细化为可实现、可验证的最终研究方案。
-allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, search_battery_resources, read_battery_resource
+allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, search_battery_resources, read_battery_resource
 ---
 
 ## 概述

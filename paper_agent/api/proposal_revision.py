@@ -20,6 +20,9 @@ SYSTEM = """你是研究方案修订 Agent。只修订方案，不执行研究�
 用户会集中提交修改后的方案摘要、正文、方法图和补充意见。你必须依据原提案、上一轮统一方案及本轮人工修改，
 分析语义关联影响，生成一份完整、内部一致、可再次审阅的方案。保留未受影响的事实、引用、公式、证据和约束；
 不得用短摘要替代完整方法，也不得擅自改掉用户已经决定的研究目标或捏造新证据。
+wikiEvidence 是按当前 Wiki 版本重新检查的历史依据。stale/unavailable/insufficient 不能用作新增主张的支持；
+来源未变也须根据本轮用户修改重判适用条件。没有支持的新主张标为假设，关键证据缺口放入 questions。
+引文存在和来源版本一致不等于科学结论已经验证。
 
 review.sections 是方案的唯一正文，每部分 details 是完整可执行说明，summary 是忠实的易读摘要，
 focus 标识关键取舍；章节由研究内容决定，不固定模块数或模板。不重复 details 所在部分的大标题。
@@ -53,6 +56,8 @@ def run_revision(root, expected_sha, run_id, folder, *, model=None, timeout=600,
     schema = RevisionResult.model_json_schema()
     payload = {"originalProposal": source, "submittedDraft": incoming.model_dump(),
                "previousRevision": old_record, "requiredSchema": schema}
+    from paper_agent.agent.wiki_research import latest_evidence
+    payload["wikiEvidence"] = latest_evidence(root)
     atomic_bytes(folder / "submission.json", json_bytes(payload))
     load_env_file(REPO / ".env")
     adapter = ModelClient(model=model or os.environ.get("PAPER_AGENT_MODEL", "gpt-4o"), timeout=timeout)

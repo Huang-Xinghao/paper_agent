@@ -112,14 +112,14 @@ def test_discover_existing_projects_without_modification(tmp_path, monkeypatch):
     project = root / "existing"
     project.mkdir(parents=True)
     state = project / "workflow-state.json"
-    state.write_text('{"status":"awaiting_results","task_prompt":"原始目标"}')
+    state.write_text('{"status":"awaiting_results","project_goal":"原始目标"}')
     monkeypatch.setenv("PAPER_AGENT_WEB_DATA", str(tmp_path / "metadata"))
     monkeypatch.setenv("PAPER_AGENT_PROJECT_ROOTS", str(root))
     with TestClient(api_module.app) as client:
         items = client.get("/api/projects").json()
         assert len(items) == 1
-        assert items[0]["state"]["task_prompt"] == "原始目标"
-    assert state.read_text() == '{"status":"awaiting_results","task_prompt":"原始目标"}'
+        assert items[0]["state"]["project_goal"] == "原始目标"
+    assert state.read_text() == '{"status":"awaiting_results","project_goal":"原始目标"}'
 
 
 def test_path_boundary_and_private_files(web, tmp_path):
@@ -209,7 +209,7 @@ def test_review_uses_current_file_hashes(web, monkeypatch):
         "run_id": "r",
         "status": "awaiting_user",
         "current_node": "literature",
-        "task_prompt": "goal",
+        "project_goal": "goal",
         "expert_checkpoint": {
             "node": "literature",
             "status": "pending",
@@ -338,7 +338,7 @@ def test_worker_revision_and_durable_events(web, monkeypatch):
         kwargs["on_event"]({"kind": "tool_end", "tool": "read", "time": store.now()})
         return SimpleNamespace(status="awaiting_user", error=None)
 
-    monkeypatch.setattr(workflow_cli, "run_workflow", fake_workflow)
+    monkeypatch.setattr(workflow_cli, "run_coordinated_workflow", fake_workflow)
     execute(run_id)
     assert captured["max_iterations"] == 17
     assert captured["advance_after_revision"] is True
@@ -365,7 +365,7 @@ def test_public_state_excludes_large_internal_artifacts(web):
     project = create(client)
     state = {
         "status": "completed",
-        "task_prompt": "goal",
+        "project_goal": "goal",
         "artifacts": {"literature": "internal content" * 10000},
         "history": [
             {
@@ -432,7 +432,7 @@ def test_resume_can_switch_to_expert_mode_without_changing_saved_state(web, monk
     client, _ = web
     project = create(client)
     root = Path(project["path"])
-    state = {"task_prompt": "goal", "status": "completed", "mode": "auto", "current_node": "paper_compile"}
+    state = {"project_goal": "goal", "status": "completed", "mode": "auto", "current_node": "paper_compile"}
     state_path = root / "workflow-state.json"
     original = json.dumps(state)
     state_path.write_text(original)
@@ -450,7 +450,7 @@ def test_resume_review_timeout_is_forwarded_and_validated(web, monkeypatch):
     project = create(client)
     root = Path(project["path"])
     (root / "workflow-state.json").write_text(json.dumps({
-        "status": "failed", "failed_node": "improvement", "task_prompt": "goal"}))
+        "status": "failed", "failed_node": "improvement", "project_goal": "goal"}))
     monkeypatch.setattr(api_module.subprocess, "Popen", lambda *a, **kw:
                         SimpleNamespace(pid=os.getpid(), wait=lambda: 0))
     endpoint = f"/api/projects/{project['id']}/runs"
@@ -538,7 +538,7 @@ def test_worker_forwards_separate_review_budgets(web, monkeypatch):
     def run(path, **options):
         captured.update(options)
         return SimpleNamespace(status='completed', error=None)
-    monkeypatch.setattr(workflow_cli, 'run_workflow', run)
+    monkeypatch.setattr(workflow_cli, 'run_coordinated_workflow', run)
     worker.execute(run_id)
     assert captured['paper_review_timeout'] == 1800
     assert captured['paper_review_round2_timeout'] == 1200
@@ -563,7 +563,7 @@ def test_completed_project_message_dispatches_scoped_task(web, monkeypatch):
     client, _ = web
     project = create(client)
     root = Path(project['path'])
-    state = '{"status":"completed","current_node":"improvement","task_prompt":"study"}'
+    state = '{"status":"completed","current_node":"improvement","project_goal":"study"}'
     (root / 'workflow-state.json').write_text(state)
     (root / 'figures').mkdir()
     (root / 'figures/figure_1.pdf').write_bytes(b'%PDF-original')
@@ -576,8 +576,8 @@ def test_completed_project_message_dispatches_scoped_task(web, monkeypatch):
     response = client.post(f"/api/projects/{project['id']}/messages", json={'prompt': '只改图一'})
     assert response.status_code == 202, response.text
     options = json.loads(store.rows('SELECT options FROM runs')[0]['options'])
-    assert options['action'] == 'revise'
-    assert options['node_task']['node'] == 'paper_figure'
+    assert options['action'] == 'coordinate'
+    assert options['revision_task']['node'] == 'paper_figure'
     assert options['prompt'] == '只改图一'
     assert 'start_node' not in options
     assert (root / 'workflow-state.json').read_text() == state
@@ -617,7 +617,7 @@ def test_worker_scoped_task_bypasses_workflow_and_gpu_check(web, monkeypatch):
         'node_task': {'node': 'paper_figure', 'target': '图一', 'instruction': '只改图一',
                       'files': ['figures/figure_1.pdf']}})
     monkeypatch.setattr(runtime, 'check_runtime', lambda: pytest.fail('no GPU check for local edit'))
-    monkeypatch.setattr(workflow_cli, 'run_workflow', lambda *a, **k: pytest.fail('must not run workflow'))
+    monkeypatch.setattr(workflow_cli, 'run_coordinated_workflow', lambda *a, **k: pytest.fail('must not run workflow'))
     captured = {}
     def revise(path, task, prompt, folder, **options):
         captured.update(task=task, prompt=prompt, **options)
@@ -627,3 +627,33 @@ def test_worker_scoped_task_bypasses_workflow_and_gpu_check(web, monkeypatch):
     assert captured['task']['node'] == 'paper_figure'
     assert captured['prompt'] == '只改图一'
     assert captured['max_iterations'] == 12
+
+
+def test_worker_runs_coordinator_and_persists_final_reply(web, monkeypatch):
+    from paper_agent.api import worker, runtime
+    from paper_agent.agent import coordinator
+    client, _ = web
+    project = create(client)
+    task = {'node': 'literature', 'role': 'idea_generator', 'instruction': 'Review evidence'}
+    run_id = seed_run(project['id'], options={
+        'action': 'coordinate', 'prompt': 'Review this topic', 'max_tool_rounds': 12,
+        'stage_task': task})
+    captured = {}
+    class Main:
+        def __init__(self, path, **options):
+            captured.update(options)
+        def go(self, prompt):
+            captured['prompt'] = prompt
+            return SimpleNamespace(status='completed', error=None, final='Report verified.')
+    monkeypatch.setattr(coordinator, 'CoordinatorAgent', Main)
+    monkeypatch.setattr(runtime, 'check_runtime', lambda: pytest.fail('No GPU needed for literature'))
+    worker.execute(run_id)
+    assert captured['stage_task'] == task
+    assert captured['worker_max_iterations'] == 12
+    result = json.loads((store.data_root() / 'runs' / run_id / 'result.json').read_text())
+    assert result['status'] == 'completed'
+    turns = store.rows("SELECT data FROM events WHERE kind='conversation_turn'")
+    assert json.loads(turns[-1]['data'])['reply'] == 'Report verified.'
+    captured['execution_guard']('literature')
+    with pytest.raises(pytest.fail.Exception):
+        captured['execution_guard']('experiment_bridge')

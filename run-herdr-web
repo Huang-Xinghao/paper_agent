@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${HERDR_ENV:-}" != 1 || -z "${HERDR_PANE_ID:-}" ]]; then
+  echo 'Start Herdr first, then run this launcher in its terminal.' >&2
+  exit 1
+fi
+if [[ $# != 1 || ! "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+  echo 'Usage: ./run-herdr-web SESSION_NAME' >&2
+  exit 2
+fi
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+runtime_python="${PAPER_AGENT_RUNTIME_PYTHON:-/data/apps/micromamba/envs/xinghao/bin/python}"
+export PAPER_AGENT_HERDR_SESSION="$1"
+# Resolve this caller in the named session before accepting Web requests.
+"$runtime_python" -c 'import os; from pathlib import Path; from paper_agent.agent.herdr import Client; p = Client(os.environ["PAPER_AGENT_HERDR_SESSION"], str(Path(os.sys.executable).with_name("herdr"))).call("pane", "current", "--current")["pane"]; assert p["pane_id"] == os.environ["HERDR_PANE_ID"], "Herdr session does not contain the caller pane"'
+echo "Herdr session: $PAPER_AGENT_HERDR_SESSION; persistent role agents execute workflow stages."
+exec "$repo_root/run-web-api"

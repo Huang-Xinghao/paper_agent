@@ -2,14 +2,14 @@
 """Deterministic prompt-injection / promptware / exfiltration scanner for ARIS.
 
 ARIS injects model- and web-authored content back into agent context: MEMORY.md,
-research-wiki nodes/edges, the query_pack that feeds /idea-creator, fetched paper
+research-wiki nodes/edges, fetched paper
 abstracts, and community-PR-authored SKILL.md. None of that was scanned before.
 This module is the cheap, deterministic FIRST layer of ARIS's two-layer defense:
 
   layer 1 (this file) — regex, fail-closed, no model. A poisoned model cannot
                         talk its way past a regex. Blocks overt injection.
   layer 2 (the jury)  — cross-model review (codex/gemini) catches semantic
-                        poisoning a regex can't (see injection-hygiene.md).
+                        poisoning a regex can't.
 
 A clean scan is NOT a safety acquittal — only the absence of known-bad strings.
 "Drive, not acquit": this scanner may GATE a write/inject; correctness of the
@@ -18,7 +18,7 @@ content still belongs to the cross-model jury (acceptance-gate.md).
 Pattern set adapted from NousResearch/hermes-agent `tools/threat_patterns.py`
 (MIT License, Copyright (c) 2025 Nous Research), with ARIS-runtime adaptations
 (Claude/Codex/Gemini env vars, ARIS config paths) and an added entry-level
-`quarantine()` + CLI. See shared-references/injection-hygiene.md.
+`quarantine()` + CLI.
 
 Scope (nested: all ⊂ context ⊂ strict):
   all      — classic injection + exfil; minimal false positives, any text.

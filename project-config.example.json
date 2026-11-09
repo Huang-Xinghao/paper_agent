@@ -1,0 +1,9 @@
+{
+  "compute": {
+    "device": "auto",
+    "gpu_index": null,
+    "cpu_threads": null,
+    "max_job_seconds": null,
+    "total_experiment_seconds": null
+  }
+}

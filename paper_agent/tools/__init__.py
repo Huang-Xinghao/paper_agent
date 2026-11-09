@@ -5,6 +5,7 @@ from . import execution as _execution
 from . import literature as _literature
 from . import battery_resources as _battery_resources
 from . import wiki as _wiki
+from . import wiki_hybrid as _wiki_hybrid
 from . import figure_references as _figure_references
 from . import dataset_inspection as _dataset_inspection
 from . import image_generation as _image_generation

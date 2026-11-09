@@ -48,10 +48,10 @@ def test_runner_passes_original_task_without_duplicate_policy(tmp_path):
     configure(tmp_path, cpu_threads=3, total_experiment_seconds=42)
     r=runner(tmp_path)
     captured=[]
-    r._nodes['custom'] = lambda state, prompt: (captured.append(prompt) or NodeResult())
-    state=r.run('original task', state=WorkflowState('test', current_node='custom'))
+    r._nodes['improvement'] = lambda state, prompt: (captured.append(prompt) or NodeResult())
+    state=r.run('original task', state=WorkflowState('test', current_node='improvement'))
     assert captured == ['original task']
-    assert state.task_prompt == 'original task'
+    assert state.project_goal == 'original task'
 
 
 def test_agent_cannot_change_user_policy(tmp_path):

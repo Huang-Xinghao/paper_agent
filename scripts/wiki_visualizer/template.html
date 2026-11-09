@@ -17,7 +17,7 @@
  <div><div class="side-title">数据形式</div><div class="filter-group" id="data_type"></div></div>
  <div><div class="side-title">研究场景</div><div class="filter-group" id="scenarios"></div></div>
  <div><div class="side-title">研究任务</div><div class="filter-group" id="tasks"></div></div>
- <div><div class="side-title">知识库文档</div><nav class="nav"><button data-doc="index.md">↗ &nbsp; 原始索引</button><button data-doc="log.md">↗ &nbsp; 更新日志</button><button data-doc="query_pack.md">↗ &nbsp; 研究上下文</button></nav></div>
+ <div><div class="side-title">知识库文档</div><nav class="nav"><button data-doc="index.md">↗ &nbsp; 原始索引</button><button data-doc="log.md">↗ &nbsp; 更新日志</button></nav></div>
  <div class="side-note"><b>● 本地知识库快照</b><br>内容来自原始 Markdown 与关系记录。<br>新增内容后，重新生成即可更新。</div>
 </aside>
 <main>
@@ -38,7 +38,7 @@
 const DATA=JSON.parse(document.getElementById('wiki-data').textContent);
 const $=id=>document.getElementById(id), escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const names={paper:'论文',idea:'研究思路',experiment:'实验证据',claim:'研究主张'}, colors={paper:'#347d68',idea:'#b58a40',experiment:'#7395b3',claim:'#aa799a'};
-const edgeNames={inspired_by:'启发自',tested_by:'由实验验证',supports:'支持',extends:'扩展',contradicts:'存在矛盾',depends_on:'依赖',uses:'引用',refutes:'反驳',invalidates:'否定',supersedes:'取代',addresses_gap:'回应缺口',shares_method:'共享具体方法',addresses_same_problem:'研究同一问题',may_apply_to:'可能迁移至（待验证）'};
+const edgeNames={cites:'文献引用',inspired_by:'启发自',tested_by:'由实验验证',supports:'支持',extends:'扩展',contradicts:'存在矛盾',depends_on:'依赖',uses:'引用',refutes:'反驳',invalidates:'否定',supersedes:'取代',addresses_gap:'回应缺口',shares_method:'共享具体方法',addresses_same_problem:'研究同一问题'};
 const nodes=DATA.nodes, edges=DATA.edges, byId=new Map(nodes.map(n=>[n.node_id,n]));
 const facets=['research_field','task','method','data_type','scenario'];
 const state={type:'all',...Object.fromEntries(facets.map(k=>[k,''])),query:'',view:'graph',selected:null,zoom:1,x:0,y:0};
@@ -84,7 +84,7 @@ function openNode(id,push=true){const n=byId.get(id);if(!n)return;state.selected
  showReader();if(push)history.pushState(null,'','#'+encodeURIComponent(id));
 }
 function closeReader(){$('reader').hidden=$('overlay').hidden=true;document.body.style.overflow='';state.selected=null;render();history.replaceState(null,'',location.pathname+location.search);if(lastFocus?.isConnected)lastFocus.focus();else $('search').focus();}
-function openDoc(path){const d=DATA.documents.find(d=>d.path===path);if(!d)return;state.selected=null;render();history.replaceState(null,'',location.pathname+location.search);$('readerPath').textContent=path;$('readerContent').innerHTML='<h2 id="readerTitle">'+escape({'index.md':'原始索引','log.md':'更新日志','query_pack.md':'研究上下文'}[path]||path)+'</h2><div class="markdown">'+markdown(d.body)+'</div>';showReader();}
+function openDoc(path){const d=DATA.documents.find(d=>d.path===path);if(!d)return;state.selected=null;render();history.replaceState(null,'',location.pathname+location.search);$('readerPath').textContent=path;$('readerContent').innerHTML='<h2 id="readerTitle">'+escape({'index.md':'原始索引','log.md':'更新日志'}[path]||path)+'</h2><div class="markdown">'+markdown(d.body)+'</div>';showReader();}
 document.addEventListener('click',e=>{const b=e.target.closest('button,[data-node]');if(!b)return;if(b.dataset.node){openNode(b.dataset.node);return;}for(const key of facets){if(b.hasAttribute('data-'+key)){state[key]=b.getAttribute('data-'+key);render();}}if(b.dataset.nav){state.type=b.dataset.nav;state.view=state.type==='all'?'graph':'cards';render();}if(b.dataset.doc)openDoc(b.dataset.doc);});
 $('graph').addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.dataset.node){e.preventDefault();openNode(e.target.dataset.node);}});
 $('search').addEventListener('input',e=>{state.query=e.target.value.trim().toLowerCase();render();});

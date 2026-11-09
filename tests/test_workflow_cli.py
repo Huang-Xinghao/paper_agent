@@ -10,8 +10,8 @@ from paper_agent.agent.loop import PhaseAgent
 from paper_agent.agent.workflow import NodeResult, WorkflowState
 
 
-@pytest.mark.parametrize("failed_round", [1, 2])
-def test_resume_review_timeout_preserves_completed_round(tmp_path, monkeypatch, failed_round):
+@pytest.mark.parametrize("failed_round,has_checkpoint", [(1, True), (2, True), (2, False)])
+def test_review_resume_uses_checkpoint_and_not_old_error_text(tmp_path, monkeypatch, failed_round, has_checkpoint):
     from paper_agent.agent.workflow import WorkflowRunner
     from paper_agent.agent.review_runner import ReviewRunner
 
@@ -20,9 +20,10 @@ def test_resume_review_timeout_preserves_completed_round(tmp_path, monkeypatch, 
     for name in ("main.tex", "main.pdf", "main_round0_original.pdf", "main_round1.pdf",
                  "review_round1.md", "PAPER_IMPROVEMENT_LOG.md"):
         (paper / name).write_text(name)
-    saved = WorkflowState("old", task_prompt="no new experiments", status="failed",
+    saved = WorkflowState("old", project_goal="no new experiments", status="failed",
                           failed_node="improvement", current_node="improvement", mode="expert",
-                          error=f"node improvement failed: Paper review round {failed_round} did not complete: Review exceeded 1800 seconds")
+                          error=f"node improvement failed: Paper review round {failed_round} did not complete: Review exceeded 1800 seconds",
+                          improvement_checkpoint={"round": failed_round, "stage": "review"} if has_checkpoint else {})
     (tmp_path / "workflow-state.json").write_text(json.dumps(saved.to_dict()))
     seen = []
 
@@ -33,12 +34,15 @@ def test_resume_review_timeout_preserves_completed_round(tmp_path, monkeypatch, 
 
     monkeypatch.setattr(ReviewRunner, "run", review)
     monkeypatch.setattr(workflow_cli, "PhaseAgent", lambda *a, **k: SimpleNamespace(project=tmp_path))
-    state = workflow_cli.run_workflow(tmp_path, saved.task_prompt, start_node="improvement",
+    state = workflow_cli._run_workflow(tmp_path, saved.project_goal, start_node="improvement",
                                       paper_review_timeout=5400, paper_review_round2_timeout=5400)
     assert state.status == "failed"
-    assert seen == [f"review_round{failed_round}.md"]
+    expected_round = failed_round if has_checkpoint else 1
+    assert seen == [f"review_round{expected_round}.md"]
+    assert state.improvement_checkpoint["round"] == expected_round
+    assert state.improvement_checkpoint["stage"] == "review"
     assert "test timeout" in state.error
-    if failed_round == 2:
+    if failed_round == 2 and has_checkpoint:
         for name in ("main_round0_original.pdf", "main_round1.pdf", "review_round1.md",
                      "PAPER_IMPROVEMENT_LOG.md"):
             assert (paper / name).read_text() == name
@@ -53,7 +57,7 @@ def test_cli_single_figure_entry_and_stop(tmp_path, monkeypatch, options):
     def run(*args, **kwargs):
         captured.update(kwargs)
         return WorkflowState('test', status='completed')
-    monkeypatch.setattr(workflow_cli, 'run_workflow', run)
+    monkeypatch.setattr(workflow_cli, 'run_coordinated_workflow', run)
     monkeypatch.setattr(sys, 'argv', ['paper-workflow', '--project', str(tmp_path), *options, 'Only Figure 1'])
     workflow_cli.main()
     assert captured['start_node'] == captured['stop_after'] == 'paper_figure'
@@ -80,6 +84,15 @@ def test_agent_reports_model_and_tool_progress(tmp_path):
     agent = PhaseAgent(tmp_path, model_client=Model(), on_progress=lambda kind, data: events.append((kind, data)))
     agent.go("create an idea")
 
+    assert events[0][0] == "role_task_start"
+    assert events[-1][0] == "role_task_end"
+    assert events[0][1]["role"] == "idea_generator"
+    assert events[-1][1]["status"] == "completed"
+    contexts = [data for kind, data in events if kind == "context_prepared"]
+    assert len(contexts) == 2
+    assert all(data["request_chars"] <= data["transcript_chars"] for data in contexts)
+    events = [(kind, data) for kind, data in events if kind != "context_prepared"]
+    events = events[1:-1]
     assert [kind for kind, _ in events] == [
         "model_start", "model_end", "tool_start", "tool_end",
         "model_start", "model_end", "assistant_output", "phase_end",
@@ -99,7 +112,7 @@ def test_workflow_cli_persists_failed_state_and_progress(tmp_path, monkeypatch, 
             self.on_node_end = on_node_end
 
         def run(self, prompt):
-            state = WorkflowState("test-run", task_prompt=prompt)
+            state = WorkflowState("test-run", project_goal=prompt)
             self.on_node_start("ideas", state)
             self.agent.on_progress("model_start", {"phase": "ideas", "iteration": 1})
             self.agent.on_progress("model_error", {"phase": "ideas", "iteration": 1,
@@ -112,7 +125,7 @@ def test_workflow_cli_persists_failed_state_and_progress(tmp_path, monkeypatch, 
                         SimpleNamespace(on_progress=kwargs["on_progress"]))
     monkeypatch.setattr(workflow_cli, "WorkflowRunner", Runner)
 
-    state = workflow_cli.run_workflow(tmp_path, "test task")
+    state = workflow_cli._run_workflow(tmp_path, "test task")
 
     progress = json.loads((tmp_path / "workflow-progress.json").read_text())
     persisted = json.loads((tmp_path / "workflow-state.json").read_text())
@@ -126,7 +139,7 @@ def test_workflow_cli_persists_failed_state_and_progress(tmp_path, monkeypatch, 
 
 
 def test_workflow_cli_exits_nonzero_on_failed_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(workflow_cli, "run_workflow", lambda *args, **kwargs: WorkflowState(
+    monkeypatch.setattr(workflow_cli, "run_coordinated_workflow", lambda *args, **kwargs: WorkflowState(
         "test-run", status="failed", error="Request timed out."))
     monkeypatch.setattr(sys, "argv", ["paper-workflow", "--project", str(tmp_path), "task"])
 
@@ -139,7 +152,7 @@ def test_tool_round_option_reaches_agent_configuration(tmp_path, monkeypatch):
     def run(*args, **kwargs):
         captured.update(kwargs)
         return WorkflowState('test', status='completed')
-    monkeypatch.setattr(workflow_cli, 'run_workflow', run)
+    monkeypatch.setattr(workflow_cli, 'run_coordinated_workflow', run)
     monkeypatch.setattr(sys, 'argv', ['paper-workflow', '--project', str(tmp_path),
                                     '--max-tool-rounds', '40', 'task'])
     workflow_cli.main()
@@ -147,7 +160,7 @@ def test_tool_round_option_reaches_agent_configuration(tmp_path, monkeypatch):
 
 
 def test_workflow_cli_starts_at_requested_node_from_saved_state(tmp_path, monkeypatch):
-    saved = WorkflowState("prior-run", task_prompt="Research", status="failed",
+    saved = WorkflowState("prior-run", project_goal="Research", status="failed",
                           current_node="ideas", transitions=2)
     (tmp_path / "workflow-state.json").write_text(json.dumps(saved.to_dict()))
 
@@ -171,7 +184,7 @@ def test_workflow_cli_starts_at_requested_node_from_saved_state(tmp_path, monkey
 
     monkeypatch.setattr(workflow_cli, "PhaseAgent", lambda project, **kwargs: SimpleNamespace())
     monkeypatch.setattr(workflow_cli, "WorkflowRunner", Runner)
-    state = workflow_cli.run_workflow(tmp_path, "Research", start_node="refine")
+    state = workflow_cli._run_workflow(tmp_path, "Research", start_node="refine")
     assert state.run_id == "prior-run"
     assert state.status == "completed"
 
@@ -180,7 +193,7 @@ def test_workflow_cli_starts_at_requested_node_from_saved_state(tmp_path, monkey
     ("awaiting_results", 2),
 ])
 def test_workflow_cli_exits_nonzero_for_unfinished_states(tmp_path, monkeypatch, status, exit_code):
-    monkeypatch.setattr(workflow_cli, "run_workflow", lambda *args, **kwargs:
+    monkeypatch.setattr(workflow_cli, "run_coordinated_workflow", lambda *args, **kwargs:
                         WorkflowState("test-run", status=status))
     monkeypatch.setattr(sys, "argv", ["paper-workflow", "--project", str(tmp_path), "task"])
     with pytest.raises(SystemExit) as exc:

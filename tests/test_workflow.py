@@ -12,7 +12,7 @@ def test_resume_accepts_node_instructions_without_changing_original_task(tmp_pat
     from paper_agent.agent.workflow import NodeResult
     (tmp_path / 'PAPER_PLAN.md').write_text('Existing plan')
     runner = WorkflowRunner(SimpleNamespace(project=tmp_path))
-    saved = WorkflowState('existing', task_prompt='Study battery lifetime', status='completed',
+    saved = WorkflowState('existing', project_goal='Study battery lifetime', status='completed',
                           current_node='experiment_bridge', artifacts={'experiment_bridge': 'results'})
     calls = []
 
@@ -23,19 +23,20 @@ def test_resume_accepts_node_instructions_without_changing_original_task(tmp_pat
     runner._nodes['paper_figure'] = handle
     runner._nodes['paper_write'] = handle
     runner._next_node = lambda state, node: 'paper_write' if node == 'paper_figure' else None
-    state = runner.start_from_project('paper_figure', 'Use three panels and blue colors', saved)
-    assert state.task_prompt == 'Study battery lifetime'
-    result = runner.run('Use three panels and blue colors', state=state)
+    state = runner.start_from_project('paper_figure', saved.project_goal, saved)
+    assert state.project_goal == 'Study battery lifetime'
+    result = runner.run(state.project_goal, instruction='Use three panels and blue colors', state=state)
     assert result.status == 'completed'
     assert [node for node, _ in calls] == ['paper_figure', 'paper_write']
     assert 'Study battery lifetime' in calls[0][1]
     assert 'Use three panels and blue colors' in calls[0][1]
     assert calls[1][1] == 'Study battery lifetime'
-    assert result.node_results['paper_figure']['node_instructions'] == 'Use three panels and blue colors'
-    assert result.node_results['paper_write']['node_instructions'] == ''
+    assert result.node_results['paper_figure']['instruction'] == 'Use three panels and blue colors'
+    assert result.node_results['paper_write']['instruction'] == ''
     restored = WorkflowState.from_dict(result.to_dict())
-    assert restored.task_prompt == 'Study battery lifetime'
-    assert restored.history[-2]['node_instructions'] == 'Use three panels and blue colors'
+    assert restored.project_goal == 'Study battery lifetime'
+    assert 'instruction' not in restored.history[-2]
+    assert 'node_instructions' not in restored.to_dict()
     # Another entry with the original task does not inherit previous figure instructions.
     runner.start_from_project('paper_figure', 'Study battery lifetime', restored)
     calls.clear()
@@ -47,8 +48,8 @@ def test_first_explicit_entry_uses_prompt_as_original_task(tmp_path):
     (tmp_path / 'PAPER_PLAN.md').write_text('Existing plan')
     runner = WorkflowRunner(SimpleNamespace(project=tmp_path))
     state = runner.start_from_project('paper_figure', 'Battery research')
-    assert state.task_prompt == 'Battery research'
-    assert state.node_instructions == ''
+    assert state.project_goal == 'Battery research'
+    assert 'node_instructions' not in state.to_dict()
 
 
 def test_checkpoint_round_trip_preserves_current_state():
@@ -107,7 +108,7 @@ class StubAgent:
             (self.project / "experiments").mkdir(exist_ok=True)
             script = "import pathlib; p=pathlib.Path(__import__('sys').argv[1]); p.parent.mkdir(exist_ok=True); p.write_text('{\"metric\": 0.82}')"
             def job(name, output):
-                return {"id": name, "block_id": "B1", "depends_on": [], "argv": [sys.executable, "-c", script, output], "timeout_seconds": 5, "expected_outputs": [{'path': output, 'metrics': ['metric']}]}
+                return {"id": name, "block_id": "B1", "depends_on": [], "resources": {"device": "cpu"}, "argv": [sys.executable, "-c", script, output], "timeout_seconds": 5, "expected_outputs": [{'path': output, 'metrics': ['metric']}]}
             manifest_path = self.project / "experiments/manifest.json"
             if not manifest_path.exists():
                 manifest_path.write_text(json.dumps({

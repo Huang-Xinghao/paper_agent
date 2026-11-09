@@ -60,7 +60,7 @@ def build(root: Path, output: Path) -> dict:
             if line.strip():
                 edge = json.loads(line)
                 (edges if edge.get("from") in ids and edge.get("to") in ids else unresolved).append(edge)
-    documents = [read_page(root / name, root) for name in ("index.md", "log.md", "query_pack.md") if (root / name).exists()]
+    documents = [read_page(root / name, root) for name in ("index.md", "log.md") if (root / name).exists()]
     data = {"nodes": nodes, "edges": edges, "documents": documents, "unresolved": unresolved}
     template = Path(__file__).with_name("wiki_visualizer").joinpath("template.html").read_text(encoding="utf-8")
     # A wiki page must never be able to terminate the embedded JSON script element.

@@ -9,6 +9,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from paper_agent.agent.model_client import ModelClient, load_env_file
+from paper_agent.agent.coordinator import StageAssignment
+from paper_agent.agent.role_sessions import RoleSession, now
 from .store import REPO, read_json
 
 Node = Literal['literature', 'data_search', 'ideas', 'refine', 'experiment_plan',
@@ -72,7 +74,7 @@ def project_context(project, query=''):
     return {'name': project['name'], 'status': project.get('status', state.get('status', 'idle')),
             'current_node': state.get('current_node'), 'failed_node': state.get('failed_node'),
             'checkpoint': (state.get('expert_checkpoint') or {}).get('node'),
-            'research_goal': state.get('task_prompt', '')[:6000],
+            'research_goal': state.get('project_goal', '')[:6000],
             'progress': read_json(root / 'workflow-progress.json', {}).get('last_event'),
             'files': files, 'figure_references': references, 'truncated': len(files) >= 400}
 
@@ -92,9 +94,15 @@ TOOLS = [
     {'type': 'function', 'function': {'name': 'revise_artifact',
         'description': '调用对应节点修改已有指定产物，完成后停止；files是允许写入的精确相对路径，不支持目录或通配符。',
         'parameters': RevisionTask.model_json_schema()}},
+    {'type': 'function', 'function': {'name': 'delegate_stage',
+        'description': '用户明确要求单独执行一个阶段时，指定node、role和具体instruction；由主控执行和检查。',
+        'parameters': StageAssignment.model_json_schema()}},
 ]
 
-SYSTEM = '''你是研究项目的消息入口。正常workflow自行按节点推进，你只处理本次用户消息。
+SYSTEM = '''你是研究项目主控的对话入口，与后台主控共享main角色记忆。
+普通对话直接回答；研究执行请求提交后台主控，由主控串行委派角色任务并读取结果。
+角色：idea_generator负责文献、数据、构思、方案；experiment负责实验；paper_writer负责图表与论文。
+单独执行阶段使用delegate_stage；完整研究使用run_workflow，后端交给主控按阶段安排。
 普通问答、进度查询直接回答，不能声称执行了未执行的操作。需要修改时才调用执行工具。
 节点职责：literature文献报告；data_search数据说明；ideas研究想法；refine方案细化；
 experiment_plan实验计划；paper_plan论文提纲；paper_figure生成图片及绘图脚本；
@@ -112,26 +120,56 @@ paper_write正文与图注；paper_compile编译/排版；improvement明确要�
 
 
 def dispatch_message(project, prompt, history=(), model=None):
+    session = RoleSession(Path(project['path']), 'main')
+    try:
+        with session.locked():
+            data = session.load()
+            return _dispatch_message(project, prompt, history, model, session, data)
+    except RuntimeError as exc:
+        if 'Role session is already running: main' not in str(exc):
+            raise
+        context = project_context(project)
+        return {'tool': 'reply', 'reply': '主控正在处理任务。当前阶段：'
+                + str(context.get('current_node') or '主控规划')
+                + '。请等待当前运行结束，或使用停止运行；本次未提交新执行任务。'}
+
+
+def _dispatch_message(project, prompt, history, model, session, data):
     load_env_file(REPO / '.env')
     adapter = ModelClient(model=model or os.environ.get('PAPER_AGENT_MODEL', 'gpt-4o'), timeout=45)
     messages = [{'role': 'system', 'content': SYSTEM},
                 {'role': 'system', 'content': '当前项目：' + json.dumps(project_context(project), ensure_ascii=False)}]
-    for turn in history:
-        messages.extend([{'role': 'user', 'content': str(turn.get('prompt', ''))[:20000]},
-                         {'role': 'assistant', 'content': str(turn.get('reply', ''))[:4000]}])
+    prior = session.recover_messages(data['messages'])
+    if not prior:
+        for turn in history:
+            prior.extend([{'role': 'user', 'content': str(turn.get('prompt', ''))[:20000]},
+                          {'role': 'assistant', 'content': str(turn.get('reply', ''))[:4000]}])
+    prior = session.compact(data, prior, adapter, 120000)
+    messages.extend(prior)
     messages.append({'role': 'user', 'content': prompt})
+
+    def finish(result, reply):
+        # A proposed execution is not a submitted/completed tool call. The queue
+        # owns execution; keep a closed conversational record of the proposal.
+        messages.append({'role': 'assistant', 'content': reply})
+        data['messages'] = [m for m in messages if m['role'] != 'system']
+        data['last_proposal'] = {'decision': result, 'time': now(), 'status': 'proposed'}
+        session.save(data)
+        return result
     for _ in range(4):
         response = adapter.complete(messages, TOOLS)
         if not response.tool_calls:
             if not response.content.strip():
                 raise ValueError('Empty routing response')
-            return {'tool': 'reply', 'reply': response.content[:20000]}
+            return finish({'tool': 'reply', 'reply': response.content[:20000]}, response.content[:20000])
         if any(call.name != 'get_project_context' for call in response.tool_calls):
             if len(response.tool_calls) != 1:
                 raise ValueError('Only one execution request is allowed')
             call = response.tool_calls[0]
             if call.name == 'revise_artifact':
                 arguments = RevisionTask.model_validate(call.arguments).model_dump()
+            elif call.name == 'delegate_stage':
+                arguments = StageAssignment.model_validate(call.arguments).model_dump()
             elif call.name == 'resume_workflow' and not call.arguments:
                 arguments = {}
             elif (call.name == 'run_workflow' and set(call.arguments) == {'instruction'}
@@ -140,7 +178,8 @@ def dispatch_message(project, prompt, history=(), model=None):
                 arguments = call.arguments
             else:
                 raise ValueError('Invalid routing tool or arguments')
-            return {'tool': call.name, 'arguments': arguments}
+            result = {'tool': call.name, 'arguments': arguments}
+            return finish(result, '待后端校验与提交的执行建议（尚未执行）：' + json.dumps(result, ensure_ascii=False))
         messages.append({'role': 'assistant', 'content': response.content or '', 'tool_calls': [
             {'id': c.id, 'type': 'function', 'function': {'name': c.name,
              'arguments': json.dumps(c.arguments)}} for c in response.tool_calls]})

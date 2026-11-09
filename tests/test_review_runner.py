@@ -58,7 +58,12 @@ assert 'Current research evidence' not in prompt
     assert result.report == tmp_path / output
     assert result.report.read_text() == "# Review\nNeeds revisions"
     after = {p for p in tmp_path.rglob('*') if p.is_file()}
-    assert after - before == {result.report}
+    usage_path = tmp_path / '.paper-agent/usage.jsonl'
+    assert after - before == {result.report, usage_path}
+    event = json.loads(usage_path.read_text())
+    assert event['usage']['input_tokens'] == 100
+    assert event['source'] == 'review'
+    assert event['phase'] == kind
     assert not (tmp_path / 'reviews').exists()
 
 

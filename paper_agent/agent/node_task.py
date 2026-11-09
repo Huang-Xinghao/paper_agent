@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .loop import PhaseAgent
+from .role_sessions import RoleSession, revision_role
 from .workflow_cli import _write_json
 
 IGNORED = {'.git', '.recovery', '.paper-agent', '.review-diagnostics', '__pycache__', '.web-run.lock'}
@@ -53,9 +54,24 @@ def clone_file(source, destination):
 
 def run_node_task(project, task, prompt, folder, *, model=None, max_iterations=100,
                   timeout=600, on_event=None):
+    """Keep a role's accepted memory consistent with scoped artifact publication."""
+    from paper_agent.api.dispatch import RevisionTask
+    validated = RevisionTask.model_validate(task)
+    session = RoleSession(Path(project).resolve(), revision_role(Path(project).resolve(), validated.node))
+    with session.locked():
+        return _run_node_task(project, validated.model_dump(), prompt, folder,
+                              model=model, max_iterations=max_iterations,
+                              timeout=timeout, on_event=on_event, role_session=session)
+
+
+def _run_node_task(project, task, prompt, folder, *, model=None, max_iterations=100,
+                   timeout=600, on_event=None, role_session):
     from paper_agent.api.dispatch import RevisionTask
     task = RevisionTask.model_validate(task)
     project, folder = Path(project).resolve(), Path(folder).resolve()
+    from .artifact_versions import ArtifactVersions
+    versions = ArtifactVersions(project)
+    versions.prepare(task.node)
     workspace = folder / 'workspace'
     if workspace.exists():
         raise ValueError('Task workspace already exists')
@@ -65,6 +81,10 @@ def run_node_task(project, task, prompt, folder, *, model=None, max_iterations=1
     before = inventory(project)
     shutil.copytree(project, workspace, symlinks=True, copy_function=clone_file,
                     ignore=shutil.ignore_patterns(*IGNORED))
+    candidate_session = RoleSession(workspace, role_session.role)
+    candidate_session.folder.mkdir(parents=True, exist_ok=True)
+    if role_session.path.exists():
+        shutil.copy2(role_session.path, candidate_session.path)
     progress_path = project / 'workflow-progress.json'
 
     def emit(kind, **details):
@@ -102,6 +122,8 @@ def run_node_task(project, task, prompt, folder, *, model=None, max_iterations=1
             summary = '审阅报告已生成，未自动修改论文。'
         else:
             agent = PhaseAgent(workspace, model=model, max_iterations=max_iterations, timeout=timeout,
+                               assignment_role=role_session.role,
+                               user_question_project=project,
                                on_progress=lambda kind, data: emit(kind, **data))
             phase = 'research_refine' if task.node == 'refine' else task.node
             result = agent.go(instructions, phase=phase, completion_check=lambda: None)
@@ -172,6 +194,14 @@ def run_node_task(project, task, prompt, folder, *, model=None, max_iterations=1
                 shutil.copy2(workspace / name, temporary)
                 temporary.replace(target)
                 applied.append(name)
+            # Rejected candidate work must never enter the project's role memory.
+            if candidate_session.path.exists():
+                candidate_archives = candidate_session.folder / 'archives' / role_session.role
+                if candidate_archives.exists():
+                    shutil.copytree(candidate_archives,
+                                    role_session.folder / 'archives' / role_session.role,
+                                    dirs_exist_ok=True)
+                role_session.save(candidate_session.load())
         except BaseException:
             for name in applied:
                 if (backup / name).exists():
@@ -179,10 +209,12 @@ def run_node_task(project, task, prompt, folder, *, model=None, max_iterations=1
                 else:
                     (project / name).unlink(missing_ok=True)
             raise
+        versions.record(task.node, files=publish)
         emit('assistant_output', content=summary or '指定产物修改完成。')
         emit('node_task_end', files=publish)
         result = SimpleNamespace(status='completed', error=None)
-        # Keep original workflow state/checkpoint untouched; the run owns its result.
+        # The coordinator owns checkpoint routing; this worker records content
+        # versions without changing the workflow cursor.
         shutil.rmtree(workspace)
         return result
     except Exception as exc:

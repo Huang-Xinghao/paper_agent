@@ -1,7 +1,7 @@
 ---
 name: paper-figure
 description: 承接实验计划和论文计划，基于真实电池实验结果生成出版质量、可复现的图表、正式图注和 LaTeX 引用片段。
-allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, search_wiki, read_wiki, search_figure_references, read_battery_resource
+allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, search_wiki, search_figure_references, read_battery_resource
 ---
 
 # 论文图表绘制
