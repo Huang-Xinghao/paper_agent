@@ -7,9 +7,11 @@
 - 新增侧边栏 MCP 管理：远程 Streamable HTTP 连接、无认证/Bearer/API Key、分页发现、兼容性说明、工具选择、阶段绑定及最近调用记录。当前配置在单工作台共享。
 - 官方 SDK 2.3.0 适配现有 ToolSpec，不改 Agent 框架；阶段开始固定目录，后续新阶段读取最新配置。每次外发重新检查权限和工具定义，停用/撤权影响后续调用。
 - 凭据由独立主密钥加密，管理接口不回显；etag 防止旧页面覆盖新配置。默认公网 HTTPS443，DNS 校验后固定 IP 拨号，禁重定向/环境代理；管理员可登记精确端点例外。
-- 外部查询参与既有取证预算，结果记录为 external_candidates，不冒充已核验 Wiki 引文；首版只支持文本/JSON。不开放任意 stdio 启动命令、OAuth、写操作或个人电脑连接器。
+- MCP 由 PhaseAgent 按阶段独立加载，不依赖 Wiki；工具结果直接交给阶段 Agent，不自动入库。首版只支持文本/JSON，不开放任意 stdio 启动命令、OAuth、写操作或个人电脑连接器。
+- 同日修正初版将 MCP 接入 Wiki 取证的耦合：移除共享取证预算与 external_candidates 输出，恢复 Wiki 原有入口；Wiki 依据包交接不再关闭 MCP。外部结果使用通用的 external_tool_data 标记。
 - 增加挂载目录依赖与加密配置安装脚本；本地 Docker 环境把包和密钥放在 E 盘，既有 MinerU/E5 环境继续加载。
 - 验证：Windows 相关后端69项、Linux容器新增MCP17项、桌面/手机浏览器2项通过；TypeScript、改动文件ESLint与Vite构建通过。真实 DeepWiki 目录读取成功，真实 gpt-6.1-sol 通过 PhaseAgent 两轮请求调用一次工具并生成研究便笺；测试使用隔离项目，不代表新实验或论文研究结论已验证。
+- 解耦修复后验证：Windows 相关后端70项、Linux容器MCP18项通过；TypeScript、MCP前端ESLint和Vite构建通过。本地API已重启加载修复。
 - 使用与工程说明分别见 [操作指南](guides/mcp.md)和[技术说明](reference/mcp-management.md)，[开源调研](mcp-research-2026-11-09.md)保留方案依据和后续方向。
 
 ## 2026-11-09 — Wiki 检索与研究依据

@@ -120,21 +120,18 @@ class AgentLoop:
     async def arun(self, prompt: str, *, system_prompt: str, phase: str,
                   completion_check: Callable[[], None] | None = None) -> AgentState:
         if getattr(self, "_mcp_enabled", False):
-            from .wiki_research import has_evidence_handoff
             from paper_agent.mcp import registry as mcp_registry
             from paper_agent.mcp.runtime import tool_specs
-            # 即使复用同一个 Agent 且未重新 configure，交接后也撤下外部工具。
+            # MCP 按阶段加载；Wiki 是否已交接依据包不改变外部工具权限。
             self.tools = tuple(t for t in self.tools if not t.source)
+            if phase not in self._mcp_snapshots:
+                self._mcp_snapshots[phase] = mcp_registry.snapshot(phase)
+            external = tool_specs(phase, self.workspace, snapshot=self._mcp_snapshots[phase])
+            self.tools += external
             self._by_name = {spec.name: spec for spec in self.tools}
-            if not has_evidence_handoff():
-                if phase not in self._mcp_snapshots:
-                    self._mcp_snapshots[phase] = mcp_registry.snapshot(phase)
-                external = tool_specs(phase, self.workspace, snapshot=self._mcp_snapshots[phase])
-                self.tools = tuple(t for t in self.tools if not t.source) + external
-                self._by_name = {spec.name: spec for spec in self.tools}
-                if external:
-                    self._progress("mcp_tools_loaded", phase=phase,
-                                   tools=[spec.source for spec in external])
+            if external:
+                self._progress("mcp_tools_loaded", phase=phase,
+                               tools=[spec.source for spec in external])
         state = AgentState([{"role": "system", "content": system_prompt},
                             {"role": "user", "content": prompt}], phase)
         schemas = [tool_schema(spec) for spec in self.tools]

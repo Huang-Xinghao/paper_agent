@@ -122,7 +122,7 @@ def result_output(result, item, tool):
             "definition_sha256": tool["fingerprint"],
             "retrieved_at": registry.now(),
         },
-        "trust": "external_data_not_verified_paper_evidence",
+        "trust": "external_tool_data",
         "text": [block.text for block in blocks],
         "structured": result.structured_content,
     }

@@ -1,6 +1,7 @@
 """MCP HTTP 协议、权限与管理边界；服务使用官方 SDK，数据全在隔离目录。"""
 
 import asyncio
+from contextlib import nullcontext
 import importlib
 import json
 import socket
@@ -144,7 +145,7 @@ def test_http_sdk_discovery_call_and_result_boundaries(workbench, service, tmp_p
     assert not result.is_error, result.output
     data = json.loads(result.output)
     assert (data["structured"] or json.loads(data["text"][0]))["title"] == "TimesFM"
-    assert data["trust"] == "external_data_not_verified_paper_evidence"
+    assert data["trust"] == "external_tool_data"
     assert data["source"]["definition_sha256"]
     for name, code in [
         ("image_result", "UNSUPPORTED_CONTENT"),
@@ -256,14 +257,23 @@ def test_dns_rebinding_blocked(monkeypatch):
     asyncio.run(check())
 
 
-def test_phase_agent_invokes_http_tool_and_handoff_removes_it(
-    workbench, service, tmp_path
+@pytest.mark.parametrize("has_wiki", [False, True])
+def test_phase_agent_mcp_is_independent_of_wiki_and_evidence_handoff(
+    workbench, service, tmp_path, monkeypatch, has_wiki
 ):
     from paper_agent.agent.loop import PhaseAgent
     from paper_agent.agent.model_client import ModelResponse, ToolCall
-    from paper_agent.agent.wiki_research import evidence_handoff
+    from paper_agent.agent.wiki_research import NAMES, evidence_handoff
 
-    configured(workbench, service)
+    root = tmp_path / "wiki"
+    monkeypatch.setenv("PAPER_AGENT_WIKI_ROOT", str(root))
+    if has_wiki:
+        (root / "papers").mkdir(parents=True)
+        (root / "papers/a.md").write_text(
+            "# Test\n## Method\nTest method.", encoding="utf-8"
+        )
+    item = configured(workbench, service)
+    assert update(workbench, item, phases=["literature"]).status_code == 200
 
     class Model:
         step = 0
@@ -283,31 +293,37 @@ def test_phase_agent_invokes_http_tool_and_handoff_removes_it(
                     )
                 )
             assert any(
-                "external_data_not_verified_paper_evidence" in m.get("content", "")
+                "external_tool_data" in m.get("content", "")
                 for m in messages
                 if m["role"] == "tool"
             )
-            return ModelResponse(
-                content="Candidate found; original evidence still required."
-            )
+            return ModelResponse(content="External query completed.")
 
     agent = PhaseAgent(
         tmp_path, phase="literature", model_client=Model(), max_iterations=2
     )
     with registry.use_run("agent-phase"):
-        result = agent.run(
-            "Find candidate",
-            phase="literature",
-            system_prompt="Read only.",
-            completion_check=lambda: None,
-        )
-    assert service[1]["calls"] == 1 and result.iterations == 2
-    with evidence_handoff():
-        agent.configure(phase="literature")
-        assert all(not t.source for t in agent.tools)
+        for handoff in (False, True):
+            with evidence_handoff() if handoff else nullcontext():
+                agent.model = Model()
+                agent.configure(phase="literature")
+                if handoff:
+                    assert not NAMES.intersection(t.name for t in agent.tools)
+                result = agent.run(
+                    "Run external query",
+                    phase="literature",
+                    system_prompt="Read only.",
+                    completion_check=lambda: None,
+                )
+                assert result.iterations == 2
+                assert any(t.source for t in agent.tools)
+        assert runtime.tool_specs("ideas", tmp_path) == ()
+    assert service[1]["calls"] == 2
+    records = workbench.get(f"/api/mcp/{item['id']}/calls").json()["items"]
+    assert len(records) == 2 and all(r["status"] == "success" for r in records)
 
 
-def test_external_candidates_do_not_become_wiki_evidence(
+def test_wiki_collector_neither_loads_nor_calls_mcp(
     workbench, service, tmp_path, monkeypatch
 ):
     from paper_agent.agent.wiki_research import collect_wiki_evidence
@@ -320,21 +336,26 @@ def test_external_candidates_do_not_become_wiki_evidence(
     )
     monkeypatch.setenv("PAPER_AGENT_WIKI_ROOT", str(root))
     configured(workbench, service)
+    alias = runtime.tool_specs("literature", tmp_path)[0].name
+
+    def unexpected_mcp_load(*args, **kwargs):
+        raise AssertionError("Wiki collector must not load MCP tools")
+
+    monkeypatch.setattr(runtime, "tool_specs", unexpected_mcp_load)
 
     class Model:
         step = 0
 
         def complete(self, messages, tools):
             self.step += 1
+            assert not any(t["function"]["name"].startswith("mcp_") for t in tools)
             if self.step == 1:
-                external = next(
-                    t for t in tools if t["function"]["name"].startswith("mcp_")
-                )
+                # 即使模型伪造外部别名，取证入口也不能执行它。
                 return ModelResponse(
                     tool_calls=(
                         ToolCall(
                             "external",
-                            external["function"]["name"],
+                            alias,
                             {"query": "TimesFM"},
                         ),
                     )
@@ -357,10 +378,11 @@ def test_external_candidates_do_not_become_wiki_evidence(
         packet = collect_wiki_evidence(
             tmp_path / "project", Model(), "TimesFM", stage="literature"
         )
-    assert packet["budget"]["tool_calls"] == 2
-    assert len(packet["external_candidates"]) == 1
-    assert not packet["external_candidates"][0]["verified"]
-    assert not packet["evidence"] and service[1]["calls"] == 1
+    assert packet["budget"]["tool_calls"] == 1
+    assert "external_candidates" not in packet
+    assert not packet["evidence"] and service[1]["calls"] == 0
+    with registry.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM mcp_calls").fetchone()[0] == 0
 
 
 def test_sdk_legacy_initialization_is_compatible(workbench, service, monkeypatch):

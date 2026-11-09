@@ -9,7 +9,7 @@ flowchart TB
     UI[React 管理页 /mcp] --> API[FastAPI /api/mcp]
     API --> REG[registry：配置、加密、etag、阶段快照]
     API --> DISC[runtime.discover：分页发现]
-    PHASE[PhaseAgent / Wiki 取证] --> SNAP[阶段目录快照]
+    PHASE[PhaseAgent] --> SNAP[阶段目录快照]
     REG --> SNAP
     SNAP --> SPEC[外部定义转换为 ToolSpec]
     SPEC --> LLM[模型选择工具并生成参数]
@@ -18,7 +18,7 @@ flowchart TB
     DISC --> NET
     NET --> SDK[官方 Client 与 HTTP Transport]
     SDK --> SERVER[远端 MCP Server]
-    SERVER --> OUT[文本/JSON + 来源与未核验标记]
+    SERVER --> OUT[文本/JSON + 来源与外部数据标记]
     OUT --> PHASE
     AUTH --> AUDIT[调用状态与耗时]
 ```
@@ -30,7 +30,6 @@ flowchart TB
 | `paper_agent/mcp/network.py` | 端点规范化、DNS 检查、IP 固定拨号、禁止重定向与环境代理、响应限额。 |
 | `paper_agent/mcp/runtime.py` | SDK 生命周期、完整分页、ToolSpec 转换、逐次授权及结果转换。 |
 | `paper_agent/agent/loop.py` | 阶段加载工具，模型调用在工作线程执行，工具继续支持异步 handler。 |
-| `paper_agent/agent/wiki_research.py` | 外部查询进入共享取证预算，单独记录候选，不加入已见 Wiki 引文账本。 |
 | `paper_agent/api/worker.py` | 绑定 run ContextVar，使阶段快照和调用预算跟随任务。 |
 
 SDK `Client(mode="auto")` 处理当前协议探测及旧版 initialize/session 兼容；不手写一套 JSON-RPC 初始化。每次发现或工具调用创建独立异步客户端，在同一事件循环内用上下文管理器关闭。首版不做常驻连接池，减少跨线程、跨事件循环和凭据更新带来的失效状态；代价是逐次连接和重新核对目录的开销。
@@ -65,15 +64,15 @@ SDK `Client(mode="auto")` 处理当前协议探测及旧版 initialize/session �
 
 SDK 未提供模型 sampling、文件 roots、用户 elicitation 回调，禁止服务把请求转为新的模型调用或用户输入循环。工具返回的描述、文本和 JSON 都是不可信资料，不能改变平台权限；提示词提醒不能代替宿主隔离。
 
-## 预算与研究证据
+## 调用预算与结果
 
 每个工具适配集合最多尝试 6 次；API 任务还在数据库事务中为 `(run_id,phase)` 原子预留调用记录，防止并发请求同时突破 6 次。预留后记录 running，结束更新具体状态，进程崩溃可能留下 running，可结合任务状态诊断，不自动重放。
 
-受控 Wiki 取证仍最多 3 次模型请求、6 次工具执行和 1 次图扩展；MCP 参与这 6 次，而不是另获 6 次。外部调用写入依据包的 `external_candidates`，不加入 `observed_passages`，不通过 Wiki 引文验证。若候选值得采用，需另行取得原文和位置再核对。取证交接后的撰写关闭外部工具，避免绕出第二条搜索路径。创新性检查等未走该取证入口的阶段使用阶段自身约束与 MCP 调用限额。
+MCP 工具在 PhaseAgent 开始运行时按阶段快照加载，与 Wiki 是否存在及是否交付依据包无关。Wiki 取证入口只加载自己的内置工具，不加载 MCP，也不计入 MCP 预算；MCP 调用不消耗 Wiki 检索预算。两者可以在同一研究阶段服务不同任务，没有强制的先后关系或自动入库链路。
 
-文本和结构化 JSON 返回带连接、服务器、原工具名、定义 SHA256、UTC 取得时间及 `external_data_not_verified_paper_evidence` 标记。纯文本块里包含 JSON 也是合法结果，不强行解析成已验证元数据。多模态或资源内容明确拒绝，不忽略后显示完整成功；远端 isError 会作为工具错误保留。
+文本和结构化 JSON 返回带连接、服务器、原工具名、定义 SHA256、UTC 取得时间及 `trust: external_tool_data` 标记。它表示外部工具数据，不代表内容已被平台验证；研究证据要求属于使用结果的业务流程。纯文本块里包含 JSON 也是合法结果，不强行解析成已验证元数据。多模态或资源内容明确拒绝，不忽略后显示完整成功；远端 isError 会作为工具错误保留。
 
-通用审计表不保存查询正文；原有 Agent 会话、阶段进度或研究依据包仍可能记录参数和正文，因此这不是“所有日志不含研究资料”的保证。
+通用审计表不保存查询正文；原有 Agent 会话或阶段进度仍可能记录参数和正文，因此这不是“所有日志不含研究资料”的保证。
 
 ## 网络与凭据
 
@@ -113,7 +112,7 @@ Linux 权限使用目录 0700、文件 0600；Windows 挂载盘的实际权限�
 
 ## 验证与维护
 
-后端 `tests/test_mcp_management.py` 使用官方 SDK 启动真实本地 Streamable HTTP 服务，验证发现、调用、旧版初始化兼容、参数、结果、阶段交接和权限边界。它是协议/工程测试，不是论文研究质量评测。
+后端 `tests/test_mcp_management.py` 使用官方 SDK 启动真实本地 Streamable HTTP 服务，验证发现、调用、旧版初始化兼容、参数、结果和权限边界。独立性回归覆盖无 Wiki、有 Wiki、Wiki 依据包已交接时的实际 MCP 调用，并验证 Wiki 取证不加载或执行 MCP。它是协议/工程测试，不是论文研究质量评测。
 
 前端 `playwright.mcp.config.ts` 启动独立测试 API 和官方 SDK 服务。测试先核对 `/api/mcp-test` 标记，仅对隔离数据做创建、授权、冲突和密钥检查。可复用本机 Chrome，不下载浏览器；结果写仓库兄弟目录 E 盘。命令示例：
 
@@ -129,3 +128,5 @@ npx playwright test --config playwright.mcp.config.ts
 
 
 2026-11-10 验证记录：Windows 相关后端 69 项，实际 Linux 容器 MCP 17 项，桌面/手机浏览器 2 项通过；TypeScript、改动文件 ESLint 和 Vite 构建通过。真实服务/真实模型结果保留在不提交 Git 的本地验收目录；线上服务未部署本次改动。
+
+同日解耦修复验证：Windows 相关后端 70 项、实际 Linux 容器 MCP 18 项通过，覆盖无 Wiki 及 Wiki 交接后的真实本地 HTTP 工具调用；TypeScript、MCP 前端 ESLint 和 Vite 构建通过。本地 API 重启加载修复，继续使用服务器数据的本地开发快照；此前真实外部服务与真实模型的验收记录保留，不计作本轮重测。
