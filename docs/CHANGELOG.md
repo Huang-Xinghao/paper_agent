@@ -13,6 +13,7 @@
 - 验证：Windows 相关后端69项、Linux容器新增MCP17项、桌面/手机浏览器2项通过；TypeScript、改动文件ESLint与Vite构建通过。真实 DeepWiki 目录读取成功，真实 gpt-6.1-sol 通过 PhaseAgent 两轮请求调用一次工具并生成研究便笺；测试使用隔离项目，不代表新实验或论文研究结论已验证。
 - 解耦修复后验证：Windows 相关后端70项、Linux容器MCP18项通过；TypeScript、MCP前端ESLint和Vite构建通过。本地API已重启加载修复。
 - 使用与工程说明分别见 [操作指南](guides/mcp.md)和[技术说明](reference/mcp-management.md)，[开源调研](mcp-research-2026-11-09.md)保留方案依据和后续方向。
+- 补充[工程讲解与面试场景](explanations/mcp-engineering.md)：从真实代码的管理/调用链讲解工具发现、模型选择、授权、定义更新、故障定位、网络、身份、异步生命周期及评估，区分现有实现与后续方案，并附官方资料和公开题库来源。
 
 ## 2026-11-09 — Wiki 检索与研究依据
 

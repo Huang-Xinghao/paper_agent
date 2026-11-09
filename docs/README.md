@@ -17,6 +17,7 @@
 | 问题 | 阅读入口 |
 | --- | --- |
 | MCP 如何发现、授权、调用并保护凭据 | [MCP 管理技术说明](reference/mcp-management.md) |
+| 从完整调用链学习 MCP 工程取舍和面试场景 | [MCP 工程讲解与面试场景](explanations/mcp-engineering.md) |
 | Skill 如何保存、选择、固定版本并交给 Agent | [Skill 管理技术说明](reference/skill-management.md) |
 | 方案如何统一修订、校验、批准和交付 | [方案审阅技术说明](reference/proposal-review.md) |
 | 论文如何清洗、保留原文位置、整理并核验证据 | [Wiki 预处理与核验](wiki.md#论文预处理与证据核验) |

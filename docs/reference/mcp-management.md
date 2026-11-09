@@ -2,6 +2,8 @@
 
 本模块实现 **MCP Host**：现有 Paper Agent 作为客户端，调用外部 MCP Server。保留原有 `AgentLoop`、`PhaseAgent`、`ToolSpec` 和阶段编排，协议交给官方 Python SDK `mcp==2.3.0`；没有引入另一个 Agent 框架或网关。原有图像 MCP 桥保持独立。
 
+需要按调用过程理解实现、工程取舍及面试场景时，见 [MCP 工程讲解](../explanations/mcp-engineering.md)。
+
 ## 模块与调用链
 
 ```mermaid
