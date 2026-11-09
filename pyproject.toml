@@ -7,7 +7,7 @@ name = "paper-agent-prototype"
 version = "0.1.0"
 description = "A file-backed agent for research paper workflows"
 requires-python = ">=3.11"
-dependencies = ["openai>=1.0", "pypdf>=4", "httpx>=0.27", "Pillow>=10", "black>=24"]
+dependencies = ["openai>=1.0", "pypdf>=4", "httpx>=0.27", "Pillow>=10", "black>=24", "mcp==2.3.0", "httpx2==2.16.0", "httpcore2==2.16.0", "cryptography>=43,<47", "jsonschema>=4.20,<5"]
 
 [project.scripts]
 paper-agent = "paper_agent.agent.loop:main"

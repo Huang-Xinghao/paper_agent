@@ -1,0 +1,2 @@
+# Windows 检出后仍在 Linux 容器中执行，脚本必须保持 LF。
+scripts/setup_mcp.sh text eol=lf

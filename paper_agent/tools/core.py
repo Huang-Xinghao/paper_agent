@@ -26,6 +26,8 @@ class ToolSpec:
     description: str
     handler: Callable[..., Awaitable[ToolResult] | ToolResult]
     read_only: bool = False
+    input_schema: dict[str, Any] | None = None
+    source: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

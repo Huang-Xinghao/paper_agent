@@ -39,8 +39,9 @@ def stop_tree(process):
 
 def execute(run_id):
     from paper_agent import skill_registry
+    from paper_agent.mcp import registry as mcp_registry
 
-    with skill_registry.use_run(run_id):
+    with skill_registry.use_run(run_id), mcp_registry.use_run(run_id):
         _execute(run_id)
 
 

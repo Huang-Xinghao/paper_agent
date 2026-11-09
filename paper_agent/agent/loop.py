@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
@@ -32,6 +33,9 @@ class ArtifactValidationError(ValueError, RuntimeError):
 
 def tool_schema(spec: ToolSpec) -> dict[str, Any]:
     """Build an OpenAI function schema from a tool handler signature."""
+    if spec.input_schema is not None:
+        return {"type": "function", "function": {"name": spec.name,
+                "description": spec.description, "parameters": spec.input_schema}}
     properties: dict[str, Any] = {}
     required: list[str] = []
     signature = inspect.signature(spec.handler)
@@ -115,6 +119,22 @@ class AgentLoop:
 
     async def arun(self, prompt: str, *, system_prompt: str, phase: str,
                   completion_check: Callable[[], None] | None = None) -> AgentState:
+        if getattr(self, "_mcp_enabled", False):
+            from .wiki_research import has_evidence_handoff
+            from paper_agent.mcp import registry as mcp_registry
+            from paper_agent.mcp.runtime import tool_specs
+            # 即使复用同一个 Agent 且未重新 configure，交接后也撤下外部工具。
+            self.tools = tuple(t for t in self.tools if not t.source)
+            self._by_name = {spec.name: spec for spec in self.tools}
+            if not has_evidence_handoff():
+                if phase not in self._mcp_snapshots:
+                    self._mcp_snapshots[phase] = mcp_registry.snapshot(phase)
+                external = tool_specs(phase, self.workspace, snapshot=self._mcp_snapshots[phase])
+                self.tools = tuple(t for t in self.tools if not t.source) + external
+                self._by_name = {spec.name: spec for spec in self.tools}
+                if external:
+                    self._progress("mcp_tools_loaded", phase=phase,
+                                   tools=[spec.source for spec in external])
         state = AgentState([{"role": "system", "content": system_prompt},
                             {"role": "user", "content": prompt}], phase)
         schemas = [tool_schema(spec) for spec in self.tools]
@@ -133,7 +153,8 @@ class AgentLoop:
             )
             heartbeat.start()
             try:
-                response = self.model.complete(state.messages,
+                # MCP 的收包、超时不能被同步模型 HTTP 请求阻塞；每轮仍只发一次模型请求。
+                response = await asyncio.to_thread(self.model.complete, state.messages,
                                                schemas if iteration <= self.max_iterations else [])
             except Exception as exc:
                 self._write_phase_checkpoint(phase, iteration, "model_error", error=str(exc))
@@ -292,6 +313,8 @@ class PhaseAgent(AgentLoop):
         self._tool_phases: dict[str, tuple[str, ...]] = {}
         self._skills: list[str] = []
         self._phase_snapshots = {}
+        self._mcp_snapshots = {}
+        self._mcp_enabled = True
         self._skill_snapshot = None
         self.configure()
 

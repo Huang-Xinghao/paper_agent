@@ -25,6 +25,7 @@ from . import auth
 from .library import router as library_router
 from .idea_canvas import router as idea_canvas_router
 from .skills import router as skills_router
+from .mcp import router as mcp_router
 from paper_agent import skill_registry
 from .intent import route_message
 from .dispatch import RevisionTask, dispatch_message
@@ -175,6 +176,8 @@ async def lifespan(_):
         raise RuntimeError("Public access requires PAPER_AGENT_PASSWORD_HASH")
     initialize()
     skill_registry.initialize()
+    from paper_agent.mcp import registry as mcp_registry
+    mcp_registry.initialize()
     auth.initialize()
     for root in allowed_roots():
         if root.is_dir():
@@ -209,6 +212,7 @@ app.include_router(auth.router)
 app.include_router(library_router)
 app.include_router(idea_canvas_router)
 app.include_router(skills_router)
+app.include_router(mcp_router)
 
 
 @app.middleware("http")
