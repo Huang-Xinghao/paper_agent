@@ -41,11 +41,11 @@ def resolve_data_read(workspace, knowledge_roots, value):
     candidate = candidate.resolve()
     if candidate.is_relative_to(Path(workspace).resolve()):
         return candidate
-    # Figure retrieval returns absolute paths in the shared, read-only library.
-    # Resolve both sides so symlinks cannot grant access outside that library.
-    from .wiki import resolve_wiki_root
+    # Shared figures and original papers are readable from independent projects.
+    # Resolve both sides so symlinks cannot grant access outside those libraries.
+    from .wiki import resolve_wiki_root, resolve_raw_paper_root
     figure_root = (resolve_wiki_root() / 'figures').resolve()
-    if candidate.is_relative_to(figure_root):
+    if candidate.is_relative_to(figure_root) or candidate.is_relative_to(resolve_raw_paper_root()):
         return candidate
     for source in registered_data_sources(knowledge_roots):
         if candidate.is_relative_to(Path(source['path'])):

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import ToolContext, ToolResult, tool
+from .wiki import resolve_raw_paper_root
 
 
 def _json(value: Any) -> str:
@@ -22,20 +23,29 @@ def _json(value: Any) -> str:
 
 
 def _words(text: str) -> set[str]:
-    return {word.lower() for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", text)}
+    return {word.lower() for word in re.findall(r"[A-Za-z0-9]{3,}", text)}
+
+
+def _pdf_cache_target(name: str) -> Path:
+    root = resolve_raw_paper_root()
+    target = (root / name).resolve()
+    if target.parent != root or target.suffix != '.pdf':
+        raise ValueError('PDF cache target must be a PDF directly inside the shared library')
+    return target
 
 
 @tool(read_only=True)
 def discover_local_papers(ctx: ToolContext, query: str = "", library_path: str | None = None,
                           max_papers: int = 20) -> ToolResult:
-    """Find local PDF papers in papers/, literature/, or a configured workspace path.
+    """Find PDFs in the shared research-wiki/raw-paper/ library.
 
-    Returns paths and lightweight filename relevance scores. Use read_local_paper for content.
+    An optional library_path also searches a permitted read-only directory.
+    Returns readable paths and filename relevance scores. Use read_local_paper for content.
     """
     roots: list[Path] = []
     if library_path:
-        roots.append(ctx.resolve(library_path))
-    roots.extend(ctx.resolve(name) for name in ("papers", "literature"))
+        roots.append(ctx.resolve_read(library_path))
+    roots.append(resolve_raw_paper_root())
     seen: set[Path] = set()
     candidates: list[dict[str, Any]] = []
     query_words = _words(query)
@@ -43,27 +53,32 @@ def discover_local_papers(ctx: ToolContext, query: str = "", library_path: str |
         if not root.is_dir():
             continue
         for path in root.rglob("*.pdf"):
-            path = path.resolve()
+            try:
+                path = ctx.resolve_read(path)
+            except ValueError:
+                continue
+            if not path.is_file():
+                continue
             if path in seen:
                 continue
             seen.add(path)
             name_words = _words(path.stem)
             score = len(query_words & name_words)
-            candidates.append({"path": str(path.relative_to(ctx.workspace.resolve())),
+            candidates.append({"path": ctx.display_path(path),
                                "filename": path.name, "filename_score": score})
     candidates.sort(key=lambda item: (-item["filename_score"], item["filename"].lower()))
     limit = max(1, min(max_papers, 100))
     payload = {"query": query, "roots_checked": [str(root) for root in roots],
                "found": len(candidates), "papers": candidates[:limit]}
     if not candidates:
-        payload["warning"] = ("No PDFs found in papers/, literature/, or the configured library path.")
+        payload["warning"] = "No PDFs found in the shared raw-paper library or the configured library path."
     return ToolResult(_json(payload), metadata={"count": len(candidates)})
 
 
 @tool(read_only=True)
 def read_local_paper(ctx: ToolContext, path: str, max_pages: int = 3) -> ToolResult:
     """Extract the first pages of a local PDF for title, abstract, and introduction screening."""
-    target = ctx.resolve(path)
+    target = ctx.resolve_read(path)
     if not target.is_file() or target.suffix.lower() != ".pdf":
         return ToolResult(f"PDF not found: {path}", True, {"error_code": "PDF_NOT_FOUND"})
     try:
@@ -86,7 +101,7 @@ def read_local_paper(ctx: ToolContext, path: str, max_pages: int = 3) -> ToolRes
 def read_paper_pages(ctx: ToolContext, path: str, start_page: int = 1,
                      page_count: int = 5) -> ToolResult:
     """Read numbered PDF pages, allowing a paper to be reviewed beyond its abstract."""
-    target = ctx.resolve(path)
+    target = ctx.resolve_read(path)
     if not target.is_file() or target.suffix.lower() != ".pdf":
         return ToolResult(f"PDF not found: {path}", True, {"error_code": "PDF_NOT_FOUND"})
     if start_page < 1 or page_count < 1:
@@ -191,7 +206,7 @@ def search_papers(ctx: ToolContext, query: str, source: str = "openalex",
 
 @tool()
 def download_openalex_paper(ctx: ToolContext, paper: dict) -> ToolResult:
-    """Download an OpenAlex paper's available PDF to papers/openalex/.
+    """Download an OpenAlex PDF to the shared research-wiki/raw-paper/ library.
 
     Pass a search_papers record, or title and DOI. Missing PDF links are resolved
     via OpenAlex DOI lookup. Try alternative PDF locations; report unavailable
@@ -214,8 +229,8 @@ def download_openalex_paper(ctx: ToolContext, paper: dict) -> ToolResult:
     identity = doi.casefold() or str(paper.get("openalex_id") or "") or (
         str(paper.get("title") or "") + "|" + urls[0])
     key = hashlib.sha256(identity.encode()).hexdigest()[:24]
-    relative = f"papers/openalex/{key}.pdf"
-    target = ctx.resolve(relative, write=True)
+    target = _pdf_cache_target(f"openalex-{key}.pdf")
+    relative = ctx.display_path(target)
     if target.is_file():
         with target.open("rb") as stream:
             if stream.read(5) == b"%PDF-":
@@ -255,7 +270,7 @@ def download_openalex_paper(ctx: ToolContext, paper: dict) -> ToolResult:
 
 @tool()
 def download_arxiv_paper(ctx: ToolContext, url: str) -> ToolResult:
-    """Download and cache an arXiv PDF inside the project workspace."""
+    """Download and cache an arXiv PDF in the shared research-wiki/raw-paper/ library."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"arxiv.org", "export.arxiv.org"}:
         return ToolResult("Not an arXiv paper URL", True)
@@ -263,8 +278,8 @@ def download_arxiv_paper(ctx: ToolContext, url: str) -> ToolResult:
     if not match:
         return ToolResult("Invalid arXiv paper identifier", True)
     paper_id = match.group(1)
-    relative = f"papers/arxiv/{paper_id.replace('/', '_')}.pdf"
-    target = ctx.resolve(relative, write=True)
+    target = _pdf_cache_target(f"arxiv-{paper_id.replace('/', '_')}.pdf")
+    relative = ctx.display_path(target)
     temporary = None
     try:
         if target.is_file():

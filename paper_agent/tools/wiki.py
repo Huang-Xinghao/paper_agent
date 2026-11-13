@@ -31,6 +31,11 @@ def resolve_wiki_root() -> Path:
             Path(__file__).resolve().parents[2] / "research-wiki")
 
 
+def resolve_raw_paper_root() -> Path:
+    """The shared PDF library follows the configured Wiki location."""
+    return (resolve_wiki_root() / "raw-paper").resolve()
+
+
 def _wiki_root() -> Path:
     root = resolve_wiki_root()
     if not root.is_dir():

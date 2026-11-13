@@ -24,6 +24,7 @@
 - 外部评审诊断统一放在 `.paper-agent/reviews/<类型>/<报告名>/<调用编号>/`，不混入论文产物。
 - 会话、工具调用、用量和产物版本记录放在 `.paper-agent/`。实验进程日志及执行回执保留在专用 `experiment-runs/`，科学产物放在 `results/`；工作流与队列状态由运行器维护。
 - 超参数寻优只从 `refine-logs/EXPERIMENT_PLAN.md` 读取执行策略，不回退到研究方案中的旧策略。
+- 论文原始 PDF 统一保存在 `research-wiki/raw-paper/`（随 `PAPER_AGENT_WIKI_ROOT` 配置），文献发现与 OpenAlex/arXiv 下载共用此目录。独立研究项目可读取共享 PDF，普通文件写入工具仍限于项目内。删除根目录旧 Zotero 缓存与依赖失效同步清单的 `backfill_wiki_assets.py`；合并记录保存在本地 `.paper-agent/library-consolidation/`。
 
 ## 放宽的验收
 
