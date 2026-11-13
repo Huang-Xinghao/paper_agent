@@ -2,9 +2,8 @@
 
 import hashlib
 import json
-import os
-import tempfile
 from pathlib import Path
+from paper_agent.storage import atomic_bytes
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -103,13 +102,7 @@ def save_canvas(project_id: str, body: CanvasSave):
                 raise HTTPException(
                     409, "画布已被其他人修改，请先下载当前草稿再重新加载"
                 )
-            fd, temporary = tempfile.mkstemp(prefix=".canvas-", dir=target.parent)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                    stream.write(serialized)
-                os.replace(temporary, target)
-            finally:
-                Path(temporary).unlink(missing_ok=True)
+            atomic_bytes(target, serialized.encode('utf-8'))
             saved_hash = digest(target)
     event(
         project_id,

@@ -90,7 +90,6 @@ def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
                  stop_after: str | None = None,
                  mode: str | None = None, continue_run: bool = False,
                  revise: str | None = None,
-                 advance_after_revision: bool = False,
                  proposal_review_sha: str | None = None,
                  model: str | None = None,
                  role: str | None = None,
@@ -99,7 +98,6 @@ def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
                  finalize_stage: str | None = None,
                  workflow_stop_after: str | None = None,
                  approve_revision: bool = False,
-                 review_by_main: bool = False,
                  paper_review_timeout: float | None = None,
                  paper_review_round2_timeout: float | None = None,
                  on_event: Callable[[dict[str, Any]], None] | None = None) -> WorkflowState:
@@ -209,8 +207,6 @@ def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
     runner_options = {"config": config} if config is not None else {}
     if idea_config is not None:
         runner_options["idea_config"] = idea_config
-    if review_by_main:
-        runner_options['review_by_main'] = True
     runner = WorkflowRunner(agent, on_node_start=on_node_start, on_node_end=on_node_end,
                             on_node_progress=on_node_progress,
                             **runner_options)
@@ -221,7 +217,6 @@ def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
             if stop_after is not None:
                 saved.expert_checkpoint["stop_after"] = stop_after
             state = runner.resume_checkpoint(saved, revise=revise is not None,
-                                             advance_after_revision=advance_after_revision,
                                              **({"proposal_review_sha": proposal_review_sha} if proposal_review_sha else {}))
             # 先持久化批准与冻结版本，再调用下游；下游失败也不丢失批准记录。
             _write_json(project / "workflow-state.json", state.to_dict())
@@ -296,7 +291,6 @@ def refresh_revision_checkpoint(project, node, project_goal=None):
         'stop_after': checkpoint.get('stop_after', saved.get('workflow_stop_after')),
         'summary': '已按修改意见更新产物。请审阅新版后明确批准。',
         'questions': [], 'revision_id': uuid4().hex,
-        **({'hpo_policy': True} if node == 'refine' and saved['mode'] == 'auto' else {}),
     }
     _write_json(project / 'workflow-state.json', saved)
     return True
@@ -311,8 +305,6 @@ def run_coordinated_workflow(project: Path, prompt: str = "", *, start_node=None
     from types import SimpleNamespace
     from .coordinator import CoordinatorAgent
 
-    if "advance_after_revision" in workflow_options:
-        raise TypeError("advance_after_revision is not supported here; revised artifacts require approval")
     project = project.resolve()
     if stop_after is not None and stop_after not in WORKFLOW_NODE_NAMES:
         raise ValueError("unknown workflow node")
@@ -453,8 +445,6 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
     while state.status == "awaiting_user":
         checkpoint = state.expert_checkpoint
         print(f"\n{checkpoint['node']} 结果摘要：{checkpoint['summary']}")
-        for label, quote in (checkpoint.get("brief") or {}).items():
-            print(f"{label}：{quote}")
         for number, question in enumerate(checkpoint["questions"], 1):
             print(f"{number}. {question}")
             if checkpoint.get("decision_options"):

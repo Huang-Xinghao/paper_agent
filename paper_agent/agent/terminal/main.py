@@ -12,7 +12,7 @@ import sys
 import threading
 from uuid import uuid4
 
-from paper_agent.agent.runtime.herdr import Client, HerdrError, _read, connect, directory, load_config, require_managed_pane
+from paper_agent.agent.runtime.herdr import Client, HerdrError, _read, connect, load_config, require_managed_pane
 from paper_agent.agent.terminal.role import HELP, TITLES, RoleTerminal, follow_process
 from paper_agent.agent.runtime.sessions import PHASE_ROLES
 from paper_agent.agent.workflow_cli import is_approval, checkpoint_snapshot, approve_checkpoint

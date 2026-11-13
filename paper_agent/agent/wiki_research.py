@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from paper_agent.tools.wiki_research_prompts import RESEARCH_PROMPT as SYSTEM, research_budget_prompt
 from paper_agent.agent.loop import tool_schema
-from paper_agent.agent.model_client import limited_model_requests
+from paper_agent.integrations.model import limited_model_requests
 from paper_agent.tools import ToolContext, ToolResult, builtin_tools
 from paper_agent.tools.wiki import resolve_wiki_root
 from paper_agent.tools.wiki_retrieval import load_page
@@ -117,18 +117,7 @@ def validate_packet(answer, passages, wiki):
                 or not item["claim"].strip()
             ):
                 raise ValueError("Evidence must be an object with an explicit claim")
-            # 旧提示未完整列出英文枚举；只兼容真实响应中三个明确同义值，
-            # 保留原值用于审计，其他未知角色仍拒绝。
             item = dict(item)
-            aliases = {
-                "boundary": "constraint",
-                "condition": "constraint",
-                "counterexample": "counterevidence",
-            }
-            if item.get("role") in aliases:
-                item.update(
-                    role=aliases[item["role"]], role_normalized_from=item["role"]
-                )
             path = (wiki / item["wiki_path"]).resolve()
             if path.parent != (wiki / "papers").resolve() or not path.is_file():
                 raise ValueError("Not a readable paper source")
@@ -248,7 +237,6 @@ def latest_evidence(workspace):
         ]
         valid, errors = validate_packet(packet, passages, resolve_wiki_root())
         packet["evidence"] = valid
-        packet.pop("pages", None)  # 旧版重复摘录不能绕过本次版本检查。
         if errors:
             packet.update(
                 status="stale",

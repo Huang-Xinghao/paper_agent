@@ -9,7 +9,7 @@ import re
 import shutil
 from pathlib import Path
 
-from paper_agent.agent.model_client import load_env_file
+from paper_agent.integrations.model import load_env_file
 from paper_agent.tools.figure_grouping import ANCHOR, LABEL, group_page, union, gap
 from paper_agent.tools.paper_figures import read_mineru_paper, save_architecture_figures
 from pypdf import PdfReader

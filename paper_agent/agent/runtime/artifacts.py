@@ -1,4 +1,4 @@
-"""Conservative workflow dependencies and content versions, independent of UI state."""
+"""Artifact hashes and advisory change tracking, independent of UI state."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -17,7 +17,7 @@ def node_files(project, node):
     patterns = {'experiment_plan': ('experiments/hpo_spec.json',),
                 'experiment_bridge': ('results/hpo/best_config.json',),
                 'paper_figure': ('figures/*.pdf', 'figures/*.png', 'figures/*.svg', 'figures/*.jpg', 'figures/*.jpeg'),
-                'paper_write': ('paper/sections/*.tex',)}.get(node, ())
+                'paper_write': ('paper/**/*.tex', 'paper/**/*.bib')}.get(node, ())
     for pattern in patterns:
         paths.update(p.relative_to(project).as_posix() for p in project.glob(pattern) if p.is_file())
     return paths
@@ -56,76 +56,37 @@ class ArtifactVersions:
 
     def _read(self):
         if self.path.exists():
-            return json.loads(self.path.read_text())
-        # Adopt legacy outputs once, without asserting any new scientific approval.
-        nodes = {}
-        state_path = self.project / 'workflow-state.json'
-        state = json.loads(state_path.read_text()) if state_path.exists() else {}
-        for node in ORDER:
-            files = hashes(self.project, node_files(self.project, node))
-            if files:
-                recorded = {r['path']: r['sha256'] for r in state.get('artifacts', {}).get(node, [])
-                            if 'path' in r and 'sha256' in r}
-                nodes[node] = {'version': 1, 'files': {**files, **recorded}, 'adopted': True}
-        return {'nodes': nodes, 'stale_nodes': {}}
+            return {'nodes': json.loads(self.path.read_text())['nodes']}
+        return {'nodes': {}}
 
-    def _invalidate(self, data, node, reason, *, include_self=False, changed_files=()):
-        start = ORDER.index(node) + (0 if include_self else 1)
-        for dependent in ORDER[start:]:
-            if dependent in data['nodes']:
-                data['stale_nodes'][dependent] = {'caused_by': node, 'reason': reason, 'at': now(),
-                                                  'kind': 'external' if include_self else 'revision',
-                                                  'changed_files': sorted(changed_files)}
-
-    def _detect_changes(self, data, *, accepted_files=()):
-        accepted_files = set(accepted_files)
+    def _detect_changes(self, data):
+        changes = {}
         for node, record in data['nodes'].items():
             current = hashes(self.project, set(record['files']) | node_files(self.project, node))
-            differences = {p for p in current.keys() | record['files'].keys()
-                           if current.get(p) != record['files'].get(p)}
-            if differences and not differences <= accepted_files:
-                self._invalidate(data, node, '产物内容与记录版本不一致，需要重新核查或生成',
-                                 include_self=True, changed_files=differences)
-        return data
+            differences = sorted(p for p in current.keys() | record['files'].keys()
+                                 if current.get(p) != record['files'].get(p))
+            if differences:
+                changes[node] = differences
+        return {**data, 'changed_files': changes}
 
     def _save(self, data):
         _write_json(self.path, data)
 
     def context(self):
-        # Status queries derive invalidation without modifying project state.
+        # Status queries report changes without modifying project state.
         return self._detect_changes(self._read())
 
-    def prepare(self, node, *, approval=False, accepted_files=()):
-        with self.locked():
-            data = self._detect_changes(self._read(), accepted_files=accepted_files if approval else ())
-            if approval:
-                for reviewed in ORDER[:ORDER.index(node) + 1]:
-                    stale = data['stale_nodes'].get(reviewed, {})
-                    if (stale.get('kind') == 'external' and stale.get('changed_files')
-                            and set(stale['changed_files']) <= set(accepted_files)):
-                        data['stale_nodes'].pop(reviewed, None)
-            self._save(data)
-            preceding = ORDER[:ORDER.index(node) + (1 if approval else 0)]
-            blocked = [n for n in preceding if n in data['stale_nodes']]
-            if blocked:
-                raise ValueError('上游产物已变更，请先重新核查或生成：' + ', '.join(blocked))
-            return data
-
-    def record(self, node, *, regenerated=False, files=()):
+    def record(self, node, *, files=()):
         """Called only after validated publication; no-op revisions change no versions."""
         with self.locked():
             data = self._read()
             old = data['nodes'].get(node, {})
             current = hashes(self.project, node_files(self.project, node) | set(files) | set(old.get('files', {})))
             changed = current != old.get('files', {})
-            if changed:
-                self._invalidate(data, node, '上游产物已修订，下游需要重新核查或生成')
             data['nodes'][node] = {'version': old.get('version', 0) + int(changed),
                                   'files': current, 'updated_at': now(),
                                   'inputs': {n: r['version'] for n, r in data['nodes'].items()
                                              if ORDER.index(n) < ORDER.index(node)}}
-            if regenerated:
-                data['stale_nodes'].pop(node, None)
             # Later phases can legitimately update shared sources (e.g. improvement
             # edits main.tex and recompiles). Keep their previous owners in sync.
             for other, record in data['nodes'].items():

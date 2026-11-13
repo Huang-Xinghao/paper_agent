@@ -14,8 +14,8 @@ from uuid import uuid4
 from paper_agent.tools import BUILTIN_TOOLS, ToolContext, ToolResult, ToolSpec
 from paper_agent.project_config import compute_context, load_compute_config, load_execution_config
 from paper_agent.agent.runtime.questions import AUTO_QUESTION_REQUIREMENT, interaction_instructions
-from .loop import AgentLoop, ArtifactValidationError
-from .model_client import ModelClient, load_env_file
+from .loop import AgentLoop
+from paper_agent.integrations.model import ModelClient, load_env_file
 from paper_agent.agent.runtime.sessions import RoleSession, now, revision_role
 from .stages import BY_NODE, WORKFLOW_NODE_NAMES
 from paper_agent.agent.runtime.execution import dispatch_stage as execute_stage, dispatch_revision
@@ -89,9 +89,9 @@ experiment负责实验计划、实现与运行；paper_writer负责论文规划�
 history读取保存的执行或讨论记录（含工具记录），按next_offset/next_char_offset续读；status列出摘要前的archive文件。
 用户提到与角色的讨论时，先读相应discussion记录，核对当前用户意图，再把有关结论写进正式派单；讨论和旧记录本身不授予执行权限。
 CLI派单和修订沿用原工具的审批、范围及次数预算。一次响应最多一个执行命令，状态和记录查询不受此限制。
-get_project_context中的artifact_versions.stale_nodes表示旧下游产物已失效，需按阶段顺序重新核查生成，不能拿旧结果验收。
+get_project_context中的artifact_versions.changed_files提供改动提示；结合实际依赖判断需要更新的产物，不必重跑无关阶段。
 专家模式的所有用户审批统一由主控接收，沿用既有工作流校验；refine完成交给用户批准。自动模式自行核对方案并推进。
-角色交付后先读真实产物，理解结果、证据和取舍；专家模式遇到待审检查点时，用review_checkpoint写入面向用户的摘要和问题。自动模式验收后继续派单；角色附带的问题只是参考。
+角色交付后先读真实产物，理解结果、证据和取舍；专家模式遇到待审检查点时，向用户解释关键产物；可用review_checkpoint更新摘要和必要的问题，不要求固定问题数量。自动模式验收后继续派单；角色附带的问题只是参考。
 用户已明确批准当前版本时直接落实批准，不重复提问或重写审阅摘要。若有画布草稿，修改FINAL_PROPOSAL前先读IDEA_CANVAS.json及IDEA_REVIEW.json（存在时），核对尚未写入正文的意见；旧投影将归档，当前MD作为新版依据。
 你可直接使用search_battery_resources、read_battery_resource查询电池资源库，使用list_battery_data_sources、find、inspect_battery_data核对登记路径中的真实数据，使用inspect_compute核对本机算力。
 用户提到的数据集先在资源库查证，不能仅因用户没提供链接就判定缺失。资源库的说明与真实文件分别核对；研究目标确定后可派给idea_generator完成数据检查。
@@ -151,7 +151,6 @@ class CoordinatorAgent(AgentLoop):
         if stage_task and revision_task:
             raise ValueError("Only one explicit assignment is allowed")
         self._active = None
-        self._review_due = False
         # Per invocation read ledger. The main agent must be able to verify
         # artifacts, but rereading an unchanged range only inflates context.
         self._read_ledger: dict[str, dict] = {}
@@ -234,9 +233,6 @@ class CoordinatorAgent(AgentLoop):
         session.save(data)
         return ToolResult(json.dumps({'project_goal': goal}, ensure_ascii=False))
 
-    def _complete_research(self):
-        if self._review_due:
-            raise ArtifactValidationError('先读取本次交付或修订的产物，用review_checkpoint写入主控理解后的摘要和问题，再交还用户；不要再次派单。')
 
     def _role_cli(self, ctx, command: str) -> ToolResult:
         from .role_cli import run
@@ -352,17 +348,15 @@ class CoordinatorAgent(AgentLoop):
                         self._require_current_read(name)
                         changes[f'refine-logs/review-history/main-{uuid4().hex}-{draft.name}'] = draft.read_bytes()
             versions = ArtifactVersions(self.project)
-            versions.prepare(node)
             write_group(self.project, changes)
             if path == PROPOSAL:
                 for name in (CANVAS, RECORD):
                     (self.project / name).unlink(missing_ok=True)
-            versions.record(node, regenerated=True, files=[path])
+            versions.record(node, files=[path])
             self._edited_paths.add(path)
             pending = refresh_revision_checkpoint(self.project, node, self.project_goal)
             self._approval_snapshot = None  # An answer approving the old text never approves this edit.
             if pending:
-                self._review_due = True
                 self.worker_status = 'awaiting_user'
                 self.halted = 'Markdown已修订，等待用户审阅当前版本。'
             result = {'path': path, 'node': node, 'changed': True, 'status': self.worker_status,
@@ -371,12 +365,12 @@ class CoordinatorAgent(AgentLoop):
             self._progress('artifact_edited', **result)
             return ToolResult(json.dumps(result, ensure_ascii=False))
 
-    def _review_checkpoint(self, ctx, summary: str, questions: list[str],
+    def _review_checkpoint(self, ctx, summary: str, questions: list[str] | None = None,
                            decision_options: list[list[str]] | None = None) -> ToolResult:
         from paper_agent.agent.runtime.execution import project_write_lock
         from paper_agent.agent.runtime.herdr import ensure_no_pending
-        if (not summary.strip() or len(summary) > 4000 or len(questions) > 8
-                or any(not q.strip() or len(q) > 4000 for q in questions)
+        questions = questions or []
+        if (not summary.strip() or any(not q.strip() for q in questions)
                 or decision_options is not None and len(decision_options) != len(questions)):
             raise ValueError('请提供简短摘要及与实际取舍相关的问题，选项应逐题对应')
         with project_write_lock(self.project):
@@ -385,13 +379,11 @@ class CoordinatorAgent(AgentLoop):
             checkpoint = state.get('expert_checkpoint') or {}
             if state.get('status') != 'awaiting_user' or checkpoint.get('status') != 'pending':
                 raise ValueError('没有待审检查点')
-            self._require_current_read(checkpoint['report'])
-            checkpoint.update(summary=summary, questions=questions, reviewed_by='main')
+            checkpoint.update(summary=summary, questions=questions)
             checkpoint.pop('decision_options', None)
             if decision_options is not None:
                 checkpoint['decision_options'] = decision_options
             _write_json(self.project / 'workflow-state.json', state)
-            self._review_due = False
             self.worker_status = 'awaiting_user'
             self._progress('coordinator_decision', checkpoint=checkpoint)
             return ToolResult(json.dumps(checkpoint, ensure_ascii=False))
@@ -460,7 +452,7 @@ class CoordinatorAgent(AgentLoop):
                              timeout=self.timeout, max_iterations=self.worker_max_iterations,
                              on_event=self._worker_event, workflow_stop_after=self.stop_after,
                              approve_revision=self.approve_revision,
-                             **{**self.workflow_options, 'review_by_main': True})
+                             **self.workflow_options)
         self.checkpoint_revision = None
         artifacts = WorkflowRunner._review_files(task.node)
         result = {"status": state.status, "error": state.error, "node": task.node,
@@ -469,8 +461,6 @@ class CoordinatorAgent(AgentLoop):
                   "artifacts": artifacts,
                   "artifact_handoff": self._artifact_handoff(artifacts)}
         self._accept_result(state.status, state.error)
-        if (state.expert_checkpoint or {}).get('review_owner') == 'main' and state.status == 'awaiting_user':
-            self._review_due = True
         if self.stage_task or self.stop_after == task.node:
             self.halted = "The explicitly assigned stage has ended; summarize and stop."
         self._progress("assignment_end", **result)
@@ -483,7 +473,7 @@ class CoordinatorAgent(AgentLoop):
             return None
         allowed = {"phase", "role", "session_id", "task_id", "iterations", "canonical_path",
                    "status", "node", "summary", "questions", "checkpoint_path", "execution",
-                   "brief", "decision_options", "hpo_policy", "reviewed_by", "review_owner"}
+                   "decision_options"}
         result = {key: item for key, item in value.items() if key in allowed}
         # Even checkpoint summaries can contain user-authored long text.
         return {key: item[:2000] if isinstance(item, str) else item[:3]
@@ -522,11 +512,8 @@ class CoordinatorAgent(AgentLoop):
         self._accept_result(state.status, state.error)
         if self.revision_task:
             self.halted = "The explicitly assigned revision has ended; summarize and stop."
-        checkpoint = getattr(state, 'expert_checkpoint', None)
-        if state.status == 'awaiting_user' and checkpoint and checkpoint.get('status') == 'pending':
-            self._review_due = True
         result = {"status": state.status, "error": state.error, "files": validated.files,
-                  "checkpoint": self._node_receipt(checkpoint),
+                  "checkpoint": self._node_receipt(getattr(state, 'expert_checkpoint', None)),
                   "artifact_handoff": self._artifact_handoff(validated.files)}
         self._progress("assignment_end", **result)
         return ToolResult(json.dumps(result, ensure_ascii=False), state.status in {'failed', 'interrupted'})
@@ -665,7 +652,6 @@ class CoordinatorAgent(AgentLoop):
                 prompt = f"用户已正式回答问题 [{answered['id']}]：{answered['answer']}"
             history = session.recover_messages(data["messages"])
             self.halted, self.assignments = None, 0
-            self._review_due = False
             self._edited_paths = set()
             self._invalid_batch = False
             self.worker_status = "awaiting_user" if saved.get("status") == "awaiting_user" else "completed"
@@ -709,7 +695,7 @@ class CoordinatorAgent(AgentLoop):
                     request = "执行本次唯一授权的阶段任务，验收并总结后停止。"
                 result = self.run(request, system_prompt=SYSTEM + "\n当前项目：\n" + context
                                   + '\n' + compute_context(self.project) + interaction_instructions(self.mode),
-                                  phase="coordinator", history=history, completion_check=self._complete_research)
+                                  phase="coordinator", history=history)
                 if (self.stage_task or self.revision_task and not self._edited_paths) and self.assignments == 0:
                     raise RuntimeError("Main agent did not execute the explicit assignment")
                 if not result.final.strip():

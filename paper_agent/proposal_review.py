@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import re
-import tempfile
 from pathlib import Path
+from paper_agent.storage import atomic_bytes
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PROPOSAL = "refine-logs/FINAL_PROPOSAL.md"
@@ -104,7 +102,6 @@ class CanvasDraft(BaseModel):
         return self
 
 
-
 class ReviewImpact(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: str = Field(pattern=r"^(direct|related)$")
@@ -120,12 +117,6 @@ class ReviewQuestion(BaseModel):
     sectionIds: list[str] = Field(default_factory=list, max_length=30)
 
 
-class SourceCoverage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    sourceTitle: str = Field(min_length=1, max_length=300)
-    sectionIds: list[str] = Field(min_length=1, max_length=30)
-
-
 class RevisionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     review: ProposalReview
@@ -134,7 +125,6 @@ class RevisionResult(BaseModel):
     summary: str = Field(min_length=1, max_length=3000)
     impacts: list[ReviewImpact] = Field(max_length=60)
     questions: list[ReviewQuestion] = Field(max_length=30)
-    coverage: list[SourceCoverage] = Field(max_length=60)
 
     @model_validator(mode="after")
     def references(self):
@@ -143,7 +133,7 @@ class RevisionResult(BaseModel):
             raise ValueError("修订方案的各部分必须有完整摘要和正文")
         if any(not node.data.sectionIds for node in self.nodes):
             raise ValueError("方法图的每个模块必须关联方案正文")
-        if any(ref not in ids for item in [*self.impacts, *self.questions, *self.coverage] for ref in item.sectionIds):
+        if any(ref not in ids for item in [*self.impacts, *self.questions] for ref in item.sectionIds):
             raise ValueError("修订报告引用了不存在的方案部分")
         if len({q.id for q in self.questions}) != len(self.questions):
             raise ValueError("待决策问题标识重复")
@@ -160,17 +150,6 @@ def owned_path(root: Path, name: str) -> Path:
     if path.is_symlink() or not path.resolve().is_relative_to(root):
         raise ValueError("方案审阅文件不能位于项目外或使用符号链接")
     return path
-
-
-def atomic_bytes(path: Path, content: bytes):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".proposal-review-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(content)
-        os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
 
 
 def json_bytes(value) -> bytes:
@@ -204,7 +183,7 @@ def load_record(root: Path):
 
 def pending_refine(state) -> bool:
     cp = state.get("expert_checkpoint") or {}
-    return ((state.get("mode") == "expert" or cp.get('hpo_policy')) and state.get("status") == "awaiting_user"
+    return (state.get("status") == "awaiting_user"
             and state.get("current_node") == "refine" and cp.get("node") == "refine"
             and cp.get("status") == "pending" and cp.get("next_node") == "experiment_plan")
 
@@ -241,8 +220,8 @@ def require_candidate(root: Path, expected_sha: str):
     return draft, record
 
 
-def guard_legacy_approval(root: Path):
-    """旧网页与 CLI 也不能绕过新增审阅草稿，自动模式不调用此门禁。"""
+def require_resolved_proposal_review(root: Path):
+    """Require pending canvas edits to be resolved before approval or revision."""
     path = owned_path(root, CANVAS)
     if not path.exists():
         return
@@ -253,22 +232,6 @@ def guard_legacy_approval(root: Path):
             return
     if record or draft.changes or draft.review and (draft.review.feedback.strip() or any(s.edited for s in draft.review.sections)):
         raise ValueError("存在方案审阅草稿，请在方案审阅中统一修订、复审并批准")
-
-
-def source_titles(source: str):
-    titles = []
-    fence = None
-    for line in source.splitlines():
-        delimiter = re.match(r"^\s*(`{3,}|~{3,})", line)
-        if delimiter:
-            if fence is None:
-                fence = delimiter[1][0]
-            elif fence == delimiter[1][0]:
-                fence = None
-        match = not fence and re.match(r"^##\s+(.+?)\s*#*$", line)
-        if match:
-            titles.append(match[1])
-    return titles
 
 
 def render_proposal(draft: CanvasDraft) -> str:

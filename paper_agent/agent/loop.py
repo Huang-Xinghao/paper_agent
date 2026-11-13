@@ -22,7 +22,7 @@ from paper_agent.tools import (ToolContext, ToolResult, ToolSpec,
 
 from paper_agent.project_config import compute_context
 
-from .model_client import ModelClient, ToolCall, load_env_file
+from paper_agent.integrations.model import ModelClient, ToolCall, load_env_file
 from paper_agent.agent.runtime.sessions import PhaseTask, RoleSession, ROLE_DESCRIPTIONS, now
 from .context import WorkingContext, project_messages, request_size
 from .stages import BY_PHASE, SKILL_BY_PHASE, WORKFLOW_NODE_NAMES
@@ -134,7 +134,7 @@ class AgentLoop:
     async def arun(self, prompt: str, *, system_prompt: str, phase: str,
                   completion_check: Callable[[], None] | None = None,
                   history: list[dict[str, Any]] | None = None) -> AgentState:
-        from paper_agent.mcp.manager import MCPManager
+        from paper_agent.integrations.mcp import MCPManager
 
         # Sessions and their transport tasks live in this run's event loop.
         # Never retain a session across separate asyncio.run() invocations.
@@ -287,20 +287,14 @@ class AgentLoop:
     def _tool_schemas(self) -> list[dict[str, Any]]:
         return [tool_schema(spec) for spec in self.tools]
 
+
     def _check_completion(self, phase: str) -> None:
-        """Minimal artifact checks for direct calls without a workflow validator."""
-        stage = BY_PHASE.get(phase)
-        required = stage.completion_outputs(direct=True) if stage else ()
-        missing = [name for name in required
-                   if not (self.workspace / name).is_file()
-                   or not (self.workspace / name).read_text(encoding="utf-8").strip()]
-        if phase == "paper_write" and not any(
-            path.is_file() and path.read_text(encoding="utf-8").strip()
-            for path in (self.workspace / "paper/sections").glob("*.tex")
-        ):
-            missing.append("paper/sections/*.tex (at least one nonempty section)")
-        if missing:
-            raise ArtifactValidationError(f"{phase} cannot finish without: {', '.join(missing)}")
+        from .stages import validate_outputs
+        if phase in BY_PHASE:
+            try:
+                validate_outputs(self.workspace, phase)
+            except ValueError as exc:
+                raise ArtifactValidationError(str(exc)) from exc
 
     def _model_heartbeat(self, stop: threading.Event, phase: str, iteration: int) -> None:
         """Emit durable liveness events while a synchronous model request is pending."""
@@ -497,6 +491,12 @@ class PhaseAgent(AgentLoop):
                    "Stop after the assigned task; do not independently advance downstream phases.\n" if self.role else "")
                 + compute_context(self.project) + self._experiment_template_context()
                 + self._skill_prompt()
+                + "\nRuntime delivery policy: deliver the stage's required outputs. "
+                  "Choose your own document structure, helper files and review process. "
+                  "JSON visual-check manifests, per-figure hashes, fixed question counts, "
+                  "verbatim checkpoint excerpts and a paper/sections directory are optional. "
+                  "Use only the registered external-service tools; do not recreate old MCP or reviewer clients. "
+                  "The workflow runner owns paper reviews; improvement assignments only revise the supplied report. "
                 + '\n用户在角色窗口的聊天仅为讨论上下文，不构成修改MD或批准的指令。'
                   '正式产物按本次主控派单生成。用户审批和面向用户的最终审阅问题由主控负责；'
                   '你可以在交付中列出证据缺口和待决事项作为主控参考，不自行批准或推进阶段。'
@@ -517,7 +517,6 @@ class PhaseAgent(AgentLoop):
         session = RoleSession(self.project, task.role)
         with session.locked():
             data = session.load()
-            session.isolate_legacy_discussion(data)
             if any(item["id"] == task.id for item in data["tasks"]):
                 raise ValueError("Task id already exists; inspect its result before submitting a new assignment")
             for item in data["tasks"]:

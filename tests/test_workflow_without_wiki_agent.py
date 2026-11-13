@@ -4,8 +4,8 @@ import json
 import pytest
 
 from paper_agent.agent import coordinator, role_cli, workflow_cli
-from paper_agent.agent.loop import ArtifactValidationError, PhaseAgent
-from paper_agent.agent.model_client import ModelResponse, ToolCall
+from paper_agent.agent.loop import PhaseAgent
+from paper_agent.integrations.model import ModelResponse, ToolCall
 from paper_agent.agent.runtime.execution import ExecutionTask, StageAssignment
 from paper_agent.agent.runtime.sessions import PhaseTask, RoleSession
 from paper_agent.agent.terminal import main as main_terminal
@@ -99,11 +99,39 @@ def test_main_accepts_final_stage_and_summarizes(final_paper, monkeypatch):
     assert not (final_paper / '.paper-agent/research-memory.json').exists()
 
 
-def test_review_requirement_is_still_enforced(tmp_path):
-    agent = coordinator.CoordinatorAgent(tmp_path)
-    agent._review_due = True
-    with pytest.raises(ArtifactValidationError, match='review_checkpoint'):
-        agent._complete_research()
+def test_expert_summary_does_not_require_extra_review_tool(tmp_path, monkeypatch):
+    report = tmp_path / 'literature/RESEARCH_REPORT.md'
+    report.parent.mkdir()
+    report.write_text('Current literature evidence')
+
+    class Model:
+        calls = 0
+        def complete(self, messages, tools):
+            self.calls += 1
+            if self.calls == 1:
+                return ModelResponse(tool_calls=(ToolCall('stage', 'delegate_stage', {
+                    'assignment': {'node': 'literature', 'role': 'idea_generator',
+                                   'instruction': 'Review literature'},
+                }),))
+            return ModelResponse(content='文献报告已生成，请审阅。')
+
+    def pending(*args, **kwargs):
+        return WorkflowState('pending', project_goal='Research goal', mode='expert',
+            current_node='literature', status='awaiting_user', expert_checkpoint={
+                'node': 'literature', 'status': 'pending',
+                'report': 'literature/RESEARCH_REPORT.md', 'next_node': 'data_search',
+            })
+
+    monkeypatch.setattr(coordinator, 'execute_stage', pending)
+    model = Model()
+    agent = coordinator.CoordinatorAgent(tmp_path, model_client=model,
+        project_goal='Research goal', mode='expert')
+    result = agent.go('Review literature')
+    assert model.calls == 2 and agent.assignments == 1
+    assert result.status == 'awaiting_user'
+    assert result.final == '文献报告已生成，请审阅。'
+    with pytest.raises(ValueError, match='明确批准'):
+        agent._approve_checkpoint(None)
 
 
 @pytest.mark.parametrize('change', [

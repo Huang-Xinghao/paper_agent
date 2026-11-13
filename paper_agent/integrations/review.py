@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from .model_client import record_usage
+from paper_agent.integrations.model import record_usage
+from paper_agent.storage import atomic_bytes
 
 
 ReviewKind = Literal["idea", "code", "paper"]
@@ -24,6 +25,12 @@ RUBRICS = {
     "idea": "Assess novelty against supplied literature, method soundness, feasibility, and falsifiable experimental claims.",
     "code": "Check implementation against the stated method, correctness, data leakage, evaluation fairness, and test evidence.",
     "paper": "Check claims against experimental evidence, methodological clarity, consistency of text/tables/figures, citations, and limitations.",
+}
+
+DEFAULT_REPORTS = {
+    "idea": Path("idea-stage/review.md"),
+    "code": Path("refine-logs/CODE_REVIEW.md"),
+    "paper": Path("paper/review.md"),
 }
 
 
@@ -61,11 +68,6 @@ def resolve_codex() -> str:
     found = shutil.which("codex")
     if found:
         return found
-    for directory in (".vscode-server", ".vscode"):
-        extensions = Path.home() / directory / "extensions"
-        for candidate in sorted(extensions.glob("openai.chatgpt-*/bin/*/codex"), reverse=True):
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return str(candidate)
     raise FileNotFoundError("Codex not found; install it on PATH or set CODEX_BIN")
 
 
@@ -120,14 +122,10 @@ class ReviewRunner:
         inputs = []
         for value in request.inputs:
             path = (self.workspace / value).resolve(strict=True)
-            if not path.is_relative_to(self.workspace) or not path.is_file():
-                raise ValueError(f"input must be a file inside workspace: {value}")
+            if not path.is_relative_to(self.workspace) or not path.is_file() or not path.stat().st_size:
+                raise ValueError(f"input must be a nonempty file inside workspace: {value}")
             inputs.append({"path": str(path.relative_to(self.workspace)), "sha256": _sha256(path)})
-        output = request.output or Path({
-            "idea": "idea-stage/review.md",
-            "code": "experiments/review.md",
-            "paper": "paper/review.md",
-        }[request.kind])
+        output = request.output or DEFAULT_REPORTS[request.kind]
         report = (self.workspace / output).resolve()
         if not report.is_relative_to(self.workspace):
             raise ValueError("review output must be inside workspace")
@@ -155,7 +153,7 @@ class ReviewRunner:
         diagnostic_dir = None
         event_stream = error_stream = None
         if request.save_diagnostics:
-            diagnostic_dir = (report.parent / ".review-diagnostics" / report.stem /
+            diagnostic_dir = (self.workspace / ".paper-agent" / "reviews" / request.kind / report.stem /
                               (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + f"-{time.time_ns()}"))
             diagnostic_dir.mkdir(parents=True)
             (diagnostic_dir / "request.json").write_text(json.dumps({
@@ -243,7 +241,7 @@ class ReviewRunner:
             status, error = "failed", "Input files changed during review: " + ", ".join(changed)
         if status == "completed":
             report.parent.mkdir(parents=True, exist_ok=True)
-            report.write_text(content, encoding="utf-8")
+            atomic_bytes(report, content.encode("utf-8"))
         result = ReviewResult(status, report, thread_id, exit_code,
                               round(time.monotonic() - started, 3), usage, error)
         if diagnostic_dir is not None:
@@ -320,7 +318,7 @@ def main() -> int:
     parser.add_argument("--instructions-file", required=True, type=Path)
     parser.add_argument("--model")
     parser.add_argument("--reasoning-effort")
-    parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--timeout", type=float, default=1200)
     parser.add_argument("--output", type=Path, help="Markdown output path relative to workspace")
     args = parser.parse_args()
     previous_handler = signal.signal(signal.SIGTERM, _interrupt)

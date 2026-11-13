@@ -76,7 +76,7 @@ def load_servers(
         transport = options.get(
             "transport", "stdio" if "command" in options else "http"
         )
-        if transport not in {"http", "streamable-http", "stdio"}:
+        if transport not in {"http", "stdio"}:
             raise ValueError(
                 f"MCP server {name}: supported transports are http and stdio"
             )
@@ -192,6 +192,7 @@ def convert_result(answer, *, server: str, name: str) -> ToolResult:
         bool(answer.isError),
         {"transport": "mcp", "server": server, "tool": name},
         images,
+        answer.structuredContent,
     )
 
 

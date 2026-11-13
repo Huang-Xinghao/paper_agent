@@ -143,7 +143,7 @@ def _schedule(executor, state, manifest, on_progress, *, track=True, queue_path=
             status='failed' if failure else 'running' if pending or running else 'completed',
             error=str(failure) if failure else None, available_gpu_ids=allowed,
             max_parallel_gpu_jobs=gpu_limit, budget_serialized=budgeted,
-            jobs=[dict(id=j['id'], block_id=j['block_id'], depends_on=dependencies[j['id']],
+            jobs=[dict(id=j['id'], block_id=j.get('block_id') or j['id'], depends_on=dependencies[j['id']],
                        status='completed' if j['id'] in completed else 'running' if j['id'] in active else
                        'artifact_invalid' if j['id'] in artifact_failures else
                        'failed' if j['id'] in failures else 'blocked' if j['id'] in blocked else 'pending',

@@ -15,7 +15,7 @@ from paper_agent.tools.paper_compile import compile_pdf
 from paper_agent.storage import write_json as _write_json
 
 
-IGNORED = {'.git', '.recovery', '.paper-agent', '.review-diagnostics', '__pycache__', '.web-run.lock'}
+IGNORED = {'.git', '.recovery', '.paper-agent', '__pycache__', '.web-run.lock'}
 BUILD_SUFFIXES = {'.aux', '.log', '.out', '.toc', '.fls', '.fdb_latexmk', '.xdv', '.synctex.gz', '.bbl', '.blg'}
 
 
@@ -71,7 +71,6 @@ def _run_node_task(project, task, prompt, folder, *, model=None, max_iterations=
     project, folder = Path(project).resolve(), Path(folder).resolve()
     from paper_agent.agent.runtime.artifacts import ArtifactVersions
     versions = ArtifactVersions(project)
-    versions.prepare(task.node)
     workspace = folder / 'workspace'
     if workspace.exists():
         raise ValueError('Task workspace already exists')
@@ -110,8 +109,8 @@ def _run_node_task(project, task, prompt, folder, *, model=None, max_iterations=
             '若无法在本次范围内完成，说明缺少什么，不扩大范围。'
             '完成前检查目标产物，报告具体修改和限制。不要写无关文档。')
         if task.node == 'improvement':
-            from paper_agent.agent.review_runner import ReviewRequest, ReviewRunner
-            from paper_agent.agent.review_runner import paper_review_inputs
+            from paper_agent.integrations.review import ReviewRequest, ReviewRunner
+            from paper_agent.integrations.review import paper_review_inputs
             if len(task.files) != 1 or not task.files[0].endswith('.md'):
                 raise ValueError('单独审稿需要指定一个 Markdown 报告输出文件')
             review = ReviewRunner(workspace, timeout=1800).run(ReviewRequest(

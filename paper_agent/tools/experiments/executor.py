@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any
 
 from paper_agent.project_config import load_compute_config, validate_job_timeout
-from paper_agent.tools.experiments.plan import read_plan_blocks
 
 
 class AwaitingResults(Exception):
@@ -34,11 +33,11 @@ class ExperimentExecutionError(RuntimeError):
 
 
 def job_dependencies(jobs):
-    """Require explicit dependency lists; [] permits independent scheduling."""
+    """Validate declared dependencies; omitted lists mean independent jobs."""
     ids = {job['id'] for job in jobs}
     dependencies = {}
     for job in jobs:
-        deps = job.get('depends_on')
+        deps = job.setdefault('depends_on', [])
         if (not isinstance(deps, list) or any(not isinstance(d, str) or d not in ids
                                              or d == job['id'] for d in deps)
                 or len(set(deps)) != len(deps)):
@@ -118,14 +117,9 @@ class ExperimentExecutor:
                 if str(path) in outputs:
                     raise ValueError(f"jobs must have distinct output paths: {output['path']}")
                 outputs.add(str(path))
-        blocks = {block['id'] for block in read_plan_blocks(self.project)}
-        for job in jobs:
-            block_id = job.get('block_id')
-            if not isinstance(block_id, str) or block_id not in blocks:
-                raise ValueError(f"{job['id']}: block_id must name a planned D/B block; got {block_id!r}")
-        inputs = manifest.get("required_inputs")
-        if not isinstance(inputs, list) or not inputs or not all(isinstance(p, str) for p in inputs):
-            raise ValueError("manifest requires required_inputs")
+        inputs = manifest.setdefault("required_inputs", [])
+        if not isinstance(inputs, list) or not all(isinstance(p, str) and p for p in inputs):
+            raise ValueError("required_inputs must be a list of paths")
         job_dependencies(jobs)
         return manifest
 

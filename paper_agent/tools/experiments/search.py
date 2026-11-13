@@ -15,11 +15,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from paper_agent.tools.experiments.executor import AwaitingResults, ExperimentExecutionError, ExperimentExecutor
-from paper_agent.tools.experiments.plan import read_plan_blocks
-from paper_agent.tools.experiments.queue import atomic_json, recover_receipts, run_queue
+from paper_agent.tools.experiments.queue import recover_receipts, run_queue
+from paper_agent.storage import write_json as atomic_json
 
 
-PROPOSAL = 'refine-logs/FINAL_PROPOSAL.md'
 PLAN = 'refine-logs/EXPERIMENT_PLAN.md'
 SPEC = 'experiments/hpo_spec.json'
 BEST = 'results/hpo/best_config.json'
@@ -91,11 +90,11 @@ class Policy(BaseModel):
 
 class SearchSpec(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    block_id: str = Field(pattern=r'^B[1-9]\d*$')
+    block_id: str = Field(pattern=r'^[A-Za-z0-9_-]+$')
     selection: str = Field(min_length=1)
     argv: list[str] = Field(min_length=1)
     code_files: list[str] = Field(min_length=1)
-    required_inputs: list[str] = Field(min_length=1)
+    required_inputs: list[str] = Field(default_factory=list)
     resources: dict[str, str] = Field(default_factory=lambda: {'device': 'auto'})
 
     @model_validator(mode='after')
@@ -112,18 +111,7 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def policy_source(project):
-    """Prefer the plan, retaining proposal policies for existing projects."""
-    for relative in (PLAN, PROPOSAL):
-        policy = read_policy(project, path=relative)
-        if policy is not None:
-            return policy, relative
-    return None, None
-
-
-def read_policy(project, *, path=None) -> Policy | None:
-    if path is None:
-        return policy_source(project)[0]
+def read_policy(project, *, path=PLAN) -> Policy | None:
     document = Path(project) / path
     return parse_policy(document.read_text(encoding='utf-8')) if document.is_file() else None
 
@@ -131,24 +119,23 @@ def read_policy(project, *, path=None) -> Policy | None:
 def parse_policy(text: str) -> Policy | None:
     matches = re.findall(r'^```hpo-policy\s*\n(.*?)^```\s*$', text, re.M | re.S)
     if not matches:
-        return None  # Existing projects keep their original execution path.
+        return None
     if len(matches) != 1:
         raise ValueError('Policy document must have one hpo-policy block')
     return Policy.model_validate(json.loads(matches[0]))
 
 
 def approved_policy(project, state):
-    policy, relative = policy_source(project)
+    policy, relative = read_policy(project), PLAN
     if policy is None or not policy.enabled:
         return None
     source_sha = hashlib.sha256((Path(project) / relative).read_bytes()).hexdigest()
-    node = 'experiment_plan' if relative == PLAN else 'refine'
+    node = 'experiment_plan'
     accepted_events = {'expert_approved', 'auto_selected'} if state.mode == 'auto' else {'expert_approved'}
     approval = next((e for e in reversed(state.history)
                      if e.get('event') in accepted_events and e.get('node') == node), {})
     if approval.get('sha256') != source_sha:
-        document = '实验计划' if relative == PLAN else '研究方案（旧项目）'
-        raise ValueError(f'搜索范围和预算需随当前{document}确认后再寻优')
+        raise ValueError('搜索范围和预算需随当前实验计划确认后再寻优')
     return policy
 
 
@@ -257,8 +244,6 @@ def _run_search(executor, state, *, on_progress=None):
             raise ValueError('hpo_spec.json requires an enabled, confirmed hpo-policy')
         return {'status': 'disabled'}
     spec = read_spec(project)
-    if spec.block_id not in {b['id'] for b in read_plan_blocks(project)}:
-        raise ValueError('HPO representative experiment must name a planned B block')
     identity, fingerprints = _identity(executor, policy, spec)
     root = project / 'results/hpo'
     root.mkdir(parents=True, exist_ok=True)

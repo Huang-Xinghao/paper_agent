@@ -64,7 +64,7 @@ class UserQuestions:
     def owner_alive(value):
         if not value.get('live'):
             return True
-        # Legacy live questions lack a verifiable owner and cannot be resumed.
+        # Verify PID creation time as well as the PID before resuming a live question.
         if value.get('owner_created') is None:
             return False
         try:

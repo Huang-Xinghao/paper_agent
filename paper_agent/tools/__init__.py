@@ -10,7 +10,6 @@ from . import dataset_inspection as _dataset_inspection
 from . import image_generation as _image_generation
 from . import image_viewing as _image_viewing
 from . import review as _review
-from . import bts as _bts
 from .core import ToolContext, ToolResult, ToolSpec, builtin_tools, invoke, tool
 from .profiles import PHASE_TOOL_NAMES, tools_for_phase
 

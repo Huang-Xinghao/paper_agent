@@ -3,6 +3,7 @@
 import re
 from collections import Counter
 from pathlib import Path
+from paper_agent.storage import atomic_bytes
 
 
 def read_plan_blocks(project):
@@ -33,8 +34,6 @@ def read_plan_blocks(project):
             priority = re.match(r'^\s*-\s*优先级\s*[:：]\s*(.+)', line)
             if priority:
                 current['priority'] = priority[1].strip()
-    if not blocks:
-        raise ValueError('EXPERIMENT_PLAN.md requires block headings such as ### 区块 D1：名称 or ### 区块 B1：名称')
     return blocks
 
 
@@ -48,8 +47,15 @@ def write_experiment_tracker(project, blocks, jobs=(), job_states=()):
             '> 由 runner 自动生成；执行完成不代表研究结论为正。', '',
             '| 块ID | 名称 | 优先级 | 执行状态 | 完成/总数 | 失败 | 阻塞 | 进程成功退出 |',
             '| --- | --- | --- | --- | --- | --- | --- | --- |']
+    blocks = list(blocks)
+    known = {block['id'] for block in blocks}
+    for job in jobs:
+        identifier = job.get('block_id') or job['id']
+        if identifier not in known:
+            blocks.append({'id': identifier, 'name': identifier, 'priority': '按计划执行'})
+            known.add(identifier)
     for block in blocks:
-        members = [job for job in jobs if job.get('block_id') == block['id']]
+        members = [job for job in jobs if (job.get('block_id') or job['id']) == block['id']]
         counts = Counter(states.get(job['id'], 'pending') for job in members)
         total = len(members)
         failed = counts['failed'] + counts['interrupted']
@@ -74,9 +80,7 @@ def write_experiment_tracker(project, blocks, jobs=(), job_states=()):
                 item['id'], labels.get(item['status'], item['status']), item['error'])) + ' |')
     path = Path(project) / 'refine-logs/EXPERIMENT_TRACKER.md'
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.md.tmp')
-    temporary.write_text('\n'.join(rows) + '\n', encoding='utf-8')
-    temporary.replace(path)
+    atomic_bytes(path, ('\n'.join(rows) + '\n').encode('utf-8'))
 
 
 EXPERIMENT_INTERFACE = """执行接口（由运行器维护）：

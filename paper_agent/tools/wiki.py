@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from paper_agent.tools.wiki_metadata import metadata_path, metadata_records
+from paper_agent.tools.wiki_metadata import metadata_path
 
 import json
 import hashlib
@@ -58,7 +58,7 @@ def _quality_records(root: Path, target: Path) -> list[dict]:
             return [{"status": "unavailable", "reason": "论文来源关系无法读取，请核对 graph/edges.jsonl。"}]
     records = []
     for paper in sorted(papers):
-        path = metadata_path(paper, "quality", existing=True)
+        path = metadata_path(paper, "quality")
         record = {"paper_path": paper.relative_to(root).as_posix(), "status": "not_checked", "issues": []}
         if path.is_file():
             if not path.resolve().is_relative_to(root):
@@ -176,7 +176,7 @@ def _search_candidates(ctx: ToolContext, query: str, entity_type: str | None = N
 def _source_record(root: Path, path: Path) -> dict:
     if path.parent != root / "papers":
         return {}
-    source = metadata_path(path, "source", existing=True)
+    source = metadata_path(path, "source")
     if not source.is_file():
         return {"status": "not_available"}
     if not source.resolve().is_relative_to(root):

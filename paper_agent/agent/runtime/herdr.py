@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import time
+from uuid import uuid4
 
 from paper_agent.agent.stages import WORKFLOW_NODE_NAMES
 from paper_agent.storage import write_json as _write_json

@@ -213,8 +213,8 @@ def execute_task(folder, *, on_event=None, execution=None):
             else:
                 from paper_agent.agent.runtime.revision import run_node_task
                 if task.node == 'refine':
-                    from paper_agent.proposal_review import guard_legacy_approval
-                    guard_legacy_approval(project)
+                    from paper_agent.proposal_review import require_resolved_proposal_review
+                    require_resolved_proposal_review(project)
                 result = run_node_task(project, task.revision_task.model_dump(), task.instruction,
                                        folder, on_event=emit, **options)
                 status, error = result.status, result.error
@@ -280,7 +280,7 @@ def read_result(folder, *, verify_artifacts=True):
     folder = Path(folder)
     receipt = json.loads((folder / 'result.json').read_text())
     if 'workflow_snapshot' not in receipt:
-        raise ValueError('Legacy receipt has no immutable workflow snapshot; inspect it with the previous runtime, do not replay the task')
+        raise ValueError('Execution receipt is missing its required workflow_snapshot field')
     task = ExecutionTask.model_validate_json((folder / 'request.json').read_text())
     if any(receipt.get(key) != getattr(task, key) for key in ('id', 'kind', 'node', 'role')):
         raise ValueError('Result identity mismatch')

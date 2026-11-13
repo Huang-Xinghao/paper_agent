@@ -80,8 +80,8 @@ def compute_context(project):
     return ('User-owned project compute policy (do not edit or override):\n' +
             json.dumps(load_compute_config(project), ensure_ascii=False) +
             '\nUser-owned execution policy:\n' + json.dumps(load_execution_config(project), ensure_ascii=False) +
-            '\nEvery manifest job must declare depends_on as a list of upstream job IDs. '
-            'Use depends_on: [] for independent jobs; list prerequisite job IDs for dependent jobs. '
+            '\nManifest jobs may declare depends_on as a list of upstream job IDs. '
+            'Omit depends_on or use [] for independent jobs; list prerequisite job IDs for dependent jobs. '
             '\nExecution limits: ' + json.dumps({'effective_max_job_seconds': effective_job_seconds(project),
                                                     'runner_max_job_seconds': MAX_JOB_SECONDS}) +
             '\nnull means no project-specific limit, not missing approval; the runner limit still applies. '
@@ -90,5 +90,5 @@ def compute_context(project):
             'Use these resources to size models, seeds and searches. Total budget includes '
             'all experiment attempts across resumes; it excludes model API time. '
             'HPO smoke, trials and confirmation runs consume this same total, plus their '
-            'separate cumulative max_seconds allowance in the confirmed proposal hpo-policy. '
+            'separate cumulative max_seconds allowance in the confirmed experiment-plan hpo-policy. '
             'Inspect real device availability before execution; auto is a preference, not proof of a GPU.\n')

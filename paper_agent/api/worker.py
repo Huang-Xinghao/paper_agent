@@ -12,7 +12,8 @@ from pathlib import Path
 
 import psutil
 
-from .store import REPO, data_root, event, now, read_json, rows, run_update
+from paper_agent.storage import read_json_or_default as read_json
+from .store import REPO, data_root, event, now, rows, run_update
 
 
 def stop_tree(process):

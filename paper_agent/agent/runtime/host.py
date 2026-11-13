@@ -17,7 +17,7 @@ from paper_agent.storage import write_json as _write_json
 
 def chat(project, role, prompt):
     """Discussion memory is isolated from the role's formal execution memory."""
-    from paper_agent.agent.model_client import ModelClient, load_env_file
+    from paper_agent.integrations.model import ModelClient, load_env_file
     load_env_file(Path(__file__).resolve().parents[3] / '.env')
     with (directory(project) / 'transport.lock').open('a') as lock:
         try:

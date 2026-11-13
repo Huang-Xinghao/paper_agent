@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -139,15 +140,17 @@ def _stream_response(stream: Any, *, deadline: float | None = None, on_usage=Non
                     finished = True
         if not finished:
             raise RuntimeError("Model stream ended without a completion marker; no tools were executed")
-        if pending and on_delta:
-            on_delta(''.join(pending))
         try:
             return _normalise_response({"content": "".join(content),
                                         "tool_calls": [calls[i] for i in sorted(calls)]})
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise InvalidToolCall(f"Invalid streamed tool call: {exc}") from exc
     finally:
-        stream.close()
+        try:
+            if pending and on_delta:
+                on_delta(''.join(pending))
+        finally:
+            stream.close()
 
 
 def load_env_file(path: str | os.PathLike[str]) -> None:
@@ -211,7 +214,7 @@ def _normalise_response(value: Any) -> ModelResponse:
 class ModelClient:
     """OpenAI-compatible client whose transport can be replaced in tests."""
 
-    def __init__(self, model: str = "gpt-4o", *, client: Any = None,
+    def __init__(self, model: str | None = None, *, client: Any = None,
                  responder: Callable[..., Any] | None = None,
                  api_key: str | None = None, base_url: str | None = None,
                  timeout: float | None = None):
@@ -220,10 +223,9 @@ class ModelClient:
         self.model = model or os.environ.get("PAPER_AGENT_MODEL", "gpt-4o")
         configured_timeout = timeout if timeout is not None else os.environ.get(
             "PAPER_AGENT_TIMEOUT_SECONDS", "120")
-        try:
-            self.timeout = float(configured_timeout)
-        except (TypeError, ValueError):
-            self.timeout = 120.0
+        self.timeout = float(configured_timeout)
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("Model timeout must be finite and positive")
         self._responder = responder
         self.usage_workspace = None
         self.usage_phase = None
@@ -245,7 +247,7 @@ class ModelClient:
             client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout, max_retries=0)
         self.client = client
 
-    def _request_response(self, request: dict[str, Any], *, on_delta=None, on_stream_reset=None) -> ModelResponse:
+    def _request_response(self, request: dict[str, Any], *, on_delta=None, on_stream_reset=None, retry=True) -> ModelResponse:
         """Retry the same model request; partial streams never reach tool execution."""
         deadline = None
         last_error = None
@@ -277,9 +279,12 @@ class ModelClient:
                 if options["stream"] and not isinstance(response, Mapping) and not hasattr(response, "choices"):
                     return _stream_response(response, deadline=deadline, on_usage=capture, on_delta=on_delta)
                 capture(response.get('usage') if isinstance(response, Mapping) else getattr(response, 'usage', None))
-                return _normalise_response(response)
+                result = _normalise_response(response)
+                if on_delta and result.content:
+                    on_delta(result.content)
+                return result
             except Exception as exc:
-                if budget is not None:
+                if budget is not None or not retry:
                     raise
                 if not _transient_request_error(exc):
                     raise
@@ -299,17 +304,7 @@ class ModelClient:
                 record_usage(self.usage_workspace, source='model', model=self.model,
                              phase=self.usage_phase, usage=usage)
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
-                 *, temperature: float = 0, on_delta=None, on_stream_reset=None) -> ModelResponse:
-        if self._responder is not None:
-            budget = _request_budget.get()
-            if budget is not None:
-                if budget.remaining <= 0:
-                    raise RuntimeError("Model request budget exhausted")
-                budget.remaining -= 1
-                budget.used += 1
-            return _normalise_response(self._responder(messages=messages, tools=tools,
-                                                       model=self.model, temperature=temperature))
+    def _request_options(self, messages, *, temperature=0):
         streaming = os.environ.get("PAPER_AGENT_STREAM", "true").lower() not in {"0", "false", "no"}
         request = {"model": self.model, "messages": messages,
                    "temperature": temperature, "timeout": self.timeout, "stream": streaming}
@@ -323,6 +318,33 @@ class ModelClient:
                 max_tokens = 0
             if max_tokens > 0:
                 request["max_tokens"] = max_tokens
+        return request
+
+    def complete_text(self, messages, *, on_delta=None) -> str:
+        """One text-only request, with shared stream validation/accounting and no replay."""
+        if self._responder is not None:
+            response = self.complete(messages, [])
+            if on_delta:
+                on_delta(response.content)
+        else:
+            response = self._request_response(self._request_options(messages),
+                                              on_delta=on_delta, retry=False)
+        if response.tool_calls:
+            raise InvalidToolCall("Text-only request returned tool calls")
+        return response.content
+
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                 *, temperature: float = 0, on_delta=None, on_stream_reset=None) -> ModelResponse:
+        if self._responder is not None:
+            budget = _request_budget.get()
+            if budget is not None:
+                if budget.remaining <= 0:
+                    raise RuntimeError("Model request budget exhausted")
+                budget.remaining -= 1
+                budget.used += 1
+            return _normalise_response(self._responder(messages=messages, tools=tools,
+                                                       model=self.model, temperature=temperature))
+        request = self._request_options(messages, temperature=temperature)
         if tools:
             request.update(tools=tools, tool_choice="auto")
         attempts = 1 if _request_budget.get() is not None else 3

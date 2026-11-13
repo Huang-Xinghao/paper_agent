@@ -113,7 +113,7 @@ def encode_texts(
         else:
             missing[key] = text
     if missing:
-        # 临时文件和缓存均在配置的E盘路径；不放进系统C盘临时目录。
+        # 临时文件与缓存放在同一配置目录，避免占用系统临时分区。
         with tempfile.TemporaryDirectory(prefix="encode-", dir=cache_dir) as temp:
             source, destination = Path(temp) / "input.json", Path(temp) / "output.json"
             source.write_text(

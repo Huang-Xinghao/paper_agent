@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
+import copy
 import math
 import os
 import time
@@ -14,7 +14,7 @@ from typing import Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from paper_agent.mcp.manager import MCPManager, load_servers, tool_name
+from paper_agent.integrations.mcp import MCPManager, load_servers, tool_name
 
 router = APIRouter(prefix="/api/laboratory", tags=["laboratory"])
 
@@ -250,8 +250,7 @@ class BtsMonitor:
                 )
                 if result.is_error:
                     raise RuntimeError("BTS query failed")
-                # Structured JSON is first; an additional text receipt may follow.
-                payload, _ = json.JSONDecoder().raw_decode(result.output.lstrip())
+                payload = result.structured_content if result.structured_content is not None else json.loads(result.output)
                 if not isinstance(payload, dict):
                     raise ValueError("Invalid BTS response")
                 return payload

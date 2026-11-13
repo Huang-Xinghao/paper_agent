@@ -372,9 +372,10 @@ class RoleTerminal:
                 self.append('· 项目状态', '\n'.join(f'{key}: {state.get(key) or "—"}' for key in ('status', 'current_node', 'project_goal', 'error')))
                 from paper_agent.agent.runtime.artifacts import ArtifactVersions
                 from paper_agent.agent.runtime.questions import UserQuestions
-                stale = ArtifactVersions(self.project).context()['stale_nodes']
-                if stale:
-                    self.append('· 需要重新核查的产物', ', '.join(stale))
+                changes = ArtifactVersions(self.project).context()['changed_files']
+                if changes:
+                    self.append('· 产物改动提示', '\n'.join(
+                        f'{node}: {", ".join(paths)}' for node, paths in changes.items()))
                 for question in UserQuestions(self.project).pending():
                     self.append('◆ 待回答问题 · ' + TITLES[question['role']], question['question'] +
                                 '\n问题 ID: ' + question['id'] + '\n在 Main 输入 /answer 回答内容')

@@ -26,6 +26,7 @@ from .library import router as library_router
 from .idea_canvas import router as idea_canvas_router
 from .laboratory import BtsMonitor, router as laboratory_router
 from paper_agent.agent.runtime.execution import RevisionTask, StageAssignment
+from paper_agent.storage import read_json_or_default as read_json
 from .store import (
     REPO,
     connection,
@@ -33,7 +34,6 @@ from .store import (
     event,
     initialize,
     now,
-    read_json,
     rows,
     run_update,
 )
@@ -537,9 +537,9 @@ def create_run(project_id: str, body: RunCreate, *, message_prompt=None):
             if body.checkpoint_token != checkpoint_token(project, state):
                 raise HTTPException(409, "报告或检查点已变化，请刷新后重新确认")
             if state.get("current_node") == "refine" and not (body.answer or '').strip():
-                from paper_agent.proposal_review import guard_legacy_approval
+                from paper_agent.proposal_review import require_resolved_proposal_review
                 try:
-                    guard_legacy_approval(Path(project["path"]))
+                    require_resolved_proposal_review(Path(project["path"]))
                 except (ValueError, OSError) as exc:
                     raise HTTPException(409, str(exc)) from exc
             for key in ["mode", "prompt", "start_node", "stop_after"]:

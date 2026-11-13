@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fcntl
 import json
-import os
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -83,42 +82,15 @@ class RoleSession:
             return {"session_id": uuid4().hex, "role": self.role, "channel": self.channel,
                     "messages": [], "tasks": []}
         value = json.loads(self.path.read_text(encoding="utf-8"))
-        if value["role"] != self.role:
+        if value["role"] != self.role or value.get("channel") != self.channel:
             raise ValueError("Role session identity mismatch")
         return value
 
-    def isolate_legacy_discussion(self, data):
-        """Archive old mixed memory and keep identifiable execution exchanges only."""
-        if self.channel != 'execution' or self.role == 'main' or data.get('channel') == 'execution':
-            return
-        history, kept, in_assignment = data['messages'], [], True
-        for message in history:
-            if message.get('role') == 'user':
-                content = message.get('content', '')
-                if isinstance(content, str):
-                    if content.startswith('Current assignment ['):
-                        in_assignment = True
-                    elif not content.startswith('Completion checks failed:'):
-                        # Untagged chat and summaries of mixed memory cannot be
-                        # promoted to scientific instructions during migration.
-                        in_assignment = False
-            if in_assignment:
-                kept.append(message)
-        if kept != history:
-            archive = self.folder / 'archives' / self.role / 'legacy-mixed'
-            archive.mkdir(parents=True, exist_ok=True)
-            (archive / f'{time.time_ns()}.json').write_text(
-                json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-            data['messages'] = kept
-            data.pop('context_memory', None)
-        data['channel'] = 'execution'
-        self.save(data)
 
     def save(self, value: dict):
         value["updated_at"] = now()
-        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(self.path)
+        from paper_agent.storage import write_json
+        write_json(self.path, value)
 
     def compact(self, data: dict, history: list[dict], model, max_chars: int) -> list[dict]:
         from paper_agent.agent.context import project_messages, request_size, resume_memory, summarize_messages
