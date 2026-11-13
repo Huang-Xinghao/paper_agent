@@ -337,11 +337,6 @@ def run_coordinated_workflow(project: Path, prompt: str = "", *, start_node=None
             saved = runner.resume_checkpoint(saved, proposal_review_sha=proposal_review_sha)
             _write_json(path, saved.to_dict())
             if saved.status == "completed":
-                if saved.current_node == 'improvement':
-                    CoordinatorAgent(project, model=model, timeout=timeout, mode=saved.mode,
-                                     on_event=on_event, wait_for_user=wait_for_user).go(
-                        '最终修订产物已正式批准，完整研究已完成。调用 curate_wiki(project_evidence=true) 沉淀成果后总结。',
-                        archive_completed=True)
                 return saved
         start_node = saved.current_node
         prompt = revise if revise is not None else saved.project_goal

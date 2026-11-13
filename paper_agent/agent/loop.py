@@ -414,13 +414,6 @@ class PhaseAgent(AgentLoop):
         if has_evidence_handoff():
             selected_names -= NAMES
         selected = tuple(spec for spec in self._tools.values() if spec.name in selected_names)
-        if self.phase == 'wiki':
-            from paper_agent.tools.wiki_ingest import WikiIngestion
-            if not hasattr(self, 'wiki_ingestion'):
-                self.wiki_ingestion = WikiIngestion(
-                    self.project, model=self.model,
-                    on_progress=lambda action, details: self._progress('wiki_progress', action=action, **details))
-            selected += self.wiki_ingestion.tools()
         selected += (ToolSpec('request_user_decision',
                               '提问并等待回答；自动模式仅限已查证的必要输入阻塞，必须填写blocking_reason。',
                               self._ask_user),)
@@ -451,11 +444,6 @@ class PhaseAgent(AgentLoop):
                                       'answer': answer, 'task_id': task['id']}, ensure_ascii=False))
 
     async def _invoke(self, spec, arguments):
-        if self.phase == 'wiki' and spec.name in {'write', 'edit'}:
-            try:
-                self.wiki_ingestion.validate_draft_write(arguments.get('path', ''))
-            except ValueError as exc:
-                return ToolResult(str(exc), True)
         if spec.name != 'request_user_decision':
             return await super()._invoke(spec, arguments)
         import asyncio
@@ -471,20 +459,8 @@ class PhaseAgent(AgentLoop):
         path = self.skills_root / name / "SKILL.md"
         if path.is_file():
             prompt = f"\n## Skill: {name}\n{path.read_text(encoding='utf-8')}"
-            if self.phase == 'wiki':
-                from paper_agent.agent.wiki_role import draft_instructions
-                prompt += draft_instructions()
             return prompt
         return ""
-
-    def _check_completion(self, phase: str) -> None:
-        if phase == 'wiki':
-            try:
-                self.wiki_ingestion.check_completion()
-            except ValueError as exc:
-                raise ArtifactValidationError(str(exc)) from exc
-            return
-        super()._check_completion(phase)
 
     def _experiment_template_context(self) -> str:
         if self.phase not in {"experiment_plan", "experiment_bridge"}:
@@ -503,8 +479,7 @@ class PhaseAgent(AgentLoop):
         from paper_agent.agent.runtime.questions import interaction_instructions
         return ("You are an autonomous scientific paper workflow agent. "
                 f"Current phase: {self.phase}. "
-                + ("Write drafts only inside this assignment's project staging directory. The wiki_publish tool is authorized to publish reviewed content to the configured shared Wiki outside the project. "
-                   if self.phase == 'wiki' else "Write code and outputs only inside the project workspace. ")
+                + "Write code and outputs only inside the project workspace. "
                 + "Read-only access to external datasets explicitly registered in battery resource README local-data fields is allowed. Use list_battery_data_sources, find and inspect_battery_data to verify real files before declaring data missing. Never modify source datasets, including via shell commands or generated scripts. "
                 f"Runner Python executable: {sys.executable!r}. Manifest commands starting with python or python3 use this interpreter. "
                 "When resuming experiments, verify that existing implementation and environment reports still match the current runtime and the approved experiment plan. Regenerate stale environment reports. An earlier CPU-only environment is not a reason to replace a planned CUDA model with a CPU/sklearn surrogate; restore the planned model and verify real CUDA training before collecting its results. Environment failures must be reported and fixed rather than changing the scientific method. "
@@ -537,11 +512,7 @@ class PhaseAgent(AgentLoop):
                 completion_check: Callable[[], None] | None = None) -> AgentState:
         """Execute one skill assignment in a durable, isolated role conversation."""
         self.project.mkdir(parents=True, exist_ok=True)
-        if task.phase == 'wiki' and hasattr(self, 'wiki_ingestion') and getattr(self.wiki_ingestion, 'started', False):
-            del self.wiki_ingestion
         self.configure(phase=task.phase)
-        if task.phase == 'wiki':
-            self.wiki_ingestion.started = True
         self.role = task.role
         session = RoleSession(self.project, task.role)
         with session.locked():
@@ -567,11 +538,7 @@ class PhaseAgent(AgentLoop):
                     f"Current assignment [{task.id}], phase={task.phase}, role={task.role}:\n{task.instruction}",
                     system_prompt=self._system_prompt(), phase=task.phase,
                     completion_check=completion_check, history=history)
-                status = ('failed' if task.phase == 'wiki' and self.wiki_ingestion.receipt.get('status') == 'failed'
-                          else 'completed')
-                record.update(status=status, final=result.final)
-                if status == 'failed':
-                    record['error'] = self.wiki_ingestion.receipt.get('error')
+                record.update(status="completed", final=result.final)
                 return result
             except BaseException as exc:
                 record.update(status="interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed",

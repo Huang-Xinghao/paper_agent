@@ -24,7 +24,7 @@ from paper_agent.agent.runtime.herdr import directory, _read, _relay, HerdrError
 from paper_agent.agent.runtime.sessions import RoleSession
 
 
-TITLES = {'main': 'Main', 'idea_generator': 'Idea Generator', 'experiment': 'Experiment', 'paper_writer': 'Paper Writer', 'wiki_agent': 'Wiki Agent'}
+TITLES = {'main': 'Main', 'idea_generator': 'Idea Generator', 'experiment': 'Experiment', 'paper_writer': 'Paper Writer'}
 HELP = ('Enter 发送 · Alt+Enter / Ctrl+J 换行 · Tab 补全命令\n'
         'PgUp/PgDn 浏览消息 · Ctrl+F 搜索 · Esc 返回输入\n'
         '/status 项目状态   /logs 执行日志   /clear 清屏   /quit 退出\n'

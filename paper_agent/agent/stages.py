@@ -33,8 +33,6 @@ class StageSpec:
 
 # Workflow order is the order below, excluding standalone phases (node=None).
 STAGES = (
-    StageSpec(node=None, phase="wiki", skill="wiki-curation", role="wiki_agent",
-              output_check="specialized"),
     StageSpec(
         node="literature", phase="literature", skill="research-lit", role="idea_generator",
         outputs=("literature/RESEARCH_REPORT.md",),

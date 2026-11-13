@@ -6,8 +6,6 @@ from .core import ToolSpec
 
 
 PHASE_TOOL_NAMES: dict[str, frozenset[str]] = {
-    "wiki": frozenset({"ls", "find", "read", "grep", "write", "edit", "skill", "skill_resource_read",
-                       "search_wiki", "read_wiki", "view_image"}),
     "data_search": frozenset({"ls", "find", "read", "grep", "write", "edit", "bash",
                               "skill", "skill_resource_read",
                               "search_battery_resources", "read_battery_resource",

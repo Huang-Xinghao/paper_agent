@@ -19,7 +19,6 @@ ROLE_DESCRIPTIONS = {
     "idea_generator": "Develop evidence-backed research questions, literature and data understanding, ideas, novelty assessments and the final proposal.",
     "experiment": "Plan, implement and execute approved experiments; verify real execution receipts and explain results without inventing evidence.",
     "paper_writer": "Plan the paper, create figures, write, compile and revise using verified project evidence; distinguish claims from untested hypotheses.",
-    "wiki_agent": "Read papers and project evidence, author and revise grounded Wiki drafts, obtain independent review and publish verified Wiki records.",
 }
 
 

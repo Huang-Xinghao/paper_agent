@@ -10,7 +10,7 @@ from pathlib import Path
 import time
 from uuid import uuid4
 
-from paper_agent.tools.wiki_prompts import RESEARCH_PROMPT as SYSTEM, research_budget_prompt
+from paper_agent.tools.wiki_research_prompts import RESEARCH_PROMPT as SYSTEM, research_budget_prompt
 from paper_agent.agent.loop import tool_schema
 from paper_agent.agent.model_client import limited_model_requests
 from paper_agent.tools import ToolContext, ToolResult, builtin_tools

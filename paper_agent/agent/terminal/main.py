@@ -210,13 +210,7 @@ def run_turn(folder):
                     prompt += ('\n终端已通过正式审批入口核验并批准当前检查点。'
                                f'请从 {approved.current_node} 继续用户已授权的任务；'
                                '历史对话中“检查点未解除”的描述已经过时。')
-            if approved and approved.status == 'completed' and approved.current_node == 'improvement':
-                result = CoordinatorAgent(project, on_event=emit, execution_guard=guard,
-                                          **options).go(
-                    '最终修订产物已正式批准，完整研究已完成。调用 curate_wiki(project_evidence=true) 沉淀成果后总结。',
-                    archive_completed=True)
-                output = dict(status=result.status, final=result.final, error=result.error)
-            elif approved and approved.status == 'completed':
+            if approved and approved.status == 'completed':
                 output = dict(status='completed', final='已批准当前产物，并按原定停止位置结束。', error=None)
             else:
                 result = CoordinatorAgent(project, on_event=emit, execution_guard=guard,

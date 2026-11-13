@@ -13,7 +13,6 @@ dependencies = ["openai>=1.0", "pypdf>=4", "httpx>=0.27", "Pillow>=10", "black>=
 paper-agent = "paper_agent.agent.loop:main"
 paper-wiki = "paper_agent.tools.research_wiki:main"
 paper-threat-scan = "paper_agent.tools.threat_scan:main"
-paper-wiki-agent = "paper_agent.agent.wiki.agent:main"
 paper-workflow = "paper_agent.agent.workflow_cli:main"
 paper-review = "paper_agent.agent.review_runner:main"
 paper-web-api = "paper_agent.api.app:main"

@@ -24,7 +24,7 @@ from paper_agent.storage import read_json_or_default as read_json
 Node = Literal['literature', 'data_search', 'ideas', 'refine', 'experiment_plan',
                'experiment_bridge', 'paper_plan', 'paper_figure', 'paper_write',
                'paper_compile', 'improvement']
-Role = Literal['idea_generator', 'experiment', 'paper_writer', 'wiki_agent']
+Role = Literal['idea_generator', 'experiment', 'paper_writer']
 
 
 class StageAssignment(BaseModel):
@@ -35,8 +35,6 @@ class StageAssignment(BaseModel):
 
     @model_validator(mode='after')
     def nonempty(self):
-        if self.role == 'wiki_agent':
-            raise ValueError('Use the standalone Wiki task for wiki_agent')
         if not self.instruction.strip():
             raise ValueError('Assignment must have a concrete instruction')
         return self
@@ -72,11 +70,11 @@ class ExecutionTask(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str = Field(pattern=r'^[a-f0-9]{32}$')
     project: str
-    node: Node | Literal['wiki']
+    node: Node
     role: Role
     instruction: str = Field(min_length=1)
     project_goal: str
-    kind: Literal['stage', 'revision', 'wiki'] = 'stage'
+    kind: Literal['stage', 'revision'] = 'stage'
     revision_task: RevisionTask | None = None
     revise: str | None = None
     options: dict = Field(default_factory=dict)
@@ -85,8 +83,6 @@ class ExecutionTask(BaseModel):
 
     @model_validator(mode='after')
     def consistent(self):
-        if (self.kind == 'wiki') != (self.node == 'wiki') or (self.role == 'wiki_agent') != (self.kind == 'wiki'):
-            raise ValueError('Wiki execution requires kind=wiki, node=wiki and role=wiki_agent')
         if (self.kind == 'revision') != (self.revision_task is not None):
             raise ValueError('Revision execution requires exactly one revision task')
         if self.revision_task and (self.revision_task.node != self.node or self.revise is not None):
@@ -198,7 +194,7 @@ def execute_task(folder, *, on_event=None, execution=None):
             if on_event:
                 on_event(record)
 
-        files, final, state, wiki_result = [], '', None, None
+        files, final, state = [], '', None
         try:
             emit({'kind': 'execution_start', 'time': now(), 'node': task.node,
                   'role': task.role, 'task_kind': task.kind})
@@ -214,15 +210,6 @@ def execute_task(folder, *, on_event=None, execution=None):
                                       revise=task.revise, execution=metadata, on_event=emit, **options)
                 status, error = state.status, state.error
                 files = [ref['path'] for ref in state.artifacts.get(task.node, [])]
-            elif task.kind == 'wiki':
-                from paper_agent.agent.wiki_role import run_wiki_role
-                wiki_result = run_wiki_role(
-                    project, task.instruction,
-                    on_progress=lambda kind, details: emit({'kind': kind, 'time': now(), **details}),
-                    **options)
-                status = 'completed' if wiki_result['status'] in {'completed', 'skipped'} else 'failed'
-                error = wiki_result.get('error') if status == 'failed' else None
-                final, files = wiki_result['final'], [wiki_result['receipt_path']]
             else:
                 from paper_agent.agent.runtime.revision import run_node_task
                 if task.node == 'refine':
@@ -269,8 +256,6 @@ def execute_task(folder, *, on_event=None, execution=None):
                    'status': status, 'error': error, 'final': final, 'artifacts': artifacts,
                    'execution': metadata, 'ended_at': now(), 'state_sha256': snapshot_hash,
                    'workflow_snapshot': 'workflow.json' if state_data is not None else None}
-        if task.kind == 'wiki':
-            receipt['wiki_result'] = wiki_result
         _write_json(folder / 'result.json', receipt)
         emit({'kind': 'execution_end', 'time': now(), 'node': task.node, 'role': task.role,
               'task_kind': task.kind, 'status': status, 'error': error})
@@ -340,8 +325,7 @@ def _result(task, receipt, snapshot):
         return snapshot
     return SimpleNamespace(status=receipt['status'], error=receipt['error'], final=receipt['final'],
                            files=[r['path'] for r in receipt['artifacts']],
-                           task_id=task.id, execution=receipt['execution'],
-                           wiki_result=receipt.get('wiki_result'))
+                           task_id=task.id, execution=receipt['execution'])
 
 
 @contextmanager

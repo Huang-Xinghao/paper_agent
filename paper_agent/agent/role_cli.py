@@ -18,7 +18,7 @@ class CommandParser(argparse.ArgumentParser):
 def parser():
     root = CommandParser(prog='paper-roles', description=__doc__, add_help=False)
     actions = root.add_subparsers(dest='action', required=True)
-    for action in ('list', 'status', 'history', 'delegate', 'revise', 'wiki'):
+    for action in ('list', 'status', 'history', 'delegate', 'revise'):
         command = actions.add_parser(action, add_help=False)
         command.add_argument('--project', type=Path)
         if action in {'status', 'history'}:
@@ -39,12 +39,6 @@ def parser():
             command.add_argument('--target', required=True)
             command.add_argument('--file', action='append', required=True)
             command.add_argument('--compile-pdf', action='store_true')
-        if action == 'wiki':
-            command.add_argument('--paper', required=True)
-            command.add_argument('--project-evidence', action='store_true')
-            command.add_argument('--source', action='append', default=[])
-            command.add_argument('--instruction', default='')
-            command.add_argument('--force', action='store_true')
     return root
 
 
@@ -162,7 +156,7 @@ def parse_command(command):
     return parser().parse_args(words)
 
 
-def run(command, *, project=None, delegate=None, revise=None, curate=None):
+def run(command, *, project=None, delegate=None, revise=None):
     """Run the same command grammar in a terminal or a project-bound main tool."""
     args = parse_command(command)
     selected = (args.project or project)
@@ -177,13 +171,6 @@ def run(command, *, project=None, delegate=None, revise=None, curate=None):
         return status(selected, getattr(args, 'role', None))
     if args.action == 'history':
         return history(selected, args)
-    if args.action == 'wiki':
-        values = {'paper_path': args.paper, 'project_evidence': args.project_evidence,
-                  'source_paths': args.source, 'instruction': args.instruction, 'force': args.force}
-        if curate is not None:
-            return curate(values)
-        from .coordinator import CoordinatorAgent
-        return json.loads(CoordinatorAgent(selected)._curate_wiki(None, **values).output)
     from paper_agent.agent.runtime.execution import StageAssignment, RevisionTask
     if args.action == 'delegate':
         task = StageAssignment(node=args.node, role=args.role, instruction=args.instruction)

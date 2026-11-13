@@ -49,7 +49,7 @@ def serve(root):
     root = Path(root).resolve()
     binding = _read(root / 'binding.json')
     project, role = Path(binding['project']).resolve(), binding['role']
-    if (role not in {'idea_generator', 'experiment', 'paper_writer', 'wiki_agent'}
+    if (role not in {'idea_generator', 'experiment', 'paper_writer'}
             or root != directory(project) / 'roles' / role
             or binding['pane_id'] != os.environ['HERDR_PANE_ID']):
         raise HerdrError('Role host identity mismatch')

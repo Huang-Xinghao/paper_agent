@@ -153,7 +153,7 @@ def host_alive(ready, root):
 def ensure_role(project, role, config, client):
     """Reuse only a verified host; lost startup responses never spawn duplicates."""
     require_managed_pane()
-    if role not in {'idea_generator', 'experiment', 'paper_writer', 'wiki_agent'}:
+    if role not in {'idea_generator', 'experiment', 'paper_writer'}:
         raise ValueError('Unknown execution role')
     root = directory(project) / 'roles' / role
     root.mkdir(parents=True, exist_ok=True)
@@ -181,7 +181,7 @@ def ensure_role(project, role, config, client):
                    'binary': config['binary'], 'project': str(Path(project).resolve()), 'status': 'starting'}
         _write_json(root / 'binding.json', binding)
         siblings = [_read(directory(project) / 'roles' / other / 'binding.json')
-                    for other in ('idea_generator', 'experiment', 'paper_writer', 'wiki_agent') if other != role]
+                    for other in ('idea_generator', 'experiment', 'paper_writer') if other != role]
         sibling = next((item for item in reversed(siblings) if item and item.get('pane_id')), None)
         response = client.call('pane', 'split', '--pane', sibling['pane_id'] if sibling else config['anchor_pane'],
                                '--direction', 'down' if sibling else config['direction'],
@@ -205,7 +205,7 @@ def submit(project, node, instruction, *, role, project_goal, revise=None, on_ev
     require_managed_pane()
     project = Path(project).resolve()
     config = load_config(project)
-    if config is None or (node not in config['nodes'] and not (node == 'wiki' and kind == 'wiki')):
+    if config is None or node not in config['nodes']:
         raise HerdrError('Stage is not enabled for Herdr')
     client = Client(config['session'], config['binary'])
     root = directory(project)
@@ -215,7 +215,7 @@ def submit(project, node, instruction, *, role, project_goal, revise=None, on_ev
         except BlockingIOError as exc:
             raise HerdrError('Another Herdr stage is being submitted or awaited') from exc
         ensure_no_pending(project)
-        if role not in {'idea_generator', 'experiment', 'paper_writer', 'wiki_agent'}:
+        if role not in {'idea_generator', 'experiment', 'paper_writer'}:
             raise ValueError('Unknown worker role')
         from paper_agent.agent.runtime.execution import new_task
         task = new_task(project, node, instruction, role=role, project_goal=project_goal,
@@ -306,7 +306,7 @@ def main():
         if config is None:
             raise HerdrError('Connect the project first')
         print(json.dumps({role: ensure_role(args.project, role, config, Client(config['session'], config['binary']))
-                          for role in ('idea_generator', 'experiment', 'paper_writer', 'wiki_agent')}, ensure_ascii=False))
+                          for role in ('idea_generator', 'experiment', 'paper_writer')}, ensure_ascii=False))
     else:
         state = reconcile(args.project, args.task_id, wait_seconds=args.timeout)
         print(json.dumps({'status': state.status, 'error': state.error}, ensure_ascii=False))

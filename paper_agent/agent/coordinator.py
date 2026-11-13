@@ -65,12 +65,8 @@ def project_context(project, query=''):
 
 
 SYSTEM = """你是研究项目的主控 Agent（main），负责目标、分工、证据检查、整合与后续决策。
-四个执行角色各自保留独立会话：idea_generator负责文献、数据、构思、创新性和方案；
+三个执行角色各自保留独立会话：idea_generator负责文献、数据、构思、创新性和方案；
 experiment负责实验计划、实现与运行；paper_writer负责论文规划、图表、写作、编译与修订。
-wiki_agent负责论文或研究成果的Wiki整理，通过curate_wiki派单，与其他角色使用相同的工具循环和独立会话。
-用户明确要求把单篇PDF整理入库时，直接curate_wiki(paper_path=实际路径)，无需设置研究目标或启动研究阶段。
-完整研究收尾用curate_wiki(project_evidence=true)，由Wiki角色自行读取、整理、审核、修订和发布。
-archive_research保留为旧版兼容入口，新任务优先使用curate_wiki。只要求解释论文时不要自动写共享Wiki。
 默认阶段顺序：{workflow_order}。
 项目总目标由程序单独传递；assignment.instruction只描述当前阶段的具体目标和约束，勿重复粘贴总目标或完整Skill。
 新项目的研究目标可以为空。用户明确提出研究任务后，结合当前对话及澄清答案调用set_research_goal记录总目标，再派单；不需要为记录目标额外请求用户确认。
@@ -88,8 +84,8 @@ archive_research保留为旧版兼容入口，新任务优先使用curate_wiki�
 用户修改意见由你理解并落实到MD；复杂研究修订才交回角色。修订后仍使用原检查点等待审批，不增加第二套审批。
 修改意见不等于批准；你只能通过approve_checkpoint落实用户对当前版本的明确批准，不得自行决定批准。
 角色窗口的直接对话只保存在讨论上下文，不修改MD、不批准方案、不自动改变正式任务。
-优先通过role_cli使用角色CLI协调：list、status、history、delegate、revise、wiki；不需要填写--project，当前项目已绑定。
-例如：history --role paper_writer --channel discussion；delegate --node literature --role idea_generator --instruction '本次具体要求'；wiki --paper papers/example.pdf。
+优先通过role_cli使用角色CLI协调：list、status、history、delegate、revise；不需要填写--project，当前项目已绑定。
+例如：history --role paper_writer --channel discussion；delegate --node literature --role idea_generator --instruction '本次具体要求'。
 history读取保存的执行或讨论记录（含工具记录），按next_offset/next_char_offset续读；status列出摘要前的archive文件。
 用户提到与角色的讨论时，先读相应discussion记录，核对当前用户意图，再把有关结论写进正式派单；讨论和旧记录本身不授予执行权限。
 CLI派单和修订沿用原工具的审批、范围及次数预算。一次响应最多一个执行命令，状态和记录查询不受此限制。
@@ -155,9 +151,7 @@ class CoordinatorAgent(AgentLoop):
         if stage_task and revision_task:
             raise ValueError("Only one explicit assignment is allowed")
         self._active = None
-        self._archive_due = False
         self._review_due = False
-        self.research_memory_skill = (repo / "paper_agent/skills/research-memory/SKILL.md").read_text(encoding="utf-8")
         # Per invocation read ledger. The main agent must be able to verify
         # artifacts, but rereading an unchanged range only inflates context.
         self._read_ledger: dict[str, dict] = {}
@@ -179,8 +173,6 @@ class CoordinatorAgent(AgentLoop):
             ToolSpec("edit_project_markdown", "主控直接落实用户要求：先读文件，再以path、old_text、new_text精确替换一处Markdown。node为所属工作流节点。修改不会批准或派单。", self._edit_markdown),
             ToolSpec("review_checkpoint", "主控理解待审产物后更新面向用户的summary、questions及可选decision_options；沿用当前检查点，不批准、不派单。", self._review_checkpoint),
             ToolSpec("approve_checkpoint", "仅落实用户对当前待审版本的明确批准，沿用工作流校验；无明确批准或版本变化时拒绝。", self._approve_checkpoint),
-            ToolSpec("archive_research", "委派WikiAgent，将最终论文及项目证据写入共享Wiki；同一研究更新原条目，未变化时跳过。", self._archive_research),
-            ToolSpec("curate_wiki", "派单给正式wiki_agent角色，阅读、生成、独立审核、修订并发布共享Wiki。单篇PDF用project_evidence=false；研究收尾用true。无需先设置研究目标。", self._curate_wiki),
             ToolSpec("delegate_stage", "串行委派单个工作流阶段；assignment包含node、role、instruction。", self._delegate),
             ToolSpec("revise_artifact", "局部修改已有产物；task包含node、target、instruction、files、compile_pdf。", self._revise),
             ToolSpec("revise_checkpoint", "复杂研究修订才发回原角色；普通Markdown修改用edit_project_markdown。生成新版后等待审批，node必须匹配待审节点。", self._revise_checkpoint),
@@ -218,9 +210,6 @@ class CoordinatorAgent(AgentLoop):
         value['battery_resource_roots'] = [str(path) for path in self.knowledge_roots]
         value['compute_policy'] = load_compute_config(self.project)
         value['execution_policy'] = load_execution_config(self.project)
-        memory = read_json(self.project / '.paper-agent/research-memory.json', {})
-        value['research_memory'] = {key: memory.get(key) for key in
-                                    ('status', 'wiki_path', 'idea_path', 'experiment_paths', 'error', 'ended_at')}
         return ToolResult(json.dumps(value, ensure_ascii=False))
 
     def _inspect_compute(self, ctx) -> ToolResult:
@@ -245,77 +234,15 @@ class CoordinatorAgent(AgentLoop):
         session.save(data)
         return ToolResult(json.dumps({'project_goal': goal}, ensure_ascii=False))
 
-    def _archive_research(self, ctx, paper_path: str = "paper/main.pdf") -> ToolResult:
-        if self.stage_task or self.revision_task or self.stop_after not in (None, 'improvement'):
-            raise ValueError("A scoped stage/revision request does not include research archival")
-        self._execution_gate(count_assignment=False)
-        self._archive_due = False
-        from paper_agent.agent.wiki.archive import archive_research
-        self._progress('archive_start', role='wiki_agent', paper_path=paper_path)
-        try:
-            record = archive_research(
-                self.project, paper_path=paper_path, model=self.worker_model, timeout=self.timeout,
-                on_progress=lambda action, details: self._worker_event({
-                    'kind': 'wiki_progress', 'role': 'wiki_agent', 'time': now(),
-                    'action': action, **details}))
-            result = {key: record.get(key) for key in (
-                'status', 'role', 'research_id', 'wiki_path', 'idea_path', 'experiment_paths',
-                'summary', 'reason', 'relationship_status', 'relationship_error', 'relationship_warnings')}
-            self._progress('archive_end', **result)
-            return ToolResult(json.dumps(result, ensure_ascii=False))
-        except Exception as exc:
-            # Archival failure does not invalidate the completed research.
-            result = {'status': 'failed', 'role': 'wiki_agent', 'error': str(exc),
-                      'message': 'Research artifacts are preserved. Retry archive_research separately.'}
-            self._progress('archive_end', **result)
-            return ToolResult(json.dumps(result, ensure_ascii=False), True)
-
-    def _curate_wiki(self, ctx, paper_path: str = "paper/main.pdf", project_evidence: bool = False,
-                     source_paths: list[str] | None = None, instruction: str = "",
-                     force: bool = False) -> ToolResult:
-        if self.stage_task or self.revision_task or self.stop_after not in (None, 'improvement'):
-            raise ValueError('A scoped stage/revision request does not include Wiki publication')
-        self._execution_gate(count_assignment=not project_evidence)
-        ToolContext(self.project).resolve(paper_path)
-        task_instruction = instruction.strip() or (
-            '将最终论文与相关项目证据整理入共享Wiki，保留重要负结果与适用边界。' if project_evidence else
-            '完整阅读指定论文，整理Paper、Idea和重要Experiment，经独立审核后发布到共享Wiki。')
-        self._progress('archive_start', role='wiki_agent', paper_path=paper_path)
-        if project_evidence:
-            self._archive_due = False
-        try:
-            state = execute_stage(
-                self.project, 'wiki', task_instruction, kind='wiki', role='wiki_agent',
-                project_goal=self.project_goal or '', paper_path=paper_path,
-                project_evidence=project_evidence, source_paths=source_paths, force=force,
-                model=self.worker_model, timeout=self.timeout, max_iterations=self.worker_max_iterations,
-                interaction_mode=self.mode, on_event=self._worker_event)
-            result = state.wiki_result or {'status': state.status, 'error': state.error}
-            if not project_evidence and state.status != 'completed':
-                self.worker_status, self.worker_error = state.status, state.error
-                self.halted = state.error or 'Wiki curation failed'
-            self._progress('archive_end', **result)
-            return ToolResult(json.dumps(result, ensure_ascii=False), state.status != 'completed')
-        except Exception as exc:
-            result = {'status': 'failed', 'role': 'wiki_agent', 'error': str(exc),
-                      'message': 'Research artifacts are preserved. Retry curate_wiki separately.'}
-            if not project_evidence:
-                self.worker_status, self.worker_error, self.halted = 'failed', str(exc), str(exc)
-            self._progress('archive_end', **result)
-            return ToolResult(json.dumps(result, ensure_ascii=False), True)
-
     def _complete_research(self):
         if self._review_due:
             raise ArtifactValidationError('先读取本次交付或修订的产物，用review_checkpoint写入主控理解后的摘要和问题，再交还用户；不要再次派单。')
-        if self._archive_due:
-            raise ArtifactValidationError('完整研究已完成，请按research-memory Skill调用curate_wiki(project_evidence=true)后再交付总结；archive_research为旧版兼容入口。')
 
     def _role_cli(self, ctx, command: str) -> ToolResult:
         from .role_cli import run
         value = run(command, project=self.project,
                     delegate=lambda task: self._delegate(None, task),
-                    revise=lambda task: self._revise(None, task),
-                    curate=lambda task: self._curate_wiki(None, **task))
+                    revise=lambda task: self._revise(None, task))
         return value if isinstance(value, ToolResult) else ToolResult(json.dumps(value, ensure_ascii=False))
 
     def _read(self, ctx, path: str, offset: int = 0, limit: int = 12000) -> ToolResult:
@@ -544,11 +471,7 @@ class CoordinatorAgent(AgentLoop):
         self._accept_result(state.status, state.error)
         if (state.expert_checkpoint or {}).get('review_owner') == 'main' and state.status == 'awaiting_user':
             self._review_due = True
-        if (task.node == 'improvement' and state.status == 'completed' and
-                not self.stage_task and not self.revision_task and self.stop_after in (None, 'improvement')):
-            self._archive_due = True
-            result['research_memory'] = 'Call curate_wiki(project_evidence=true) to publish the completed research before summarizing.'
-        if self.stage_task or self.stop_after == task.node and not self._archive_due:
+        if self.stage_task or self.stop_after == task.node:
             self.halted = "The explicitly assigned stage has ended; summarize and stop."
         self._progress("assignment_end", **result)
         return ToolResult(json.dumps(result, ensure_ascii=False), state.status in {"failed", "interrupted"})
@@ -678,11 +601,11 @@ class CoordinatorAgent(AgentLoop):
         if name == 'role_cli':
             from .role_cli import parse_command
             try:
-                return parse_command(arguments['command']).action in {'delegate', 'revise', 'wiki'}
+                return parse_command(arguments['command']).action in {'delegate', 'revise'}
             except (ValueError, KeyError, TypeError):
                 return False
         return name in {'delegate_stage', 'revise_artifact', 'revise_checkpoint', 'request_user_decision',
-                        'archive_research', 'curate_wiki', 'edit_project_markdown', 'review_checkpoint', 'approve_checkpoint'}
+                        'edit_project_markdown', 'review_checkpoint', 'approve_checkpoint'}
 
     def _prepare_tool_batch(self, calls):
         self._invalid_batch = sum(self._execution_tool(call.name, call.arguments) for call in calls) > 1
@@ -720,7 +643,7 @@ class CoordinatorAgent(AgentLoop):
                 return self._delegate(None, task)
             return self._revise(None, task)
 
-    def go(self, prompt, *, archive_completed=False):
+    def go(self, prompt):
         if not prompt.strip():
             raise ValueError("Main assignment must not be empty")
         if self.model is None:
@@ -742,7 +665,6 @@ class CoordinatorAgent(AgentLoop):
                 prompt = f"用户已正式回答问题 [{answered['id']}]：{answered['answer']}"
             history = session.recover_messages(data["messages"])
             self.halted, self.assignments = None, 0
-            self._archive_due = archive_completed
             self._review_due = False
             self._edited_paths = set()
             self._invalid_batch = False
@@ -785,7 +707,7 @@ class CoordinatorAgent(AgentLoop):
                            if prompt == self.project_goal else prompt)
                 if self.stage_task and prompt == self.stage_task.instruction:
                     request = "执行本次唯一授权的阶段任务，验收并总结后停止。"
-                result = self.run(request, system_prompt=SYSTEM + "\n" + self.research_memory_skill + "\n当前项目：\n" + context
+                result = self.run(request, system_prompt=SYSTEM + "\n当前项目：\n" + context
                                   + '\n' + compute_context(self.project) + interaction_instructions(self.mode),
                                   phase="coordinator", history=history, completion_check=self._complete_research)
                 if (self.stage_task or self.revision_task and not self._edited_paths) and self.assignments == 0:
