@@ -1,7 +1,7 @@
 ---
 name: paper-figure
 description: 承接实验计划和论文计划，基于真实电池实验结果生成出版质量、可复现的图表、正式图注和 LaTeX 引用片段。
-allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, search_wiki, search_figure_references, read_battery_resource
+allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, search_wiki, read_wiki, search_figure_references, read_battery_resource
 ---
 
 # 论文图表绘制
@@ -21,11 +21,10 @@ allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, 
 
 开始前读取：
 
-1. `refine-logs/EXPERIMENT_PLAN.md`：各实验块的必做证据、图表目标、子图划分和评价协议。
-2. `PAPER_PLAN.md`：论文主张和叙事顺序。
-3. `refine-logs/FINAL_PROPOSAL.md`、实际模型代码/配置：研究任务、输入边界和已实现机制。
-4. `experiment-runs/` 执行收据、`experiments/README.md` 中的计划覆盖记录（若有）、`results/` 中的真实 JSON/CSV、逐样本预测和必要的数据缓存。
-5. 与当前研究对象匹配的图表设计指南（若有）：按需使用适用的领域表达、颜色、字体和视觉检查规范。通过 `find/read` 或 `skill_resource_read` 查找和读取，不以 Wiki 搜索无结果判定文件不存在。
+1. `PAPER_PLAN.md`：论文主张和叙事顺序。
+2. `refine-logs/FINAL_PROPOSAL.md`、实际模型代码/配置：研究任务、输入边界和已实现机制。
+3. `experiment-runs/` 执行收据、`experiments/README.md` 中的计划覆盖记录（若有）、`results/` 中的真实 JSON/CSV、逐样本预测和必要的数据缓存。
+4. 与当前研究对象匹配的图表设计指南（若有）：按需使用适用的领域表达、颜色、字体和视觉检查规范。通过 `find/read` 或 `skill_resource_read` 查找和读取，不以 Wiki 搜索无结果判定文件不存在。
 
 **计划决定内容，结果决定可画范围，指南提供视觉设计。** 
 
@@ -48,6 +47,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, 
 - 哪些图表可以根据数据自动生成
 - 需要手动创建（架构图等）
 - 哪些是比较表（生成为 LaTeX ）
+
 ### 第2步：设置绘图环境
 
 创建共享样式配置脚本：

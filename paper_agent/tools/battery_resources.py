@@ -16,6 +16,8 @@ def _json(value: Any) -> str:
 
 def _tokens(text: str) -> set[str]:
     tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_][A-Za-z0-9_-]*", text)}
+    # Dataset names often occur only in filenames such as Tongji_README.md.
+    tokens.update(part for token in tuple(tokens) for part in re.split(r'[_-]+', token) if part)
     # Chinese technical documents do not have whitespace-delimited words.
     tokens.update(char for char in text if "\u4e00" <= char <= "\u9fff")
     return tokens

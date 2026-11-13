@@ -89,4 +89,6 @@ def compute_context(project):
             'Choose and record reasonable job budgets within configured limits. '
             'Use these resources to size models, seeds and searches. Total budget includes '
             'all experiment attempts across resumes; it excludes model API time. '
+            'HPO smoke, trials and confirmation runs consume this same total, plus their '
+            'separate cumulative max_seconds allowance in the confirmed proposal hpo-policy. '
             'Inspect real device availability before execution; auto is a preference, not proof of a GPU.\n')

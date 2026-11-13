@@ -38,12 +38,46 @@ def stop_tree(process):
 
 
 def execute(run_id):
+    import threading
+    from paper_agent.agent.runtime.execution import ExecutionOwner, OWNER_ENV
+    run = rows("SELECT * FROM runs WHERE id=?", (run_id,))[0]
+    project = rows("SELECT * FROM projects WHERE id=?", (run["project_id"],))[0]
+    folder = data_root() / 'runs' / run_id
+    owner = ExecutionOwner(project['path'], folder)
+    previous = os.environ.get(OWNER_ENV)
+    os.environ[OWNER_ENV] = str(folder)
+    done = threading.Event()
+
+    def watch():
+        while not done.wait(.2):
+            if owner.cancelled():
+                owner.cancel()
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    try:
+        if owner.cancelled():
+            raise KeyboardInterrupt('Run cancelled before execution')
+        watcher.start()
+        return _execute(run_id)
+    finally:
+        done.set()
+        if watcher.ident is not None:
+            watcher.join(timeout=1)
+        if previous is None:
+            os.environ.pop(OWNER_ENV, None)
+        else:
+            os.environ[OWNER_ENV] = previous
+
+
+def _execute(run_id):
     from paper_agent.agent.workflow_cli import run_coordinated_workflow
-    from .runtime import check_runtime
+    from paper_agent.tools.experiments.executor import check_runtime
 
     run = rows("SELECT * FROM runs WHERE id=?", (run_id,))[0]
     project = rows("SELECT * FROM projects WHERE id=?", (run["project_id"],))[0]
-    from paper_agent.agent.herdr import ensure_no_pending
+    from paper_agent.agent.runtime.herdr import ensure_no_pending
     ensure_no_pending(Path(project["path"]))
     options = json.loads(run["options"])
     options.pop("message_prompt", None)
@@ -59,19 +93,13 @@ def execute(run_id):
             project, state
         ):
             raise ValueError("审阅文件已变化，请刷新后重新确认")
-        if state.get("current_node") == "refine":
-            from paper_agent.proposal_review import guard_legacy_approval
-            guard_legacy_approval(Path(project["path"]))
         # Use the same semantic revision contract as the terminal entry point.
         if answer.strip():
-            proposal_review = (state.get("expert_checkpoint") or {}).get("node") == "refine"
-            options["advance_after_revision"] = not proposal_review
             options["revise"] = (
                 "用户已回答当前节点的专家审阅问题。先读取现有报告，将回答整合到当前节点全部相关产物，"
                 "消除与回答冲突的建议，保留有效证据及用户回答以供追溯。"
                 "不得仅改报告冒充新实验结果，不得篡改执行回执；实验变更须经现有工具执行验证。"
-                + ("修订后更新方案审阅摘要，交还用户决定是否批准。" if proposal_review else
-                   "修订完成后交还主控验收。")
+                + "主控落实修改后更新审阅摘要，交还用户决定是否批准；修改意见不代表批准。"
                 + "\n当前审阅问题：\n" + "\n".join(
                     f"{index + 1}. {question}" for index, question in enumerate(
                         (state.get("expert_checkpoint") or {}).get("questions", [])
@@ -80,6 +108,7 @@ def execute(run_id):
             )
         else:
             options["continue_run"] = True
+    options["wait_for_user"] = True
     options["max_iterations"] = options.pop("max_tool_rounds", 100)
     on_event = lambda record: event(project["id"], record["kind"], record, run_id)
     if action == "proposal_revise":
@@ -99,7 +128,7 @@ def execute(run_id):
         options.pop("node_task", None)
         state = run_coordinated_workflow(root, continue_run=True, proposal_review_sha=proposal_sha,
                              stop_after="experiment_plan", on_event=on_event, **options)
-    elif action == "coordinate":
+    elif action in {"coordinate", "revise"}:
         from paper_agent.agent.coordinator import CoordinatorAgent
 
         def guard(node):
@@ -109,18 +138,12 @@ def execute(run_id):
         agent = CoordinatorAgent(Path(project["path"]), model=options.get("model"),
                                  worker_max_iterations=options["max_iterations"],
                                  timeout=options.get("timeout", 600), mode=options.get("mode") or "auto",
-                                 on_event=on_event, execution_guard=guard,
-                                 stage_task=options.get("stage_task"), revision_task=options.get("revision_task"))
+                                 on_event=on_event, execution_guard=guard, wait_for_user=True,
+                                 stage_task=options.get("stage_task"), revision_task=options.get("node_task") if action == "revise" else options.get("revision_task"))
         prompt = options["prompt"]
         state = agent.go(prompt)
         event(project["id"], "conversation_turn", {"prompt": "主控执行结果", "reply": state.final,
               "intent": "coordinator_result"}, run_id)
-    elif action == "revise":
-        from paper_agent.agent.node_task import run_node_task
-        state = run_node_task(Path(project["path"]), options["node_task"], options["prompt"],
-                              data_root() / "runs" / run_id, model=options.get("model"),
-                              timeout=options.get("timeout", 600),
-                              max_iterations=options["max_iterations"], on_event=on_event)
     else:
         options.pop("node_task", None)
         options.pop("stage_task", None)
@@ -142,6 +165,8 @@ def supervise(run_id):
     root = Path(project["path"])
     folder = data_root() / "runs" / run_id
     folder.mkdir(parents=True, exist_ok=True)
+    from paper_agent.agent.runtime.execution import ExecutionOwner
+    owner = ExecutionOwner(root, folder)
     process = None
     stopped = False
 
@@ -156,7 +181,7 @@ def supervise(run_id):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             run_update(
                 run_id,
-                status="running",
+                status="stopping" if stopped or owner.cancelled() else "running",
                 pid=os.getpid(),
                 pid_created=psutil.Process().create_time(),
             )
@@ -172,7 +197,8 @@ def supervise(run_id):
                         run_id,
                     ],
                     cwd=REPO,
-                    env=os.environ.copy(),
+                    env={**os.environ, "PAPER_AGENT_PROJECT_LOCK_FD": str(lock.fileno())},
+                    pass_fds=(lock.fileno(),),
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
@@ -182,13 +208,20 @@ def supervise(run_id):
                     if stopped or (folder / "stop").exists():
                         stopped = True
                         run_update(run_id, status="stopping")
+                        owner.cancel()
                         stop_tree(process)
                         break
                     time.sleep(0.7)
                 process.wait()
+            stopped = stopped or owner.cancelled()
+            owner.cancel()
+            unresolved = owner.settle()
             result = read_json(folder / "result.json", {})
             status = "interrupted" if stopped else result.get("status", "failed")
             error = result.get("error")
+            if unresolved:
+                status = "interrupted"
+                error = ((error + " ") if error else "") + unresolved
             if status == "failed" and not error:
                 error = f"运行进程退出（退出码 {process.returncode}），请查看运行日志。"
             run_update(run_id, status=status, finished_at=now(), error=error)
@@ -199,13 +232,16 @@ def supervise(run_id):
                 run_id,
             )
     except BaseException as exc:
+        owner.cancel()
         if process is not None and process.poll() is None:
             stop_tree(process)
-        run_update(run_id, status="failed", finished_at=now(), error=str(exc))
+        unresolved = owner.settle()
+        error = str(exc) + ((" " + unresolved) if unresolved else "")
+        run_update(run_id, status="failed", finished_at=now(), error=error)
         event(
             project["id"],
             "run_finished",
-            {"status": "failed", "error": str(exc)},
+            {"status": "failed", "error": error},
             run_id,
         )
 

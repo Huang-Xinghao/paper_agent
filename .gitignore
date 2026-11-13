@@ -1,5 +1,4 @@
 __pycache__/
-.pytest_cache/
 *.egg-info/
 .venv/
 .env
@@ -7,3 +6,16 @@ build/
 .paper-agent/pdf-figures/
 
 .paper-agent/herdr/
+
+# Local research data and generated artifacts (stored separately from Git).
+/.paper-agent/
+/.latex-env/
+/.env.swp
+/*.pdf
+/battery-rul-paper/
+/demo-project*
+/figures/
+/mineru-imoe-test/
+/papers/
+/research-wiki/
+/电池资源库/

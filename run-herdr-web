@@ -12,6 +12,6 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 runtime_python="${PAPER_AGENT_RUNTIME_PYTHON:-/data/apps/micromamba/envs/xinghao/bin/python}"
 export PAPER_AGENT_HERDR_SESSION="$1"
 # Resolve this caller in the named session before accepting Web requests.
-"$runtime_python" -c 'import os; from pathlib import Path; from paper_agent.agent.herdr import Client; p = Client(os.environ["PAPER_AGENT_HERDR_SESSION"], str(Path(os.sys.executable).with_name("herdr"))).call("pane", "current", "--current")["pane"]; assert p["pane_id"] == os.environ["HERDR_PANE_ID"], "Herdr session does not contain the caller pane"'
+"$runtime_python" -c 'import os; from pathlib import Path; from paper_agent.agent.runtime.herdr import Client; p = Client(os.environ["PAPER_AGENT_HERDR_SESSION"], str(Path(os.sys.executable).with_name("herdr"))).call("pane", "current", "--current")["pane"]; assert p["pane_id"] == os.environ["HERDR_PANE_ID"], "Herdr session does not contain the caller pane"'
 echo "Herdr session: $PAPER_AGENT_HERDR_SESSION; persistent role agents execute workflow stages."
 exec "$repo_root/run-web-api"

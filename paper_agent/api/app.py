@@ -20,13 +20,12 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .schemas import HealthView, ProjectView
+from .schemas import HealthView, ProjectView, QuestionView, QuestionAnswer
 from . import auth
 from .library import router as library_router
 from .idea_canvas import router as idea_canvas_router
-from .intent import route_message
-from .dispatch import RevisionTask, dispatch_message
-from paper_agent.agent.coordinator import StageAssignment
+from .laboratory import BtsMonitor, router as laboratory_router
+from paper_agent.agent.runtime.execution import RevisionTask, StageAssignment
 from .store import (
     REPO,
     connection,
@@ -38,7 +37,7 @@ from .store import (
     rows,
     run_update,
 )
-from paper_agent.agent.workflow_cli import WORKFLOW_NODE_NAMES
+from paper_agent.agent.stages import WORKFLOW_NODE_NAMES
 
 LABELS = [
     "文献研究",
@@ -148,11 +147,18 @@ def reconcile():
             datetime.now(timezone.utc) - datetime.fromisoformat(run["created_at"])
         ).total_seconds() < 30:
             continue
+        from paper_agent.agent.runtime.execution import ExecutionOwner
+        project = project_record(run["project_id"])
+        owner = ExecutionOwner(project["path"], data_root() / "runs" / run["id"])
+        owner.cancel()
+        unresolved = owner.settle(wait_seconds=0)
+        from paper_agent.agent.runtime.questions import UserQuestions
+        UserQuestions(project["path"]).pending()
         run_update(
             run["id"],
             status="interrupted",
             finished_at=now(),
-            error="运行管理进程已退出，可从已有节点恢复。",
+            error="运行管理进程已退出，请核查已有结果。" + (unresolved or ""),
         )
         event(run["project_id"], "run_finished", {"status": "interrupted"}, run["id"])
 
@@ -187,7 +193,19 @@ async def lifespan(_):
                     except HTTPException:
                         pass
     reconcile()
-    yield
+    from paper_agent.agent.runtime.questions import UserQuestions
+    for project in rows('SELECT path FROM projects'):
+        try:
+            root = valid_project_path(project['path'])
+        except HTTPException:
+            continue
+        UserQuestions(root).pending()
+    monitor = BtsMonitor()
+    app.state.bts_monitor = monitor
+    try:
+        yield
+    finally:
+        await monitor.close()
 
 
 app = FastAPI(
@@ -206,6 +224,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(library_router)
 app.include_router(idea_canvas_router)
+app.include_router(laboratory_router)
 
 
 @app.middleware("http")
@@ -328,6 +347,7 @@ def terminal_projects():
 
 
 def detail(project, terminal_paths=None):
+    from paper_agent.agent.runtime.questions import UserQuestions
     state = read_json(Path(project["path"]) / "workflow-state.json", {})
     runs = rows(
         "SELECT * FROM runs WHERE project_id=? ORDER BY created_at DESC LIMIT 30",
@@ -363,6 +383,7 @@ def detail(project, terminal_paths=None):
         "progress": progress,
         "runs": runs,
         "checkpoint_token": checkpoint_token(project, state),
+        "pending_questions": UserQuestions(project["path"]).pending(),
     }
 
 
@@ -434,65 +455,25 @@ def send_message(project_id: str, body: MessageCreate):
         raise HTTPException(400, "请输入消息")
     reconcile()
     project = project_record(project_id)
-    state = read_json(Path(project["path"]) / "workflow-state.json", {})
-    latest = rows("SELECT status FROM runs WHERE project_id=? ORDER BY created_at DESC LIMIT 1", (project_id,))
-    project["status"] = latest[0]["status"] if latest else state.get("status", "idle")
-    history = rows("SELECT data FROM events WHERE project_id=? AND kind='conversation_turn' ORDER BY id DESC LIMIT 8",
-                   (project_id,))
-    try:
-        decision = dispatch_message(project, body.prompt,
-                                    [json.loads(row["data"]) for row in reversed(history)], body.model)
-    except Exception:
-        raise HTTPException(503, "暂时无法判断消息意图，未启动任务。请稍后重试。") from None
-    tool = decision["tool"]
-    if tool == "reply":
-        reply = decision["reply"]
-        event(project_id, "conversation_turn", {"prompt": body.prompt, "reply": reply, "intent": "chat"})
-        return {"intent": "chat", "reply": reply}
-    arguments = decision["arguments"]
-    if tool == "run_workflow":
-        if state:
-            raise HTTPException(409, "此项目已有研究成果；新研究请新建项目，修改现有成果请说明目标")
-        request = RunCreate(action="coordinate", prompt=body.prompt + "\n任务上下文：\n" + arguments["instruction"],
-                            mode=body.mode, model=body.model)
-    elif tool == "resume_workflow":
-        if state.get("status") not in {"failed", "running", "interrupted", "awaiting_results"}:
-            raise HTTPException(409, "没有可恢复的失败或中断任务；请说明需要修改的具体产物")
-        request = RunCreate(action="coordinate", prompt=body.prompt, mode=body.mode, model=body.model)
-    elif tool == "revise_artifact":
-        request = RunCreate(action="coordinate", prompt=body.prompt, revision_task=arguments, model=body.model)
-    elif tool == "delegate_stage":
-        request = RunCreate(action="coordinate", prompt=body.prompt, stage_task=arguments,
-                            mode=body.mode, model=body.model)
-    else:
-        raise HTTPException(503, "无效的调度结果，未启动任务")
-    result = create_run(project_id, request, route_initial=False, message_prompt=body.prompt)
-    event(project_id, "conversation_turn", {"prompt": body.prompt, "reply": "任务已提交。",
-          "intent": tool, "run_id": result["id"]})
-    event(project_id, "message_dispatched", {"tool": tool, **arguments}, result["id"])
+    active = rows("SELECT id,status FROM runs WHERE project_id=? AND status IN ('queued','running','stopping')", (project_id,))
+    if active:
+        from paper_agent.agent.runtime.questions import UserQuestions
+        root = Path(project['path'])
+        reply = '主控正在处理当前任务；本条消息未提交执行。请查看当前进度，待任务结束后再发送修改要求。'
+        return {'intent': 'status', 'reply': reply, 'accepted': False, 'run_id': active[0]['id'],
+                'status': active[0]['status'], 'progress': read_json(root / 'workflow-progress.json', {}),
+                'pending_questions': UserQuestions(root).pending()}
+    result = create_run(project_id, RunCreate(action='coordinate', prompt=body.prompt,
+                        mode=body.mode, model=body.model), message_prompt=body.prompt)
+    event(project_id, 'conversation_turn', {'prompt': body.prompt, 'reply': '已交给主控处理。',
+          'intent': 'coordinate', 'run_id': result['id']})
     return JSONResponse(result, status_code=202)
 
 
-def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_prompt=None):
+def create_run(project_id: str, body: RunCreate, *, message_prompt=None):
     project = project_record(project_id)
-    initial_state = read_json(Path(project["path"]) / "workflow-state.json", {})
-    if route_initial and body.action == "start" and not initial_state:
-        if not body.prompt.strip():
-            raise HTTPException(400, "请输入研究目标或问题")
-        history = rows(
-            "SELECT data FROM events WHERE project_id=? AND kind='conversation_turn' ORDER BY id DESC LIMIT 8",
-            (project_id,),
-        )
-        try:
-            decision = route_message(body.prompt, [json.loads(row["data"]) for row in reversed(history)], body.model)
-        except Exception:
-            raise HTTPException(503, "暂时无法判断请求意图，未启动研究。请稍后重试。") from None
-        if decision["intent"] != "research":
-            turn = {"prompt": body.prompt, "reply": decision["reply"], "intent": decision["intent"]}
-            event(project_id, "conversation_turn", turn)
-            return JSONResponse({"intent": decision["intent"], "reply": decision["reply"]}, status_code=200)
-        body = body.model_copy(update={"prompt": decision["research_prompt"],
-                                     **({"action": "coordinate"} if not body.start_node and not body.stop_after else {})})
+    if body.action == 'start' and not body.start_node and not body.stop_after:
+        body = body.model_copy(update={'action': 'coordinate'})
     reconcile()
     terminal_paths = terminal_projects()
     registered_paths = {item["path"] for item in rows("SELECT path FROM projects")}
@@ -511,7 +492,7 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
         state = read_json(Path(project["path"]) / "workflow-state.json", {})
         options = body.model_dump(exclude_none=True)
         if (state.get("status") == "awaiting_user" and state.get("current_node") == "refine"
-                and body.action not in {"review", "proposal_revise", "proposal_approve"}):
+                and body.action not in {"review", "proposal_revise", "proposal_approve", "coordinate", "revise"}):
             raise HTTPException(409, "最终方案待审阅，请先提交修改意见或批准方案")
         if message_prompt is not None:
             options["message_prompt"] = message_prompt
@@ -538,8 +519,6 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
         elif body.action == "coordinate":
             if not body.prompt.strip():
                 raise HTTPException(400, "请输入主控任务")
-            if state.get("status") == "awaiting_user":
-                raise HTTPException(409, "请先通过审阅入口确认当前检查点")
         elif body.action == "revise":
             if not state:
                 raise HTTPException(409, "项目尚无产物，请先开始研究")
@@ -557,7 +536,7 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
                 raise HTTPException(409, "项目没有待审阅检查点")
             if body.checkpoint_token != checkpoint_token(project, state):
                 raise HTTPException(409, "报告或检查点已变化，请刷新后重新确认")
-            if state.get("current_node") == "refine":
+            if state.get("current_node") == "refine" and not (body.answer or '').strip():
                 from paper_agent.proposal_review import guard_legacy_approval
                 try:
                     guard_legacy_approval(Path(project["path"]))
@@ -635,20 +614,58 @@ def create_run(project_id: str, body: RunCreate, *, route_initial=True, message_
     return {"id": identifier, "status": "queued"}
 
 
+@app.get("/api/projects/{project_id}/questions", response_model=list[QuestionView])
+def list_questions(project_id: str):
+    from paper_agent.agent.runtime.questions import UserQuestions
+    return UserQuestions(project_record(project_id)['path']).pending()
+
+
+@app.post("/api/projects/{project_id}/questions/{question_id}/answer")
+def answer_question(project_id: str, question_id: str, body: QuestionAnswer):
+    from paper_agent.agent.runtime.questions import UserQuestions
+    reconcile()
+    project = project_record(project_id)
+    questions = UserQuestions(project['path'])
+    # Serialize against stop requests without creating a new coordinator turn.
+    with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        stopping = db.execute("SELECT id FROM runs WHERE project_id=? AND status='stopping'",
+                              (project_id,)).fetchone()
+        if stopping:
+            raise HTTPException(409, '任务正在停止，本次回答未提交')
+        try:
+            question = questions.read(question_id)
+            if not question.get('live'):
+                raise ValueError('原提问未保持运行，请在主控核查结果后继续')
+            value = questions.answer(question_id, body.answer, task_id=body.task_id)
+        except FileNotFoundError:
+            raise HTTPException(404, '问题不存在或不属于此项目') from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+    event(project_id, 'user_answer_submitted', {'question_id': question_id,
+          'task_id': value['task_id'], 'role': value['role']})
+    return {'status': 'answered', 'question_id': question_id, 'task_id': value['task_id']}
+
+
 @app.post("/api/projects/{project_id}/stop", status_code=202)
 def stop_run(project_id: str):
-    project_record(project_id)
-    active = rows(
-        "SELECT * FROM runs WHERE project_id=? AND status IN ('queued','running','stopping')",
-        (project_id,),
-    )
-    if not active:
-        raise HTTPException(409, "没有运行中的任务")
-    run = active[0]
-    (data_root() / "runs" / run["id"] / "stop").touch()
-    run_update(run["id"], status="stopping")
-    event(project_id, "stop_requested", {}, run["id"])
-    return {"status": "stopping"}
+    from paper_agent.agent.runtime.execution import ExecutionOwner
+    project = project_record(project_id)
+    with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        run = db.execute(
+            "SELECT * FROM runs WHERE project_id=? AND status IN ('queued','running','stopping')",
+            (project_id,),
+        ).fetchone()
+        if run is None:
+            raise HTTPException(409, '没有运行中的任务')
+        folder = data_root() / 'runs' / run['id']
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'stop').touch()
+        ExecutionOwner(project['path'], folder).cancel()
+        db.execute("UPDATE runs SET status='stopping' WHERE id=?", (run['id'],))
+    event(project_id, 'stop_requested', {}, run['id'])
+    return {'status': 'stopping'}
 
 
 @app.get("/api/projects/{project_id}/files")

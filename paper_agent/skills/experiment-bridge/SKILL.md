@@ -9,6 +9,7 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 
 本节点实现代码，并调用本地 `run-experiment` 子 skill 的检查与运行工具；完成后，直接交给 `paper_plan`。
 `run_experiments` 是内部工具，不是需要用户单独启动的后续节点。
+
 ## Inputs
 
 本节点读取以下输入：
@@ -16,11 +17,9 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 1. **`refine-logs/EXPERIMENT_PLAN.md`**：实验类别、数据划分、实验设置及计划产物，是实现实验的主要依据。
 2. **`refine-logs/EXPERIMENT_TRACKER.md`**：runner 自动生成的块级进度视图，一块一行，仅供查看；具体 jobs 和依赖以 manifest 为准。
 3. **`refine-logs/FINAL_PROPOSAL.md`**：研究任务、方法定义和关键机制，用于确认代码实际实现的内容。
-4. **项目内基础模板**：读取项目已准备的参考代码和配置，在适合当前任务的模板上修改和扩展，例如 `experiments/BatteryLife/` 或 `experiments/bamboo_mixer/`。模板由当前项目的研究对象、计划和实际目录决定。
+4. **项目内基础模板（可选）**：读取项目已准备的参考代码和配置，在适合当前任务的模板上修改和扩展，例如 `experiments/BatteryLife/` 或 `experiments/bamboo_mixer/`。模板由当前项目的研究对象、计划和实际目录决定。
 6. **资源库的数据登记信息**：真实数据路径、字段及数据集说明。
-   同时读取 `data-search/DATA_REPORT.md`（若有），利用数据包及配套文件索引定位标签、元数据、划分和加载代码；未在电芯子目录找到标签不能据此判断数据包缺失标签。
-
-
+   同时读取 `data-search/DATA_REPORT.md`，利用数据包及配套文件索引定位标签、元数据、划分和加载代码；未在电芯子目录找到标签不能据此判断数据包缺失标签。
 
 ## Workflow
 
@@ -50,6 +49,7 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 4. **追踪评估与产物**：确认权重和预处理参数重载、真实标签来源、指标计算、测试路径及输出位置；涉及生成任务时核对条件和输出定义。
 5. **建立计划到代码的映射**：逐项记录数据、split、标签、模型、训练、指标和变体对应的实际文件与入口，以及哪些复用、修改或新增，再开始编码。
 
+如果用户提供代码模版或存在研究基础，尽可能的复用已有代码，避免重复实现。若计划中有未实现的部分，先在基础模板上补充实现。
 
 ### Phase 3: Implement Experiments on the Base Template
 
@@ -94,7 +94,7 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 
 实验完成后：
 
-1. **解析输出文件** ( JSON/CSV/logs ) 以获得关键指标
+1. **解析输出文件** 以获得关键指标
 2. **训练质量检查** — 读取训练日志和保存的指标，检查 NaN、发散、停滞或过拟合；已有 W&B 配置时可结合其记录，不要求额外服务。
 3. **读取 `refine-logs/EXPERIMENT_TRACKER.md`** — runner 按 D/B 块自动汇总进度，不要手动编辑；未部署块仍会保留。
 4. **检查 EXPERIMENT_PLAN.md 的成功标准** — 每个实验是否都达到了标准？
@@ -148,7 +148,6 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 结果：refine-logs/EXPERIMENT_RESULTS.md
 追踪器：refine-logs/EXPERIMENT_TRACKER.md
 ```
-
 
 交接前重新读取完整实验计划，核对必做项 X/Y、条件跳过及可选项；核对 runner 生成的 tracker，并更新结果摘要；不要手动改写 tracker。
 每个原计划图/子图的证据都要能指向实际产物，或明确指出尚缺什么。必做缺口不能留给 paper_plan 静默删减。

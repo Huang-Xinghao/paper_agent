@@ -12,7 +12,7 @@ from paper_agent.agent.model_client import ModelClient, load_env_file
 from paper_agent.proposal_review import (
     CANVAS, PROPOSAL, RECORD, CanvasDraft, RevisionResult, atomic_bytes,
     draft_hash, json_bytes, load_draft, load_record, owned_path, sha,
-    source_titles, write_group,
+    render_proposal, source_titles, write_group,
 )
 from .store import REPO
 
@@ -20,6 +20,8 @@ SYSTEM = """你是研究方案修订 Agent。只修订方案，不执行研究�
 用户会集中提交修改后的方案摘要、正文、方法图和补充意见。你必须依据原提案、上一轮统一方案及本轮人工修改，
 分析语义关联影响，生成一份完整、内部一致、可再次审阅的方案。保留未受影响的事实、引用、公式、证据和约束；
 不得用短摘要替代完整方法，也不得擅自改掉用户已经决定的研究目标或捏造新证据。
+原方案包含 hpo-policy 时，在相应 section.details 中保留完整 JSON 围栏，只按用户意见调整模型结构、搜索范围和预算；
+取消寻优应明确写 enabled=false 及 reason，不得直接省略该配置。
 wikiEvidence 是按当前 Wiki 版本重新检查的历史依据。stale/unavailable/insufficient 不能用作新增主张的支持；
 来源未变也须根据本轮用户修改重判适用条件。没有支持的新主张标为假设，关键证据缺口放入 questions。
 引文存在和来源版本一致不等于科学结论已经验证。
@@ -108,6 +110,10 @@ def run_revision(root, expected_sha, run_id, folder, *, model=None, timeout=600,
     revised = CanvasDraft(version=1, sourceHash=incoming.sourceHash, nodes=result.nodes,
                           edges=result.edges, review=result.review,
                           changes=[*incoming.changes, f"Agent 统一修订：{result.summary[:400]}"][-100:])
+    from paper_agent.tools.experiments.search import parse_policy
+    revised_policy = parse_policy(render_proposal(revised))
+    if parse_policy(source) is not None and revised_policy is None:
+        raise ValueError("修订遗漏 hpo-policy；请保留寻优范围和预算，取消时明确写 enabled=false 及 reason")
     content = json_bytes(revised.model_dump())
     if len(content) > 2 * 1024 * 1024:
         raise ValueError("修订方案超过 2 MiB，草稿未覆盖")

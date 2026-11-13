@@ -556,7 +556,7 @@ def ingest_paper(wiki_root: str, *, arxiv_id: str = "", title: str = "",
                  tags: list[str] | None = None,
                  update_on_exist: bool = False,
                  prefetched_meta: dict | None = None,
-                 refresh_indexes: bool = True) -> Path:
+                 refresh_indexes: bool = True, slug: str = "") -> Path:
     """Canonical paper-ingest entrypoint.
 
     Preferred: pass --arxiv-id and let the helper fetch metadata. If the
@@ -564,8 +564,9 @@ def ingest_paper(wiki_root: str, *, arxiv_id: str = "", title: str = "",
     title/authors/year/venue manually; doi is optional.
 
     Always:
-      - slugs the title (author + year + keyword)
-      - dedups by arxiv_id first, then by slug — `update_on_exist=False`
+      - slugs the title (author + year + keyword), unless a stable slug is supplied
+      - dedups by arxiv_id first, then by slug (explicit slugs own their identity)
+        — `update_on_exist=False`
         skips rewriting an existing page
       - creates papers/<slug>.md with the schema from research-wiki SKILL.md
       - rebuilds index.md
@@ -576,6 +577,8 @@ def ingest_paper(wiki_root: str, *, arxiv_id: str = "", title: str = "",
         raise RuntimeError(f"{root} is not an initialized wiki (papers/ missing). "
                            f"Run `init` first.")
 
+    if slug and (not re.fullmatch(r"[\w.-]+", slug) or slug in {".", ".."}):
+        raise ValueError("invalid paper slug")
     tags = tags or []
     authors = authors or []
 
@@ -583,7 +586,7 @@ def ingest_paper(wiki_root: str, *, arxiv_id: str = "", title: str = "",
     existing: Path | None = None  # populated when we find a prior page (by arxiv or slug)
     if arxiv_id:
         aid = _normalize_arxiv_id(arxiv_id)
-        existing = _find_existing_page_by_arxiv(root, aid)
+        existing = _find_existing_page_by_arxiv(root, aid) if not slug else None
         if existing and not update_on_exist:
             # Contract §3: every activation leaves a receipt. Log the skip
             # so a repeated hook invocation is still observable.
@@ -629,7 +632,7 @@ def ingest_paper(wiki_root: str, *, arxiv_id: str = "", title: str = "",
         meta["doi"] = doi
 
     author_last = _last_name(meta["authors"][0]) if meta.get("authors") else ""
-    slug = slugify(meta["title"], author_last, meta.get("year", 0))
+    slug = slug or slugify(meta["title"], author_last, meta.get("year", 0))
 
     # If we already found a prior page by arXiv-id dedup, reuse its path and
     # slug even if the newly-computed slug differs (e.g., title metadata
@@ -715,20 +718,40 @@ _CLAIM_STATUSES = {
 }
 
 
-def _claim_slugify(name: str, slug: str = "") -> str:
-    """Slug for a claim page.
-
-    A claim usually already carries a stable human ID (e.g. ``b1-main-ub``);
-    if the caller passes ``--slug`` we honor it verbatim (lower-cased, sanitized)
-    so cross-references in proofs stay stable. Otherwise we fall back to the
-    paper slugifier's keyword extraction on the claim name.
-    """
+def _entity_slug(name: str, slug: str = "", *, fallback: str) -> str:
+    """Honor a sanitized explicit slug, otherwise derive it from the entity name."""
     if slug:
-        s = re.sub(r"[^a-z0-9._-]+", "-", slug.strip().lower()).strip("-")
-        if s:
-            return s
-    # No explicit slug: reuse the title keyword extractor (no author/year).
-    return slugify(name).lstrip("_").lstrip("0").strip("_") or "claim"
+        cleaned = re.sub(r"[^a-z0-9._-]+", "-", slug.strip().lower()).strip("-")
+        if cleaned:
+            return cleaned
+    return slugify(name).lstrip("_").lstrip("0").strip("_") or fallback
+
+
+def _quarantine_fields(root: Path, kind: str, node_id: str, **fields) -> dict:
+    """Clean model-authored fields and preserve raw flagged values in the audit log."""
+    slug = node_id.partition(":")[2]
+    cleaned, hits = {}, []
+    for field, value in fields.items():
+        if not value:
+            cleaned[field] = value
+            continue
+        cleaned[field], findings = quarantine(value, scope="strict", label=f"{kind} {slug}.{field}")
+        if findings:
+            hits.append((field, findings, value))
+    if hits:
+        qlog = root / "graph" / "quarantine.log"
+        qlog.parent.mkdir(parents=True, exist_ok=True)
+        with qlog.open("a", encoding="utf-8") as stream:
+            for field, findings, raw in hits:
+                stream.write(json.dumps({
+                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    kind: node_id, "field": field,
+                    "findings": findings, "raw_text": raw,
+                }, ensure_ascii=False) + "\n")
+        print(f"⚠️  {kind} field(s) quarantined "
+              f"({', '.join(field for field, _, _ in hits)}); placeholder persisted, "
+              "raw text preserved in graph/quarantine.log for review.", file=sys.stderr)
+    return cleaned
 
 
 def _render_claim_page(slug: str, name: str, description: str, status: str,
@@ -826,7 +849,7 @@ def add_claim(wiki_root: str, slug: str, name: str, *, description: str = "",
                            f"Valid: {sorted(_CLAIM_STATUSES)}")
 
     tags = tags or []
-    slug = _claim_slugify(name, slug)
+    slug = _entity_slug(name, slug, fallback="claim")
     node_id = f"claim:{slug}"
 
     page_path = root / "claims" / f"{slug}.md"
@@ -841,35 +864,12 @@ def add_claim(wiki_root: str, slug: str, name: str, *, description: str = "",
     # re-read into agent context via index): same Layer-1 injection
     # hygiene as edge evidence above. Placeholder persists; raw text goes to
     # graph/quarantine.log for human review — nothing silently dropped.
-    _q_hits = []
-
-    def _q(val, field):
-        if not val:
-            return val
-        safe, findings = quarantine(val, scope="strict",
-                                    label=f"claim {slug}.{field}")
-        if findings:
-            _q_hits.append((field, findings, val))
-        return safe
-
-    description = _q(description, "description")
-    statement = _q(statement, "statement")
-    scope = _q(scope, "scope")
-    evidence = _q(evidence, "evidence")
-    if _q_hits:
-        qlog = root / "graph" / "quarantine.log"
-        qlog.parent.mkdir(parents=True, exist_ok=True)
-        with open(qlog, "a", encoding="utf-8") as f:
-            for field, findings, raw in _q_hits:
-                f.write(json.dumps({
-                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "claim": node_id, "field": field,
-                    "findings": findings, "raw_text": raw,
-                }, ensure_ascii=False) + "\n")
-        print(f"⚠️  claim field(s) quarantined "
-              f"({', '.join(f for f, _, _ in _q_hits)}); placeholder persisted, "
-              f"raw text preserved in graph/quarantine.log for review.",
-              file=sys.stderr)
+    fields = _quarantine_fields(root, "claim", node_id, description=description,
+                                statement=statement, scope=scope, evidence=evidence)
+    description = fields["description"]
+    statement = fields["statement"]
+    scope = fields["scope"]
+    evidence = fields["evidence"]
 
     rendered = _render_claim_page(slug, name, description, status, provenance,
                                   statement, scope, evidence, tags)
@@ -940,14 +940,6 @@ _IDEA_OUTCOMES = {
 _IDEA_STAGES = {"proposed", "active", "piloted", "archived"}
 
 
-def _idea_slugify(name: str, slug: str = "") -> str:
-    """Slug for an idea page (mirrors _claim_slugify): honor an explicit --slug
-    verbatim (sanitized), else fall back to the title keyword extractor."""
-    if slug:
-        s = re.sub(r"[^a-z0-9._-]+", "-", slug.strip().lower()).strip("-")
-        if s:
-            return s
-    return slugify(name).lstrip("_").lstrip("0").strip("_") or "idea"
 
 
 def _render_idea_page(slug, title, description, stage, outcome, thesis,
@@ -1026,7 +1018,7 @@ def upsert_idea(wiki_root: str, slug: str, title: str, *, description: str = "",
                            f"Valid: {sorted(_IDEA_STAGES)}")
 
     tags = tags or []
-    slug = _idea_slugify(title, slug)
+    slug = _entity_slug(title, slug, fallback="idea")
     node_id = f"idea:{slug}"
 
     page_path = root / "ideas" / f"{slug}.md"
@@ -1041,34 +1033,11 @@ def upsert_idea(wiki_root: str, slug: str, title: str, *, description: str = "",
     # context via index) — same Layer-1 injection hygiene as add_claim.
     # Title is structural (not quarantined, like add_claim's name). Placeholder
     # persists; raw text → graph/quarantine.log for human review.
-    _q_hits = []
-
-    def _q(val, field):
-        if not val:
-            return val
-        safe, findings = quarantine(val, scope="strict",
-                                    label=f"idea {slug}.{field}")
-        if findings:
-            _q_hits.append((field, findings, val))
-        return safe
-
-    description = _q(description, "description")
-    thesis = _q(thesis, "thesis")
-    structure = _q(structure, "structure")
-    if _q_hits:
-        qlog = root / "graph" / "quarantine.log"
-        qlog.parent.mkdir(parents=True, exist_ok=True)
-        with open(qlog, "a", encoding="utf-8") as f:
-            for field, findings, raw in _q_hits:
-                f.write(json.dumps({
-                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "idea": node_id, "field": field,
-                    "findings": findings, "raw_text": raw,
-                }, ensure_ascii=False) + "\n")
-        print(f"⚠️  idea field(s) quarantined "
-              f"({', '.join(f for f, _, _ in _q_hits)}); placeholder persisted, "
-              f"raw text preserved in graph/quarantine.log for review.",
-              file=sys.stderr)
+    fields = _quarantine_fields(root, "idea", node_id, description=description,
+                                thesis=thesis, structure=structure)
+    description = fields["description"]
+    thesis = fields["thesis"]
+    structure = fields["structure"]
 
     def _warn_if_dangling(nid: str) -> None:
         if not nid:
@@ -1201,35 +1170,12 @@ def add_experiment(wiki_root: str, slug: str, *, title: str = "", idea: str = ""
 
     # Quarantine model-authored body fields (re-read into context) — same hygiene
     # as add_claim / upsert_idea. Enum + structural fields are not quarantined.
-    _q_hits = []
-
-    def _q(val, field):
-        if not val:
-            return val
-        safe, findings = quarantine(val, scope="strict",
-                                    label=f"experiment {slug}.{field}")
-        if findings:
-            _q_hits.append((field, findings, val))
-        return safe
-
-    question = _q(question, "question")
-    hypothesis = _q(hypothesis, "hypothesis")
-    protocol = _q(protocol, "protocol")
-    results = _q(results, "results")
-    if _q_hits:
-        qlog = root / "graph" / "quarantine.log"
-        qlog.parent.mkdir(parents=True, exist_ok=True)
-        with open(qlog, "a", encoding="utf-8") as f:
-            for field, findings, raw in _q_hits:
-                f.write(json.dumps({
-                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "experiment": node_id, "field": field,
-                    "findings": findings, "raw_text": raw,
-                }, ensure_ascii=False) + "\n")
-        print(f"⚠️  experiment field(s) quarantined "
-              f"({', '.join(f for f, _, _ in _q_hits)}); placeholder persisted, "
-              f"raw text preserved in graph/quarantine.log for review.",
-              file=sys.stderr)
+    fields = _quarantine_fields(root, "experiment", node_id, question=question,
+                                hypothesis=hypothesis, protocol=protocol, results=results)
+    question = fields["question"]
+    hypothesis = fields["hypothesis"]
+    protocol = fields["protocol"]
+    results = fields["results"]
 
     if was_update and preserve_notes:
         rendered = page_path.read_text(encoding="utf-8")

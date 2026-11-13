@@ -8,6 +8,8 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from paper_agent.storage import read_json_or_default as read_json
+
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -88,8 +90,3 @@ def run_update(run_id, **values):
         )
 
 
-def read_json(path, default=None):
-    try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError, OSError):
-        return default

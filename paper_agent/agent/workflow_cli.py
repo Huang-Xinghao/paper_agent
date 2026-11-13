@@ -3,37 +3,84 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import os
+import re
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from .loop import PhaseAgent
 from .workflow import IdeaNodeConfig, WorkflowConfig, WorkflowRunner, WorkflowState
+from .stages import BY_NODE, NEXT_NODE, WORKFLOW_NODE_NAMES
+from paper_agent.storage import write_json as _write_json
+from paper_agent.storage import read_json_or_default as read_json
 
-WORKFLOW_NODE_NAMES = (
-    "literature", "data_search", "ideas", "refine",
-    "experiment_plan", "experiment_bridge",
-    "paper_plan", "paper_figure", "paper_write",
-    "paper_compile", "improvement",
-)
 
-def _write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+def is_approval(value):
+    """Accept standalone approval replies, not questions or qualified consent."""
+    value = re.sub(r'[\s，,。！!；;、]+', '', value)
+    return bool(re.fullmatch(
+        r'(?:(?:批准|同意)(?:(?:当前|推荐|这个|该)?方案)?'
+        r'(?:并?(?:继续|开始|进入)(?:运行|执行|实验规划|下一步|下一阶段)?)?'
+        r'|可以的?(?:开始|继续)(?:运行|执行)?)', value))
+
+
+def checkpoint_snapshot(project):
+    from paper_agent.agent.runtime.herdr import _read
+    project = Path(project).resolve()
+    state_path = project / 'workflow-state.json'
+    state = _read(state_path) or {}
+    checkpoint = state.get('expert_checkpoint') or {}
+    if state.get('status') != 'awaiting_user' or checkpoint.get('status') != 'pending':
+        return None
+    report = (project / checkpoint['report']).resolve()
+    if not report.is_relative_to(project) or not report.is_file():
+        raise ValueError('检查点报告不存在或位于项目之外')
+    from paper_agent.agent.runtime.artifacts import node_files
+    files = set(checkpoint.get('files', [checkpoint['report']]))
+    files.update(node_files(project, state['current_node']))
+    return {'state_sha256': hashlib.sha256(state_path.read_bytes()).hexdigest(),
+            'report': checkpoint['report'],
+            'report_sha256': hashlib.sha256(report.read_bytes()).hexdigest(),
+            'files': {name: hashlib.sha256((project / name).read_bytes()).hexdigest()
+                      for name in files
+                      if (project / name).resolve().is_relative_to(project) and (project / name).is_file()}}
+
+
+def approve_checkpoint(project, expected):
+    """Use the workflow's approval validator while excluding active stage writes."""
+    import fcntl
+    from types import SimpleNamespace
+    from paper_agent.agent.runtime.herdr import ensure_no_pending, directory, _read
+    from paper_agent.agent.runtime.execution import project_write_lock
+    from paper_agent.agent.workflow import WorkflowRunner, WorkflowState
+    project = Path(project).resolve()
+    root = directory(project)
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / 'transport.lock').open('a') as transport, project_write_lock(project):
+        fcntl.flock(transport, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ensure_no_pending(project)
+        if expected is None:
+            raise ValueError('没有可批准的待审版本')
+        if 'files' not in expected:
+            raise ValueError('终端代码已更新，请先重启 Main，查看新版产物后再批准')
+        if checkpoint_snapshot(project) != expected:
+            raise ValueError('方案或检查点已变化，本次未批准；请查看最新方案后再确认')
+        state = WorkflowState.from_dict(_read(project / 'workflow-state.json'))
+        node = state.current_node
+        # A stage executor's stop_after is not the user's overall stop boundary.
+        stop_after = state.workflow_stop_after
+        if node == 'refine' and stop_after is None:
+            stop_after = 'experiment_plan'  # Proposal approval authorizes planning.
+        state.expert_checkpoint['stop_after'] = stop_after
+        state = WorkflowRunner(SimpleNamespace(project=project)).resume_checkpoint(state)
+        _write_json(project / 'workflow-state.json', state.to_dict())
+        return state, stop_after
 
 
 def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
@@ -48,6 +95,11 @@ def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
                  model: str | None = None,
                  role: str | None = None,
                  instruction: str = "",
+                 execution: dict | None = None,
+                 finalize_stage: str | None = None,
+                 workflow_stop_after: str | None = None,
+                 approve_revision: bool = False,
+                 review_by_main: bool = False,
                  paper_review_timeout: float | None = None,
                  paper_review_round2_timeout: float | None = None,
                  on_event: Callable[[dict[str, Any]], None] | None = None) -> WorkflowState:
@@ -157,6 +209,8 @@ def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
     runner_options = {"config": config} if config is not None else {}
     if idea_config is not None:
         runner_options["idea_config"] = idea_config
+    if review_by_main:
+        runner_options['review_by_main'] = True
     runner = WorkflowRunner(agent, on_node_start=on_node_start, on_node_end=on_node_end,
                             on_node_progress=on_node_progress,
                             **runner_options)
@@ -185,6 +239,15 @@ def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
         progress["status"] = "failed"
         event("workflow_error", error=str(exc))
         raise
+    if finalize_stage:
+        if revise is not None and approve_revision and finalize_stage != 'refine' and state.status == 'awaiting_user':
+            state.expert_checkpoint['stop_after'] = workflow_stop_after
+            state = runner.resume_checkpoint(state)
+            if state.status == 'running':
+                state.status = 'completed'
+        state.workflow_stop_after = workflow_stop_after
+        if execution:
+            state.node_results.setdefault(finalize_stage, {})['execution'] = execution
     _write_json(project / "workflow-state.json", state.to_dict())
     progress["status"] = state.status
     progress["paper_status"] = state.paper_status
@@ -204,19 +267,52 @@ def execute_stage(project: Path, node: str, instruction: str, *, role: str, proj
     return _run_workflow(project, "" if revise is not None else project_goal,
                          instruction=instruction,
                          start_node=None if revise is not None else node,
-                         stop_after=node, role=role, revise=revise, **options)
+                         stop_after=node, role=role, revise=revise, finalize_stage=node, **options)
+
+
+def refresh_revision_checkpoint(project, node, project_goal=None):
+    from .workflow import WorkflowRunner
+    saved = read_json(project / 'workflow-state.json', {})
+    checkpoint = saved.get('expert_checkpoint') or {}
+    was_approved = any(item.get('event') == 'expert_approved' and item.get('node') == node
+                       for item in saved.get('history', []))
+    supersedes_pending = (saved.get('status') == 'awaiting_user'
+                          and checkpoint.get('node') in WORKFLOW_NODE_NAMES
+                          and WORKFLOW_NODE_NAMES.index(node) < WORKFLOW_NODE_NAMES.index(checkpoint['node']))
+    if not (node == 'refine' or checkpoint.get('node') == node or was_approved or supersedes_pending):
+        return False
+    files = WorkflowRunner._review_files(node)
+    report = project / files[0]
+    if not report.is_file():
+        raise ValueError('修订后缺少检查点主产物')
+    saved.update(status='awaiting_user', current_node=node, error=None)
+    saved.setdefault('mode', 'auto')
+    saved.setdefault('run_id', uuid4().hex)
+    saved.setdefault('project_goal', project_goal or '')
+    saved['expert_checkpoint'] = {
+        'node': node, 'status': 'pending', 'report': files[0], 'files': files,
+        'report_sha256': hashlib.sha256(report.read_bytes()).hexdigest(),
+        'next_node': NEXT_NODE[node],
+        'stop_after': checkpoint.get('stop_after', saved.get('workflow_stop_after')),
+        'summary': '已按修改意见更新产物。请审阅新版后明确批准。',
+        'questions': [], 'revision_id': uuid4().hex,
+        **({'hpo_policy': True} if node == 'refine' and saved['mode'] == 'auto' else {}),
+    }
+    _write_json(project / 'workflow-state.json', saved)
+    return True
 
 
 def run_coordinated_workflow(project: Path, prompt: str = "", *, start_node=None,
                              stop_after=None, mode=None, continue_run=False, revise=None, resume_run=False,
-                             advance_after_revision=False, proposal_review_sha=None,
+                             proposal_review_sha=None,
                              model=None, max_iterations=100, timeout=300, on_event=None,
-                             execution_guard=None, **workflow_options):
+                             execution_guard=None, wait_for_user=False, **workflow_options):
     """All user-facing advancement goes through main; runner only supplies stages."""
     from types import SimpleNamespace
     from .coordinator import CoordinatorAgent
-    from .role_sessions import PHASE_ROLES
 
+    if "advance_after_revision" in workflow_options:
+        raise TypeError("advance_after_revision is not supported here; revised artifacts require approval")
     project = project.resolve()
     if stop_after is not None and stop_after not in WORKFLOW_NODE_NAMES:
         raise ValueError("unknown workflow node")
@@ -241,6 +337,11 @@ def run_coordinated_workflow(project: Path, prompt: str = "", *, start_node=None
             saved = runner.resume_checkpoint(saved, proposal_review_sha=proposal_review_sha)
             _write_json(path, saved.to_dict())
             if saved.status == "completed":
+                if saved.current_node == 'improvement':
+                    CoordinatorAgent(project, model=model, timeout=timeout, mode=saved.mode,
+                                     on_event=on_event, wait_for_user=wait_for_user).go(
+                        '最终修订产物已正式批准，完整研究已完成。调用 curate_wiki(project_evidence=true) 沉淀成果后总结。',
+                        archive_completed=True)
                 return saved
         start_node = saved.current_node
         prompt = revise if revise is not None else saved.project_goal
@@ -262,20 +363,31 @@ def run_coordinated_workflow(project: Path, prompt: str = "", *, start_node=None
     if node not in WORKFLOW_NODE_NAMES or (stop_after and stop_after not in WORKFLOW_NODE_NAMES):
         raise ValueError("unknown workflow node")
     mode = mode or (saved.mode if saved else "auto")
+    if revise is not None:
+        # Feedback is a main conversation, not an implicit role assignment or
+        # approval. Main can edit MD itself or delegate a substantive revision.
+        agent = CoordinatorAgent(project, model=model, worker_max_iterations=max_iterations,
+                                 timeout=timeout, mode=mode, on_event=on_event,
+                                 execution_guard=execution_guard, stop_after=stop_after,
+                                 workflow_options=workflow_options, project_goal=saved.project_goal,
+                                 wait_for_user=wait_for_user)
+        result = agent.go(f'用户要求修改当前待审的 {node} 产物，修改意见不代表批准。'
+                         f'先读取产物，理解回答，直接落实Markdown修改；需要研究或实现时再委派角色。\n{revise}')
+        state = WorkflowState.from_dict(json.loads(path.read_text()))
+        state.status, state.error = result.status, result.error
+        return state
     task = None
-    approve_revision = bool(revise is not None and advance_after_revision and node != "refine")
-    if (revise is not None and not approve_revision) or node == stop_after:
-        task = {"node": node, "role": PHASE_ROLES["research_refine" if node == "refine" else node],
-                "instruction": (revise if revise is not None else
-                                f"完成 {node} 阶段并交付该阶段产物，验收后停止。"
+    if node == stop_after:
+        task = {"node": node, "role": BY_NODE[node].role,
+                "instruction": (f"完成 {node} 阶段并交付该阶段产物，验收后停止。"
                                 if saved is None or continue_run or resume_run else prompt)}
     agent = CoordinatorAgent(project, model=model, worker_max_iterations=max_iterations,
                              timeout=timeout, mode=mode, on_event=on_event,
                              execution_guard=execution_guard, stage_task=task,
-                             checkpoint_revision=revise, stop_after=stop_after,
+                             stop_after=stop_after,
                              workflow_options=workflow_options, first_node=node,
                              project_goal=saved.project_goal if saved else prompt,
-                             approve_revision=approve_revision)
+                             wait_for_user=wait_for_user)
     result = agent.go(prompt)
     state = WorkflowState.from_dict(json.loads(path.read_text())) if path.is_file() else WorkflowState("main")
     state.status, state.error = result.status, result.error
@@ -309,8 +421,6 @@ def main() -> None:
                         help="run one workflow node, including Runner preprocessing, then stop")
     parser.add_argument("--idea-max-total-gpu-hours", type=float, default=8.0,
                         help="total GPU-hour planning budget for idea pilots (default: 8)")
-    parser.add_argument("--idea-search-paper-number", type=int, default=15,
-                        help="target number of papers to retrieve for idea generation (default: 15)")
     parser.add_argument("prompt", nargs="*")
     args = parser.parse_args()
     if args.single_node and (args.start_node and args.start_node != args.single_node
@@ -320,12 +430,11 @@ def main() -> None:
         parser.error("--max-experiment-repairs must be nonnegative")
     if args.timeout <= 0 or args.max_tool_rounds < 1:
         parser.error("--timeout and --max-tool-rounds must be positive")
-    if not 0 < args.idea_max_total_gpu_hours < float("inf") or not 1 <= args.idea_search_paper_number <= 50:
-        parser.error("idea GPU hours must be finite and positive; idea paper number must be 1-50")
+    if not 0 < args.idea_max_total_gpu_hours < float("inf"):
+        parser.error("idea GPU hours must be finite and positive")
     run_options = dict(max_iterations=args.max_tool_rounds, timeout=args.timeout,
                          model=args.model,
-                         idea_config=IdeaNodeConfig(args.idea_max_total_gpu_hours,
-                                                    args.idea_search_paper_number),
+                         idea_config=IdeaNodeConfig(max_total_gpu_hours=args.idea_max_total_gpu_hours),
                          config=WorkflowConfig(start_node="literature",
                                                max_experiment_repairs=args.max_experiment_repairs,
                                                improvement_start_round=args.improvement_start_round,
@@ -349,7 +458,6 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
     while state.status == "awaiting_user":
         checkpoint = state.expert_checkpoint
         print(f"\n{checkpoint['node']} 结果摘要：{checkpoint['summary']}")
-        proposal_review = checkpoint["node"] == "refine"
         for label, quote in (checkpoint.get("brief") or {}).items():
             print(f"{label}：{quote}")
         for number, question in enumerate(checkpoint["questions"], 1):
@@ -362,8 +470,7 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
         if not sys.stdin.isatty():
             print("当前无交互终端，已保存检查点。在终端重新运行 --project 项目目录 即可返回审阅。")
             break
-        print(("输入修改意见，修订后会再次展示方案供你批准。\n" if proposal_review else
-               "直接输入回答（可按题号一起回答），将据此修订报告正文后自动继续下一节点。\n") +
+        print("输入回答或修改意见，由主控落实到正文；新版展示后再批准。\n" +
               "直接回车表示接受当前报告，不修订并继续。\n"
               "也可先在编辑器直接修改报告，保存后回车，将按最新文件继续。Ctrl+C 保存退出。")
         try:
@@ -377,10 +484,6 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
             continue
         if answer:
             questions = "\n".join(f"{i}. {q}" for i, q in enumerate(checkpoint["questions"], 1))
-            if not proposal_review:
-                with report.open("a", encoding="utf-8") as stream:
-                    stream.write(f"\n\n## 专家审阅：用户确认的研究方向\n\n"
-                                 f"本次问题：\n{questions}\n\n用户回答：\n{answer}\n")
             print("正在根据你的回答修订当前节点产物……", flush=True)
             state = run_coordinated_workflow(project, revise=(
                 f"用户已回答 {checkpoint['node']} 的专家审阅问题，请据此修订当前节点产物。\n"
@@ -396,8 +499,7 @@ def _interact_at_checkpoint(project: Path, state: WorkflowState,
             ), **run_options)
             if state.status != "awaiting_user":
                 return state
-            if proposal_review:
-                continue
+            continue
         state = run_coordinated_workflow(project, continue_run=True, **run_options)
     return state
 

@@ -204,7 +204,7 @@ def load_record(root: Path):
 
 def pending_refine(state) -> bool:
     cp = state.get("expert_checkpoint") or {}
-    return (state.get("mode") == "expert" and state.get("status") == "awaiting_user"
+    return ((state.get("mode") == "expert" or cp.get('hpo_policy')) and state.get("status") == "awaiting_user"
             and state.get("current_node") == "refine" and cp.get("node") == "refine"
             and cp.get("status") == "pending" and cp.get("next_node") == "experiment_plan")
 

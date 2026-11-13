@@ -10,15 +10,15 @@ from pathlib import Path
 import time
 from uuid import uuid4
 
-from .wiki_prompts import RESEARCH_PROMPT as SYSTEM, research_budget_prompt
-from .loop import tool_schema
-from .model_client import limited_model_requests
+from paper_agent.tools.wiki_prompts import RESEARCH_PROMPT as SYSTEM, research_budget_prompt
+from paper_agent.agent.loop import tool_schema
+from paper_agent.agent.model_client import limited_model_requests
 from paper_agent.tools import ToolContext, ToolResult, builtin_tools
 from paper_agent.tools.wiki import resolve_wiki_root
 from paper_agent.tools.wiki_retrieval import load_page
 
 NAMES = {"search_wiki"}
-RESEARCH_PHASES = {"literature", "ideas", "novelty", "research_refine"}
+RESEARCH_PHASES = {"literature", "ideas", "research_refine"}
 _handoff = ContextVar("wiki_evidence_handoff", default=False)
 
 
@@ -108,7 +108,7 @@ def validate_packet(answer, passages, wiki):
     evidence, errors = [], []
     items = answer.get("evidence", [])
     if not isinstance(items, list):
-        return [], ["evidence 必须是列表"]
+        return [], ["evidence must be a list"]
     for item in items[:8]:
         try:
             if (
@@ -116,7 +116,7 @@ def validate_packet(answer, passages, wiki):
                 or not isinstance(item.get("claim"), str)
                 or not item["claim"].strip()
             ):
-                raise ValueError("证据须为包含明确 claim 的对象")
+                raise ValueError("Evidence must be an object with an explicit claim")
             # 旧提示未完整列出英文枚举；只兼容真实响应中三个明确同义值，
             # 保留原值用于审计，其他未知角色仍拒绝。
             item = dict(item)
@@ -131,7 +131,7 @@ def validate_packet(answer, passages, wiki):
                 )
             path = (wiki / item["wiki_path"]).resolve()
             if path.parent != (wiki / "papers").resolve() or not path.is_file():
-                raise ValueError("不是可读取的论文来源")
+                raise ValueError("Not a readable paper source")
             quote = item["quote"]
             if (
                 not isinstance(quote, str)
@@ -139,7 +139,7 @@ def validate_packet(answer, passages, wiki):
                 or len(quote) > 180
                 or item.get("role") not in ROLES
             ):
-                raise ValueError("引文长度或证据角色无效")
+                raise ValueError("Invalid quotation length or evidence role")
             page = load_page(path)
             section = next(s for s in page.sections if s.heading == item["section"])
             source = "\n".join(page.lines[section.start : section.end])
@@ -151,9 +151,9 @@ def validate_packet(answer, passages, wiki):
                 and quote in p["text"]
             ]
             if not seen or quote not in source:
-                raise ValueError("引文没有在该来源栏目中被实际读到")
+                raise ValueError("The quotation was not observed in the source section")
             if not any(p["content_sha256"] == page.fingerprint for p in seen):
-                raise ValueError("引用来源已经更新，需要重新取证")
+                raise ValueError("The citation source has changed; collect evidence again")
             index = source.index(quote)
             line = section.start + source[:index].count("\n") + 1
             evidence.append(
@@ -167,56 +167,56 @@ def validate_packet(answer, passages, wiki):
             )
         except (OSError, ValueError, KeyError, TypeError, StopIteration) as exc:
             errors.append(
-                f"未采用引用 {item.get('wiki_path', '?') if isinstance(item, dict) else '?'}: {exc}"
+                f"Excluded citation {item.get('wiki_path', '?') if isinstance(item, dict) else '?'}: {exc}"
             )
     return evidence, errors
 
 
 def render_packet(packet, path, wiki):
     lines = [
-        "# Wiki研究依据",
+        "# Wiki research evidence",
         "",
         packet["summary"],
         "",
-        f"状态：{packet['status']}；这是待审依据，不是批准方案。",
+        f"Status: {packet['status']}; evidence for review, not an approved proposal.",
         "",
     ]
     for title, key in (
-        ("采用与排除", "decisions"),
-        ("待验证假设", "hypotheses"),
-        ("证据缺口", "gaps"),
+        ("Inclusion and exclusion", "decisions"),
+        ("Unverified hypotheses", "hypotheses"),
+        ("Evidence gaps", "gaps"),
     ):
         lines += ["## " + title, ""]
         for item in packet.get(key, []):
             lines += [
                 "- "
                 + (
-                    f"{item.get('wiki_path', '')}：{item.get('decision', '')}；{item.get('reason', '')}"
+                    f"{item.get('wiki_path', '')}: {item.get('decision', '')}; {item.get('reason', '')}"
                     if isinstance(item, dict)
                     else str(item)
                 ),
                 "",
             ]
-    lines += ["## 可追溯证据", ""]
+    lines += ["## Traceable evidence", ""]
     for e in packet["evidence"]:
         lines += [
-            f"- **{e['role']}**：{e['claim']}",
+            f"- **{e['role']}**: {e['claim']}",
             "",
             "> " + e["quote"],
             "",
-            f"  [{e['wiki_path']} / {e['section']}]({(wiki / e['wiki_path']).as_posix()}:{e['start_line']})；版本 `{e['content_sha256'][:12]}`。",
+            f"  [{e['wiki_path']} / {e['section']}]({(wiki / e['wiki_path']).as_posix()}:{e['start_line']}); version `{e['content_sha256'][:12]}`.",
             "",
         ]
     lines += [
-        "## 下一步",
+        "## Next step",
         "",
         packet.get("next_action", ""),
         "",
-        "## 调用记录",
+        "## Request log",
         "",
-        f"模型 {packet['budget']['model_calls']}/3；工具执行 {packet['budget']['tool_calls']}/6；图扩展 {packet['budget']['graph_calls']}/1。",
+        f"Model requests {packet['budget']['model_calls']}/3; tool executions {packet['budget']['tool_calls']}/6; graph expansions {packet['budget']['graph_calls']}/1.",
         "",
-        "逐字和版本检查不代表推论已被科学验证。",
+        "Verbatim quotation and version checks do not establish scientific validity.",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -229,7 +229,7 @@ def latest_evidence(workspace):
     if not files:
         return {
             "status": "unavailable",
-            "gaps": ["该项目尚无取证包，新增文献主张须先补证。"],
+            "gaps": ["This project has no evidence packet; obtain evidence before adding literature claims."],
         }
     try:
         packet = json.loads(files[0].read_text(encoding="utf-8"))
@@ -252,16 +252,16 @@ def latest_evidence(workspace):
         if errors:
             packet.update(
                 status="stale",
-                summary="旧依据已变化，旧摘要与采用建议暂不可用。",
+                summary="The previous evidence has changed; its summary and recommendations are unavailable pending review.",
                 decisions=[],
             )
             packet["gaps"] = [*packet.get("gaps", []), *errors]
         packet["reuse_note"] = (
-            "历史依据仅供参考；人工改变任务条件后必须重新判断适用性。缺失支持列为待决策，不自行补造。"
+            "Historical evidence is for reference; reassess applicability after task conditions change. List unsupported decisions as unresolved without inventing support."
         )
         return packet
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        return {"status": "unavailable", "gaps": [f"历史取证包无法核验：{exc}"]}
+        return {"status": "unavailable", "gaps": [f"The historical evidence packet could not be verified: {exc}"]}
 
 
 def collect_wiki_evidence(
@@ -324,7 +324,7 @@ def collect_wiki_evidence(
         )
         if data.get("budget_exhausted"):
             warnings.append(
-                "取证正文预算已耗尽，部分工具结果没有交付模型；未读内容不可引用。"
+                "The evidence text budget was exhausted; some tool results were not delivered to the model and cannot be cited."
             )
         delivered += len(json.dumps(data, ensure_ascii=False))
         records = observed_passages(data) if not result.is_error else []
@@ -463,19 +463,19 @@ def collect_wiki_evidence(
                     }
                 )
     except Exception as exc:
-        errors.append(f"取证未完整完成: {type(exc).__name__}: {exc}")
+        errors.append(f"Evidence collection did not complete: {type(exc).__name__}: {exc}")
     evidence, rejected = validate_packet(answer, passages, wiki)
     errors.extend(rejected)
     for key, fallback in (
-        ("summary", "当前材料不足以形成可靠的研究依据。"),
-        ("next_action", "核对取证缺口后再决定研究方案。"),
+        ("summary", "The available material is insufficient for reliable research evidence."),
+        ("next_action", "Review the evidence gaps before deciding on the research plan."),
     ):
         if not isinstance(answer.get(key, fallback), str):
-            errors.append(f"{key} 必须是字符串")
+            errors.append(f"{key} must be a string")
             answer[key] = fallback
     for key in ("gaps", "decisions", "hypotheses"):
         if not isinstance(answer.get(key, []), list):
-            errors.append(f"{key} 必须是列表")
+            errors.append(f"{key} must be a list")
             answer[key] = []
     decisions = []
     for decision in answer.get("decisions", [])[:10]:
@@ -490,10 +490,10 @@ def collect_wiki_evidence(
         ):
             decisions.append(decision)
         else:
-            errors.append("未采用缺少来源或理由的候选决策")
+            errors.append("Candidate decisions without a source or rationale were excluded")
     gaps = [str(g) for g in answer.get("gaps", [])] + errors
     if not answer:
-        gaps.append("未取得结构化结论；已有材料与调用轨迹已保留，需要后续按缺口补充。")
+        gaps.append("No structured conclusion was obtained; available material and request traces are retained for follow-up on the gaps.")
     status = (
         "insufficient"
         if not evidence or answer.get("assessment") != "sufficient"
@@ -503,13 +503,13 @@ def collect_wiki_evidence(
         "schema_version": "wiki-research-v1",
         "status": status,
         "root": str(wiki),
-        "summary": str(answer.get("summary", "当前材料不足以形成可靠的研究依据。")),
+        "summary": str(answer.get("summary", "The available material is insufficient for reliable research evidence.")),
         "summary_verification": "model_interpretation_not_scientifically_verified",
         "evidence": [{**e, **sources.get(e["wiki_path"], {})} for e in evidence],
         "decisions": decisions,
         "hypotheses": answer.get("hypotheses", [])[:10],
         "gaps": gaps,
-        "next_action": answer.get("next_action", "核对取证缺口后再决定研究方案。"),
+        "next_action": answer.get("next_action", "Review the evidence gaps before deciding on the research plan."),
         "warnings": list(dict.fromkeys(warnings)),
         "validation_errors": errors,
         "relations": graph,

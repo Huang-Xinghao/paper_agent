@@ -1,12 +1,12 @@
 ---
 name: research-refine
 description: 将电池研究想法细化为可实现、可验证的最终研究方案。
-allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, search_battery_resources, read_battery_resource
+allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, search_battery_resources, read_battery_resource
 ---
 
 ## 概述
 
-目标是将一个模糊的方向转变为一个**问题 -> 实现方法**文档，不负责规划具体的实验设计与计划
+目标是将一个模糊的方向转变为一个**问题 -> 实现方法**，不负责规划具体的实验设计与计划
 该节点产出`refine-logs/FINAL_PROPOSAL.md`，交付下一个阶段experiment-plan来设计具体的实验规划
 ## 输入与证据边界
 
@@ -16,7 +16,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, search
 
 ### 第 0 阶段：冻结问题锚点
 
-在提出任何建议之前，请提取用户不可改变的底线问题。这个锚点必须逐字复制到每个提案和每个改进轮次中。
+在提出任何建议之前，请提取用户不可改变的底线问题。
 
 - **底线问题**：必须解决什么技术问题？
 - **必须解决的瓶颈**：当前方法中哪些具体弱点是不可接受的？
@@ -58,10 +58,6 @@ allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, search
 - 一句话核心论点：
 - 为什么这个方法是可能有效的：
 - 其他领域的相似做法是什么：
-## 贡献焦点
-- 主要贡献:
-- 可选辅助贡献:
-- 明确的非贡献：
 
 ## 提议的方法
 ### 系统概述

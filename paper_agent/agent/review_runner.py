@@ -1,11 +1,12 @@
-"""Independent Codex reviews with a single Markdown output."""
-
+"""Independent reviews: manuscript inputs, Codex execution and CLI."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -14,7 +15,9 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from .usage import record_usage
+
+from .model_client import record_usage
+
 
 ReviewKind = Literal["idea", "code", "paper"]
 RUBRICS = {
@@ -254,3 +257,85 @@ class ReviewRunner:
         if interrupted is not None:
             raise interrupted
         return result
+
+
+def paper_review_inputs(workspace: Path) -> tuple[Path, ...]:
+    root = workspace.resolve()
+    selected = {Path("paper/main.pdf")}
+    visited = set()
+    graphics = [root, root / "paper"]
+
+    def resolve(name, parent, extensions):
+        if "\\" in name or "#" in name:
+            raise ValueError(f"Cannot resolve dynamic LaTeX dependency: {name}")
+        bases = [root, parent, root / "paper", *graphics]
+        for base in bases:
+            for suffix in ("", *extensions):
+                path = (base / (name + suffix)).resolve()
+                if not path.is_relative_to(root):
+                    continue
+                if any(part in {"audit", "backup", "backups", ".recovery"} for part in path.relative_to(root).parts):
+                    continue
+                if path.is_file():
+                    return path
+        raise ValueError(f"Missing or excluded LaTeX dependency: {name}")
+
+    def visit(path):
+        if path in visited:
+            return
+        visited.add(path)
+        selected.add(path.relative_to(root))
+        source = re.sub(r"(?<!\\)%[^\n]*", "", path.read_text(encoding="utf-8"))
+        for block in re.findall(r"\\graphicspath\s*\{((?:\s*\{[^{}]*\}\s*)+)\}", source):
+            for name in re.findall(r"\{([^{}]*)\}", block):
+                graphics.extend([(root / name).resolve(), (path.parent / name).resolve()])
+        for command, names in re.findall(
+                r"\\(input|include|subfile|bibliography|addbibresource|includegraphics)\*?\s*(?:\[[^\]]*\]\s*)?\{([^{}]+)\}", source):
+            for name in names.split(",") if command == "bibliography" else [names]:
+                extensions = ((".tex",) if command in {"input", "include", "subfile"}
+                              else (".bib",) if command in {"bibliography", "addbibresource"}
+                              else (".pdf", ".png", ".jpg", ".jpeg", ".eps"))
+                dependency = resolve(name.strip(), path.parent, extensions)
+                if dependency.suffix == ".tex":
+                    visit(dependency)
+                else:
+                    selected.add(dependency.relative_to(root))
+
+    visit(root / "paper/main.tex")
+    for name in ("PAPER_PLAN.md", "refine-logs/EXPERIMENT_RESULTS.md"):
+        if (root / name).is_file():
+            selected.add(Path(name))
+    return tuple(sorted(selected))
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run an independent read-only Codex review")
+    parser.add_argument("kind", choices=RUBRICS)
+    parser.add_argument("inputs", nargs="+", type=Path, help="Files relative to workspace")
+    parser.add_argument("--workspace", type=Path, default=Path.cwd())
+    parser.add_argument("--instructions-file", required=True, type=Path)
+    parser.add_argument("--model")
+    parser.add_argument("--reasoning-effort")
+    parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--output", type=Path, help="Markdown output path relative to workspace")
+    args = parser.parse_args()
+    previous_handler = signal.signal(signal.SIGTERM, _interrupt)
+    try:
+        runner = ReviewRunner(args.workspace, model=args.model,
+                              reasoning_effort=args.reasoning_effort, timeout=args.timeout)
+        result = runner.run(ReviewRequest(args.kind,
+            args.instructions_file.read_text(encoding="utf-8"), tuple(args.inputs), args.output))
+    except (OSError, ValueError) as exc:
+        parser.exit(2, f"paper-review: {exc}\n")
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+    print(json.dumps(asdict(result), default=str, ensure_ascii=False, indent=2))
+    return 0 if result.status == "completed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

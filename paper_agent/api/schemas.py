@@ -28,6 +28,7 @@ class CheckpointView(BaseModel):
     brief: dict[str, str] | None = None
     previous_brief: dict[str, str] | None = None
     decision_options: list[list[str]] | None = None
+    hpo_policy: bool = False
     report_sha256: str | None = None
 
 
@@ -58,6 +59,23 @@ class RunView(BaseModel):
     options: dict[str, Any]
 
 
+class QuestionView(BaseModel):
+    id: str
+    task_id: str
+    role: str
+    phase: str
+    question: str
+    options: list[str] = Field(default_factory=list)
+    status: str
+    live: bool
+    created_at: str
+
+
+class QuestionAnswer(BaseModel):
+    task_id: str = Field(min_length=1, max_length=200)
+    answer: str = Field(min_length=1, max_length=20000)
+
+
 class ProjectView(BaseModel):
     id: str
     name: str
@@ -68,3 +86,4 @@ class ProjectView(BaseModel):
     progress: dict[str, Any]
     runs: list[RunView]
     checkpoint_token: str
+    pending_questions: list[QuestionView] = Field(default_factory=list)

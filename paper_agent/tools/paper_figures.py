@@ -1,4 +1,4 @@
-"""One cached MinerU parse for full paper text and architecture figures."""
+"""One cached MinerU parse for full paper text and all grouped figures."""
 from __future__ import annotations
 
 import hashlib
@@ -15,20 +15,6 @@ from paper_agent.tools.paper_preprocessing import document_from_structured
 
 VERSION = "architecture-captions-v1"
 READER_VERSION = "mineru-full-paper-v2"
-ARCHITECTURE = re.compile(
-    r"\b(?:architectur\w*|workflow|flowchart|schematic|pipeline)\b"
-    r"|\b(?:overall|proposed|model|network|methodological)\s+framework\b"
-    r"|\b(?:framework|methodology|model)\s+overview\b"
-    r"|\boverview\s+of\s+(?:the\s+)?(?:proposed\s+)?(?:model|method|framework)\b"
-    r"|架构|流程图|框架图|总体框架|方法概览|模型结构", re.I)
-
-
-def architecture_reason(caption: str) -> str | None:
-    # Inspect the introductory description, not performance claims in later panels.
-    lead = re.sub(r"^(?:fig(?:ure)?\.?\s*)S?\d+\s*[|:.．–—-]?\s*", "", caption, flags=re.I)
-    lead = re.split(r"\.\s|\s[ab]\s|。", lead, maxsplit=1)[0][:250]
-    match = ARCHITECTURE.search(lead)
-    return match.group() if match else None
 
 
 def runtime_python() -> str | None:
@@ -102,16 +88,11 @@ def read_mineru_paper(project: Path, pdf: Path) -> dict:
         json.loads(structured_path.read_text(encoding="utf-8")), pdf_sha256=sha,
         parser_identity={"name": "MinerU", "version": version,
                          "reader_version": READER_VERSION, "settings_key": key})
-    selected = []
-    for figure in report["figures"]:
-        reason = architecture_reason(figure["caption"])
-        if reason:
-            selected.append({**figure, "selection_reason": reason})
     return {"status": "completed", "pages": document["pages"], "document": document,
             "reader_version": READER_VERSION,
             "pdf_sha256": sha, "mineru_version": version,
             "extraction_version": VERSION, "cache": str(cache / "grouped"),
-            "total_figures": len(report["figures"]), "figures": selected,
+            "total_figures": len(report["figures"]), "figures": report["figures"],
             "page_diagnostics": report["page_diagnostics"]}
 
 
@@ -123,8 +104,6 @@ def save_architecture_figures(root: Path, slug: str, extraction: dict) -> list[s
     directory.mkdir(parents=True, exist_ok=True)
     outputs = []
     for figure in extraction["figures"]:
-        if not figure.get("image"):
-            continue
         source = Path(extraction["cache"]) / figure["image"]
         name = Path(figure["image"]).name
         image = directory / name

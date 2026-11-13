@@ -6,6 +6,8 @@ from .core import ToolSpec
 
 
 PHASE_TOOL_NAMES: dict[str, frozenset[str]] = {
+    "wiki": frozenset({"ls", "find", "read", "grep", "write", "edit", "skill", "skill_resource_read",
+                       "search_wiki", "read_wiki", "view_image"}),
     "data_search": frozenset({"ls", "find", "read", "grep", "write", "edit", "bash",
                               "skill", "skill_resource_read",
                               "search_battery_resources", "read_battery_resource",
@@ -17,9 +19,6 @@ PHASE_TOOL_NAMES: dict[str, frozenset[str]] = {
     "ideas": frozenset({"find", "read", "grep", "write", "edit", "skill", "skill_resource_read", "review_idea",
                          "discover_local_papers", "read_local_paper",
                          "search_battery_resources", "read_battery_resource", "search_wiki"}),
-    "novelty": frozenset({"find", "read", "grep", "write", "skill", "skill_resource_read",
-                           "discover_local_papers", "read_local_paper",
-                           "search_battery_resources", "read_battery_resource", "search_wiki"}),
     "research_refine": frozenset({"find", "read", "grep", "write", "edit", "bash", "skill", "skill_resource_read",
                             "discover_local_papers", "search_wiki",
                             "search_battery_resources", "read_battery_resource"}),
@@ -44,7 +43,7 @@ for _phase in ("paper_figure", "paper_write", "paper_compile", "improvement"):
     PHASE_TOOL_NAMES[_phase] |= frozenset({"view_image"})
 
 
-for _phase in ("literature", "ideas", "novelty", "research_refine",
+for _phase in ("literature", "ideas", "research_refine",
                "experiment_plan", "experiment_bridge"):
     PHASE_TOOL_NAMES[_phase] |= frozenset({
         "search_battery_resources", "read_battery_resource",

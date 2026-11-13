@@ -1,7 +1,7 @@
 ---
 name: paper-write
 description: 根据论文规划、真实实验结果、图表和核实文献生成中文或指定语言的 LaTeX 论文源文件。
-allowed-tools: Read, Write, Edit, Grep, Glob, Bash, search_papers, search_wiki
+allowed-tools: Read, Write, Edit, Grep, Glob, Bash, search_papers, search_wiki, read_wiki
 ---
 
 # 论文写作
@@ -171,7 +171,7 @@ curl -sLH "Accept: application/x-bibtex" "https://doi.org/{doi}"
 
 **步骤 C：标记 `[VERIFY]`（最后手段）** 如果 DBLP 和 CrossRef 均未返回任何内容，请使用 `% [VERIFY]` 注释标记该条目。请勿捏造。
 
-**为什么这很重要：** LLM 生成的 BibTeX 经常会产生目标会议或期刊名称、页码甚至共同作者的幻觉。 DBLP 和 CrossRef 返回经过发布者验证的元数据。上游技能（`/research-lit`，`/novelty-check`）可能会从LLM内存中提到论文——这个获取链是防止幻觉引用进入最终`.bib`的大门。
+**为什么这很重要：** LLM 生成的 BibTeX 经常会产生目标会议或期刊名称、页码甚至共同作者的幻觉。 DBLP 和 CrossRef 返回经过发布者验证的元数据。上游技能（`/research-lit`）可能会从LLM内存中提到论文——这个获取链是防止幻觉引用进入最终`.bib`的大门。
 
 
 **自动围兜清理** — 使用此 Python 模式仅提取引用的条目：

@@ -182,8 +182,9 @@ def main():
         "papers": [],
     }
     raw_records = []
-    for source_file in sorted((root / "papers").glob("*.source.json")):
-        slug = source_file.name.removesuffix(".source.json")
+    from paper_agent.tools.wiki_metadata import metadata_records
+    for paper, source_file in metadata_records(root, "source"):
+        slug = paper.stem
         source = json.loads(source_file.read_text())
         pdf = project / source["pdf_path"]
         extraction = read_mineru_paper(project, pdf)

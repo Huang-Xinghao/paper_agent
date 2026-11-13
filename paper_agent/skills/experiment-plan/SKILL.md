@@ -1,11 +1,11 @@
 ---
 name: experiment-plan
 description: 根据 FINAL_PROPOSAL.md 分别规划电池数据集分析与方法实验，生成按 D/B 块组织的实验计划；runner 自动生成块级进度 tracker。
-allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, search_battery_resources, read_battery_resource, list_battery_data_sources, inspect_battery_data
+allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, search_battery_resources, read_battery_resource, list_battery_data_sources, inspect_battery_data
 ---
 ## 概述
 
-我们的目标不是生成一个巨大的基准愿望清单。目标是将提案转变为**论断 -> 证据 -> 运行顺序**
+我们的目标不是生成一个巨大的基准愿望清单。目标是将提案转变为**论断 -> 证据 -> 实验运行规划**
 
 ## 工作流程
 
@@ -57,7 +57,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, search
 3. 图三和图四为实验结果，实验结果至少六个子图，每个实验块需要说明在图几的某个子图
 
 
-D/B 块 ID 是计划、manifest 和结果报告的统一关联标识，不再引入 R001 等运行编号。
+D/B 块 ID 是计划、manifest 和结果报告的统一关联标识。
 已有块不重新编号；新增块追加编号。一个块可以展开为多个模型、数据集、种子或后处理 job。
 块的呈现顺序不代表执行依赖；依赖在实现阶段由 manifest jobs 的 `depends_on` 表达。
 
@@ -100,14 +100,11 @@ D/B 块 ID 是计划、manifest 和结果报告的统一关联标识，不再引
 ## 数据集分析与展示
 
 ### 区块 D1：[数据分析名称]
-- 他的体现方法的哪些方面：
+- 他的体现数据集和方法的哪些方面：
 - 为什么这个块存在：
-- 优先级：必须执行
 - 计划产物：
 
 ### 区块 D2：[按需增加的数据分析名称]
-- 优先级：必须执行
-- 计划产物：
 
 ## 方法实验
 
@@ -169,3 +166,17 @@ runner 从完整计划生成 tracker，一块一行；规划完成时均为“�
 跟踪器文件：refine-logs/EXPERIMENT_TRACKER.md
 ```
 
+## 正式实验前的超参数寻优
+
+根据方法、数据规模、已有配置和计算预算判断是否需要寻优。
+需要时读取 `skill_resource_read(name="experiment-plan", resource="references/hyperparameter-search.md")`，
+在 `refine-logs/EXPERIMENT_PLAN.md` 末尾写一个 `hpo-policy` JSON 围栏，明确核心机制、
+可调参数及范围、验证集选优指标、候选数、训练轮数层级和累计预算。
+用中文说明范围及预算的依据；学习率、隐藏维度和层数等可调整，核心机制的有无属于正式消融。
+候选数、轮数和时间额度按任务与算力估计，接口示例数值不作为默认要求。
+
+选一个代表性总体性能 B 块，明确训练/验证划分、参数应用范围与基线调参口径。
+将训练入口、代码/划分文件和实际数据输入写入 `experiments/hpo_spec.json`；在计划中说明训练配置接口，
+供 bridge 实现和执行。最佳参数由 bridge 实际寻优产生。
+不需要寻优时写 `{"enabled":false,"reason":"具体原因"}`，并说明采用的固定配置及依据。
+专家模式随实验计划审阅；自动模式在项目资源限制内自行确定。
