@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from paper_agent.agent.runtime.artifacts import ArtifactVersions
 from paper_agent.agent.stages import validate_outputs
 from paper_agent.agent.workflow import WorkflowConfig, WorkflowRunner, WorkflowState, NodeResult
 from paper_agent.tools.experiments.executor import AwaitingResults
@@ -44,33 +43,16 @@ def test_single_file_manuscript_is_accepted(tmp_path):
     validate_outputs(tmp_path, 'paper_write')
     assert result.artifact == 'paper/main.tex'
     assert not (tmp_path / 'paper/sections').exists()
-    chapter = tmp_path / 'paper/chapters/method.tex'
-    chapter.parent.mkdir()
-    chapter.write_text('Method')
-    bibliography = tmp_path / 'paper/sources.bib'
-    bibliography.write_text('@article{source, title={Source}}')
-    versions = ArtifactVersions(tmp_path)
-    versions.record('paper_write')
-    chapter.write_text('Revised method')
-    bibliography.write_text('@article{source, title={Corrected source}}')
-    assert versions.context()['changed_files']['paper_write'] == [
-        'paper/chapters/method.tex', 'paper/sources.bib']
+    assert not (tmp_path / '.paper-agent/artifact-versions.json').exists()
 
 
-def test_artifact_changes_are_advisory_and_do_not_invalidate_downstream(tmp_path):
-    (tmp_path / 'literature').mkdir()
-    report = tmp_path / 'literature/RESEARCH_REPORT.md'
-    report.write_text('Source A')
-    (tmp_path / 'data-search').mkdir()
-    (tmp_path / 'data-search/DATA_REPORT.md').write_text('Dataset B')
-    versions = ArtifactVersions(tmp_path)
-    versions.record('literature')
-    versions.record('data_search')
-    report.write_text('Source A with a corrected reference')
-    context = versions.context()
-    assert context['changed_files'] == {'literature': ['literature/RESEARCH_REPORT.md']}
-    assert context['nodes']['data_search']['version'] == 1
-    assert 'stale_nodes' not in context
+def test_legacy_experiment_state_drops_duplicate_receipts_and_freeze():
+    state = WorkflowState.from_dict({
+        'run_id': 'legacy', 'experiment_completed_receipts': [{'large': 'duplicate'}],
+        'experiment_feedback': {'error': 'retryable', 'protected_evidence': {'results/a': 'hash'}},
+    })
+    assert 'experiment_completed_receipts' not in state.to_dict()
+    assert 'experiment_feedback' not in state.to_dict()
 
 
 def test_empty_or_external_artifact_is_still_rejected(tmp_path):
@@ -104,26 +86,38 @@ def test_freeform_experiment_plan_and_nonnumeric_declared_output(tmp_path, monke
     # A report or preexisting output alone cannot substitute for an execution receipt.
     (tmp_path / 'results').mkdir()
     (tmp_path / 'results/sample.txt').write_text('old artifact')
-    with pytest.raises(AwaitingResults): runner._verified_experiment_outputs(state)
+    assert runner._available_experiment_outputs(state) == []
     receipts = run_queue(runner.experiments, state, manifest)
     assert len(receipts) == 1 and receipts[0]['status'] == 'completed'
-    assert runner._verified_experiment_outputs(state) == [tmp_path / 'results/sample.txt']
+    assert runner._available_experiment_outputs(state) == [tmp_path / 'results/sample.txt']
     tracker = (tmp_path / 'refine-logs/EXPERIMENT_TRACKER.md').read_text()
     assert 'sample' in tracker and '执行完成' in tracker
-    assert run_queue(runner.experiments, state, manifest) == receipts
+    # A legacy wrapper removal must not trigger a second fit or evaluation.
+    record = next((tmp_path / 'experiment-runs').glob('*/status.json'))
+    legacy = json.loads(record.read_text())
+    legacy['job']['argv'] = [sys.executable, 'experiments/receipt.py', 'sample', 'cpu',
+                             'experiments/fixture.py']
+    record.write_text(json.dumps(legacy))
+    assert len(run_queue(runner.experiments, state, manifest)) == 1
     assert len(list((tmp_path / 'experiment-runs').glob('*/status.json'))) == 1
     (tmp_path / 'results/sample.txt').unlink()
-    with pytest.raises(AwaitingResults): runner._verified_experiment_outputs(state)
+    assert runner._available_experiment_outputs(state) == []
 
 
-def test_explicit_proposal_revision_pauses_auto_mode_without_old_policy_marker(tmp_path):
+@pytest.mark.parametrize('mode', ['auto', 'expert'])
+def test_proposal_revision_respects_collaboration_mode(tmp_path, mode):
     from paper_agent.agent.workflow_cli import refresh_revision_checkpoint
     from paper_agent.proposal_review import pending_refine
     (tmp_path / 'refine-logs').mkdir()
     (tmp_path / 'refine-logs/FINAL_PROPOSAL.md').write_text('Current revised proposal')
     (tmp_path / 'workflow-state.json').write_text(json.dumps({
-        'run_id': 'auto', 'project_goal': 'Research', 'mode': 'auto',
+        'run_id': 'revision', 'project_goal': 'Research', 'mode': mode,
         'current_node': 'refine', 'status': 'completed'}))
+    if mode == 'auto':
+        before = (tmp_path / 'workflow-state.json').read_bytes()
+        assert not refresh_revision_checkpoint(tmp_path, 'refine')
+        assert (tmp_path / 'workflow-state.json').read_bytes() == before
+        return
     assert refresh_revision_checkpoint(tmp_path, 'refine')
     saved = json.loads((tmp_path / 'workflow-state.json').read_text())
     assert pending_refine(saved)
@@ -143,3 +137,56 @@ def test_execution_session_rejects_unscoped_or_wrong_channel_memory(tmp_path, ch
     session.path.write_text(json.dumps(value))
     with pytest.raises(ValueError, match='identity mismatch'):
         session.load()
+
+
+def test_stage_result_survives_later_file_edits_without_workflow_copy(tmp_path, monkeypatch):
+    from paper_agent.agent import workflow_cli
+    from paper_agent.agent.runtime.execution import new_task, execute_task, read_result
+    from paper_agent.storage import write_json
+    report = tmp_path / 'PAPER_PLAN.md'
+    report.write_text('Original plan')
+    state = WorkflowState('source', status='completed', current_node='paper_plan',
+                          artifacts={'paper_plan': [{'path': 'PAPER_PLAN.md'}]},
+                          node_results={'paper_plan': {'artifact': 'PAPER_PLAN.md'}})
+    monkeypatch.setattr(workflow_cli, 'execute_stage', lambda *a, **k: state)
+    task = new_task(tmp_path, 'paper_plan', 'Plan', role='paper_writer', project_goal='Research')
+    folder = tmp_path / 'task'
+    write_json(folder / 'request.json', task.model_dump())
+    assert execute_task(folder).status == 'completed'
+    assert not (folder / 'workflow.json').exists()
+    assert 'state_sha256' not in json.loads((folder / 'result.json').read_text())
+    report.write_text('Revised plan')
+    result = read_result(folder)
+    assert result.status == 'completed'
+    assert result.node_results['paper_plan']['artifact'] == 'PAPER_PLAN.md'
+
+
+def test_bridge_can_report_partial_results_and_retry_after_error(tmp_path, monkeypatch):
+    from paper_agent.tools import ToolContext
+    (tmp_path / 'refine-logs').mkdir()
+    for name in ('FINAL_PROPOSAL.md', 'EXPERIMENT_PLAN.md'):
+        (tmp_path / 'refine-logs' / name).write_text('Research plan')
+    calls = []
+    class Agent:
+        project = tmp_path
+        def add_tool(self, spec, **kwargs):
+            self.tool = spec.handler
+        def go(self, prompt, *, phase, completion_check):
+            assert self.tool(ToolContext(tmp_path)).is_error
+            assert not self.tool(ToolContext(tmp_path)).is_error
+            (tmp_path / 'refine-logs/EXPERIMENT_RESULTS.md').write_text(
+                'Core experiment completed; an optional audit failed. Limitations documented.')
+            completion_check()
+            return SimpleNamespace(iterations=2)
+    def queue(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError('Repairable launch error')
+        return []
+    monkeypatch.setattr('paper_agent.agent.workflow.run_queue', queue)
+    runner = WorkflowRunner(Agent())
+    monkeypatch.setattr(runner, '_experiment_manifest', lambda *a: {'jobs': []})
+    monkeypatch.setattr(runner.experiments, 'validate_inputs', lambda *a: None)
+    result = runner._run_experiment_bridge(WorkflowState('retry'), 'Continue')
+    assert result.artifact == 'refine-logs/EXPERIMENT_RESULTS.md'
+    assert len(calls) == 2

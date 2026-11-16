@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import inspect
+import itertools
 import copy
 import json
 import os
-import sys
 import types
 import argparse
 import threading
@@ -15,16 +15,15 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
-from typing import Union, get_args, get_origin, get_type_hints
+from typing import Literal, Union, get_args, get_origin, get_type_hints
 
 from paper_agent.tools import (ToolContext, ToolResult, ToolSpec,
                                 builtin_tools, tools_for_phase)
 
-from paper_agent.project_config import compute_context
 
 from paper_agent.integrations.model import ModelClient, ToolCall, load_env_file
 from paper_agent.agent.runtime.sessions import PhaseTask, RoleSession, ROLE_DESCRIPTIONS, now
-from .context import WorkingContext, project_messages, request_size
+from .context import CONTEXT_MAX_TOKENS, WorkingContext, request_tokens
 from .stages import BY_PHASE, SKILL_BY_PHASE, WORKFLOW_NODE_NAMES
 
 __all__ = ["AgentLoop", "PhaseAgent", "AgentState", "ArtifactValidationError", "ToolCall", "tool_schema", "main"]
@@ -56,7 +55,9 @@ def tool_schema(spec: ToolSpec) -> dict[str, Any]:
             non_none = [item for item in get_args(annotation) if item is not type(None)]
             annotation = non_none[0] if non_none else Any
             origin = get_origin(annotation)
-        if annotation is bool:
+        if origin is Literal:
+            parameter_schema = {"type": "string", "enum": list(get_args(annotation))}
+        elif annotation is bool:
             parameter_schema = {"type": "boolean"}
         elif annotation is int:
             parameter_schema = {"type": "integer"}
@@ -106,8 +107,9 @@ class AgentLoop:
     DEFAULT_KNOWLEDGE_DIRS = (Path(__file__).resolve().parents[2] / "电池资源库",)
 
     def __init__(self, model: ModelClient, *, workspace: Path,
-                 tools: tuple[ToolSpec, ...], max_iterations: int = 100,
-                 on_progress: Callable[[str, dict[str, Any]], None] | None = None):
+                 tools: tuple[ToolSpec, ...], max_iterations: int = 300,
+                 on_progress: Callable[[str, dict[str, Any]], None] | None = None,
+                 connect_mcp: bool = True, retry_model_requests: bool = True):
         self.model, self.workspace, self.tools = model, workspace, tools
         self.skill_dirs = self.DEFAULT_SKILL_DIRS
         self.knowledge_roots = tuple(
@@ -115,11 +117,14 @@ class AgentLoop:
         )
         self.max_iterations = max_iterations
         self.on_progress = on_progress
+        self.connect_mcp = connect_mcp
+        self.retry_model_requests = retry_model_requests
         self._by_name = {spec.name: spec for spec in tools}
         self.last_state: AgentState | None = None
 
     async def _invoke(self, spec: ToolSpec, arguments: dict[str, Any]) -> ToolResult:
-        result = spec.handler(ToolContext(self.workspace, self.skill_dirs, self.knowledge_roots), **arguments)
+        result = spec.handler(ToolContext(self.workspace, self.skill_dirs, self.knowledge_roots,
+                                          on_progress=lambda action, details: self._progress(action, **details)), **arguments)
         if inspect.isawaitable(result):
             result = await result
         return result
@@ -134,12 +139,15 @@ class AgentLoop:
     async def arun(self, prompt: str, *, system_prompt: str, phase: str,
                   completion_check: Callable[[], None] | None = None,
                   history: list[dict[str, Any]] | None = None) -> AgentState:
+        if not self.connect_mcp:
+            return await self._arun(prompt, system_prompt=system_prompt, phase=phase,
+                                    completion_check=completion_check, history=history)
         from paper_agent.integrations.mcp import MCPManager
 
         # Sessions and their transport tasks live in this run's event loop.
         # Never retain a session across separate asyncio.run() invocations.
         original_tools, original_by_name = self.tools, self._by_name
-        async with MCPManager.from_config(phase=phase) as mcp:
+        async with MCPManager.from_config(phase=phase, allow_unavailable=True) as mcp:
             self.tools = original_tools + mcp.tools
             self._by_name = {spec.name: spec for spec in self.tools}
             if len(self._by_name) != len(self.tools):
@@ -148,6 +156,13 @@ class AgentLoop:
             try:
                 if mcp.tools:
                     self._progress("mcp_connected", tools=[spec.name for spec in mcp.tools])
+                if mcp.unavailable:
+                    self._progress("mcp_unavailable", errors=mcp.unavailable)
+                    system_prompt += (
+                        "\n以下可选 MCP 服务在本次启动时连接失败，相关工具不可用：\n"
+                        + "\n".join(mcp.unavailable)
+                        + "\n可继续完成不依赖这些服务的工作；确需相关服务时说明阻塞原因，"
+                        "不得声称已调用、伪造结果或绕过设备接口执行操作。")
                 return await self._arun(prompt, system_prompt=system_prompt, phase=phase,
                                         completion_check=completion_check, history=history)
             finally:
@@ -165,7 +180,19 @@ class AgentLoop:
         self._save_conversation(state)
 
         completion_retries = 1 if phase == "ideas" else 0
-        for iteration in range(1, self.max_iterations + completion_retries + 1):
+        auto_continue = getattr(self, 'auto_continue_iterations', False)
+        for iteration in itertools.count(1):
+            if not auto_continue and iteration > self.max_iterations + completion_retries:
+                break
+            if auto_continue and iteration > 1 and (iteration - 1) % self.max_iterations == 0:
+                state.messages.append({'role': 'user', 'content':
+                    'Continue the same assignment from the saved artifacts and tool results above. '
+                    'This is a new execution segment, not a new task. Do not repeat completed actions '
+                    'or reread sources solely because a segment ended. Finish the remaining work.'})
+                self._save_conversation(state)
+                self._write_phase_checkpoint(phase, iteration, 'continuing')
+                self._progress('execution_continued', phase=phase, iteration=iteration,
+                               segment=(iteration - 1) // self.max_iterations + 1)
             state.iterations = iteration
             self._progress("model_start", phase=phase, iteration=iteration)
             self._write_phase_checkpoint(phase, iteration, "waiting_model")
@@ -181,24 +208,27 @@ class AgentLoop:
                     self.model.usage_workspace = self.workspace
                     self.model.usage_phase = phase
                 request_messages = working_context.prepare(
-                    state, self.model, getattr(self, "context_max_chars", 120000),
-                    lambda: self._working_context_compacted(phase, iteration))
+                    state, self.model, getattr(self, "context_max_tokens", CONTEXT_MAX_TOKENS),
+                    lambda: self._context_compaction_event(False, phase, iteration),
+                    tools=schemas,
+                    on_compacting=lambda: self._context_compaction_event(True, phase, iteration))
                 self._save_conversation(state)
                 self._progress("context_prepared", phase=phase, iteration=iteration,
                                transcript_chars=len(json.dumps(state.messages, ensure_ascii=False)),
                                request_chars=len(json.dumps(request_messages, ensure_ascii=False)),
-                               context_budget_chars=getattr(self, "context_max_chars", 120000),
-                               request_budget_units=request_size(request_messages[1:]))
+                               context_budget_tokens=getattr(self, "context_max_tokens", CONTEXT_MAX_TOKENS),
+                               request_tokens=request_tokens(request_messages, schemas))
                 stream_options = {}
                 if isinstance(self.model, ModelClient):
                     stream_options = {
+                        'retry': self.retry_model_requests,
                         'on_delta': lambda text: self._progress('assistant_delta', phase=phase,
                                                                iteration=iteration, content=text),
                         'on_stream_reset': lambda: self._progress('assistant_stream_start', phase=phase,
                                                                  iteration=iteration),
                     }
                 response = self.model.complete(request_messages,
-                                               schemas if iteration <= self.max_iterations else [], **stream_options)
+                                               schemas if auto_continue or iteration <= self.max_iterations else [], **stream_options)
             except Exception as exc:
                 self._write_phase_checkpoint(phase, iteration, "model_error", error=str(exc))
                 self._progress("model_error", phase=phase, iteration=iteration, error=str(exc))
@@ -227,7 +257,7 @@ class AgentLoop:
                     ])
                     self._save_conversation(state)
                     self._progress("validation_failed", phase=phase, iteration=iteration, error=str(exc))
-                    if iteration >= self.max_iterations:
+                    if not auto_continue and iteration >= self.max_iterations:
                         raise
                     continue
                 state.final = response.content
@@ -273,13 +303,21 @@ class AgentLoop:
                 self._save_conversation(state)
         self.last_state = state
         raise RuntimeError(f"model exceeded max_iterations={self.max_iterations} "
-                           "(per phase-agent call; configure --max-tool-rounds, not workflow stages)")
+                           "(per phase-agent call; resume with a new assignment using existing artifacts)")
 
     def _save_conversation(self, state: AgentState) -> None:
         """Low-level ephemeral loops have no role session storage."""
 
     def _prepare_tool_batch(self, calls) -> None:
         """Allow an owner to apply execution limits before any tool runs."""
+
+    def _context_compaction_event(self, active, phase=None, iteration=None):
+        self._context_compacting = active
+        if active:
+            self._progress("context_compacting", phase=phase or getattr(self, 'phase', 'coordinator'),
+                           iteration=iteration)
+        else:
+            self._working_context_compacted(phase or getattr(self, 'phase', 'coordinator'), iteration)
 
     def _working_context_compacted(self, phase: str, iteration: int) -> None:
         self._progress("working_context_compacted", phase=phase, iteration=iteration)
@@ -302,8 +340,11 @@ class AgentLoop:
         started = time.monotonic()
         while not stop.wait(interval):
             self._progress("model_heartbeat", phase=phase, iteration=iteration,
-                           waited_seconds=round(time.monotonic() - started, 1))
-            self._write_phase_checkpoint(phase, iteration, "model_waiting")
+                           waited_seconds=round(time.monotonic() - started, 1),
+                           context_compacting=getattr(self, "_context_compacting", False))
+            self._write_phase_checkpoint(phase, iteration,
+                                         "context_compacting" if getattr(self, "_context_compacting", False)
+                                         else "model_waiting")
 
     def _write_phase_checkpoint(self, phase: str, iteration: int, status: str,
                                 *, error: str | None = None) -> None:
@@ -340,15 +381,30 @@ class PhaseAgent(AgentLoop):
     """
 
     SKILL_BY_PHASE = SKILL_BY_PHASE
+    SEARCH_BUDGETS = {
+        "wiki": {"search_wiki": 5},
+        "literature": {"search_wiki": 10},
+        "data_search": {"search_wiki": 3, "battery_resources": 5},
+        "ideas": {"search_wiki": 10, "battery_resources": 5},
+        "research_refine": {"search_wiki": 3, "battery_resources": 3},
+        "experiment_plan": {"search_wiki": 5, "battery_resources": 5},
+        "experiment_bridge": {"search_wiki": 3, "battery_resources": 3},
+        "paper_plan": {"search_wiki": 3},
+        "paper_figure": {"search_wiki": 3, "battery_resources": 3},
+        "paper_write": {"search_wiki": 5},
+        "paper_compile": {"search_wiki": 3},
+        "improvement": {"search_wiki": 3},
+    }
+    auto_continue_iterations = True
     DEFAULT_BATTERY_KNOWLEDGE_ROOT = Path(__file__).resolve().parents[2] / "电池资源库"
 
     def __init__(self, project: str | Path, *, model: str | None = None,
                  model_client: ModelClient | None = None,
                  knowledge_root: str | Path | None = DEFAULT_BATTERY_KNOWLEDGE_ROOT,
-                 phase: str = "ideas", max_iterations: int = 100,
+                 phase: str = "ideas", max_iterations: int = 300,
                  api_key: str | None = None, base_url: str | None = None,
                  timeout: float | None = None,
-                 context_max_chars: int = 120000,
+                 context_max_tokens: int = CONTEXT_MAX_TOKENS,
                  assignment_role: str | None = None,
                  user_question_project: str | Path | None = None,
                  interaction_mode: str = 'expert',
@@ -367,9 +423,9 @@ class PhaseAgent(AgentLoop):
         self.skills_root = repo_root / "paper_agent" / "skills"
         self.knowledge_root = Path(knowledge_root).resolve() if knowledge_root else None
         self.phase = phase
-        if context_max_chars < 1000:
-            raise ValueError("context_max_chars must be at least 1000")
-        self.context_max_chars = context_max_chars
+        if context_max_tokens < 1000:
+            raise ValueError("context_max_tokens must be at least 1000")
+        self.context_max_tokens = context_max_tokens
         self.role: str | None = None
         if assignment_role is not None and assignment_role not in ROLE_DESCRIPTIONS:
             raise ValueError(f"Unknown role: {assignment_role}")
@@ -404,10 +460,14 @@ class PhaseAgent(AgentLoop):
             name for name in self._custom_tools
             if name not in self._tool_phases or self.phase in self._tool_phases[name]
         }
-        from paper_agent.agent.wiki_research import has_evidence_handoff, NAMES
-        if has_evidence_handoff():
-            selected_names -= NAMES
         selected = tuple(spec for spec in self._tools.values() if spec.name in selected_names)
+        if self.phase == 'wiki':
+            from paper_agent.tools.wiki_ingest import WikiIngestion
+            if not hasattr(self, 'wiki_ingestion'):
+                self.wiki_ingestion = WikiIngestion(
+                    self.project, model=self.model,
+                    on_progress=lambda action, details: self._progress('wiki_progress', action=action, **details))
+            selected += self.wiki_ingestion.tools()
         selected += (ToolSpec('request_user_decision',
                               '提问并等待回答；自动模式仅限已查证的必要输入阻塞，必须填写blocking_reason。',
                               self._ask_user),)
@@ -416,7 +476,9 @@ class PhaseAgent(AgentLoop):
                            max_iterations=self.max_iterations,
                            on_progress=self.on_progress)
         self.skill_dirs = (self.skills_root,)
-        self.knowledge_roots = ((self.knowledge_root,) if self.knowledge_root else ())
+        self.knowledge_roots = (
+            (self.knowledge_root,) if self.knowledge_root and self.phase != "literature" else ()
+        )
 
     def _ask_user(self, ctx, question: str, options: list[str] | None = None,
                   blocking_reason: str = '') -> ToolResult:
@@ -438,6 +500,11 @@ class PhaseAgent(AgentLoop):
                                       'answer': answer, 'task_id': task['id']}, ensure_ascii=False))
 
     async def _invoke(self, spec, arguments):
+        if self.phase == 'wiki' and spec.name in {'write', 'edit'}:
+            try:
+                self.wiki_ingestion.validate_draft_write(arguments.get('path', ''))
+            except ValueError as exc:
+                return ToolResult(str(exc), True)
         if spec.name != 'request_user_decision':
             return await super()._invoke(spec, arguments)
         import asyncio
@@ -453,53 +520,58 @@ class PhaseAgent(AgentLoop):
         path = self.skills_root / name / "SKILL.md"
         if path.is_file():
             prompt = f"\n## Skill: {name}\n{path.read_text(encoding='utf-8')}"
+            if self.phase == "wiki":
+                from paper_agent.agent.wiki_role import draft_instructions
+                prompt += draft_instructions()
             return prompt
         return ""
 
-    def _experiment_template_context(self) -> str:
-        if self.phase not in {"experiment_plan", "experiment_bridge"}:
-            return ""
-        experiments = self.project / "experiments"
-        directories = (sorted(path for path in experiments.iterdir()
-                              if path.is_dir() and not path.name.startswith((".", "__")))
-                       if experiments.is_dir() else [])
-        return "\nProject experiment template context:\n" + json.dumps({
-            "experiments_path": str(experiments),
-            "candidate_directories": [str(path) for path in directories],
-            "selection": "Confirm the base template from the project plan and directory contents.",
-        }, ensure_ascii=False) + "\n"
+    def _check_completion(self, phase: str) -> None:
+        if phase == 'wiki':
+            try:
+                self.wiki_ingestion.check_completion()
+            except ValueError as exc:
+                raise ArtifactValidationError(str(exc)) from exc
+            return
+        super()._check_completion(phase)
+
+    def _search_policy_prompt(self) -> str:
+        budgets = self.SEARCH_BUDGETS[self.phase]
+        limits = "\n".join(
+            "- {}：本次派单累计最多调用 {} 次。".format(
+                'battery_resources(action="search")' if name == 'battery_resources' else name, limit)
+            for name, limit in budgets.items() if name in self._by_name
+        )
+        if "search_figure_references" in self._by_name:
+            limits += "\n- search_figure_references：每张待绘制的图最多调用 2 次。"
+        return (
+            f"\n角色执行的检索与交付规则（当前阶段 {self.phase}，优先于 Skill 中冲突的探索要求）：\n"
+            + limits
+            + "\n额度仅统计上述搜索操作，定向阅读说明和检查已定位的样本不计入搜索次数。"
+              "额度是上限，不是必须用满的目标。每个搜索调用计一次，失败或无结果也计入；"
+              "同一轮模型响应中的多次调用分别计数。仅统计本次阶段派单的调用，历史其他任务不占额度；"
+              "上下文压缩、重新加载 Skill、更换关键词或重新阅读记录不重置额度。\n"
+              "优先复用已有报告和本次已读正文。新增搜索应回答会影响当前交付的具体缺口；"
+              "Wiki 先用 search_wiki(view=\"titles\") 筛标题，需要时用 view=\"abstracts\" 看已有摘要；选定后用 read_wiki(wiki_path) 一次读取完整 MD，不再用通用 read 补读同一页面。已有文件路径时定向读取相关内容，不为重新定位同一论文反复搜索。"
+              "连续两次搜索未增加实质证据时停止扩展该问题，将未解决部分记录为证据缺口。\n"
+              "已有材料足以形成有依据的初稿时，先用写入工具保存到本阶段要求的产物路径，"
+              "再围绕具体缺口补充或修订。不要仅反复宣布将写报告，却一直推迟实际写入。"
+              "材料足够时立即停止搜索，不为凑论文数量或子领域数量继续扩展。\n"
+              "达到上限后停止相应搜索，依据现有证据完成交付，注明未核实内容、假设和局限；"
+              "不得通过其他搜索工具、MCP、bash 或子技能绕过额度继续同一轮泛搜，"
+              "不得编造事实来填补缺口。预算不限制按需读取已定位的项目文件、Wiki 栏目或关键原文，"
+              "也不替代实验执行及结果校验。\n"
+        )
 
     def _system_prompt(self) -> str:
         from paper_agent.agent.runtime.questions import interaction_instructions
-        return ("You are an autonomous scientific paper workflow agent. "
-                f"Current phase: {self.phase}. "
-                + "Write code and outputs only inside the project workspace. "
-                + "Read-only access to external datasets explicitly registered in battery resource README local-data fields is allowed. Use list_battery_data_sources, find and inspect_battery_data to verify real files before declaring data missing. Never modify source datasets, including via shell commands or generated scripts. "
-                f"Runner Python executable: {sys.executable!r}. Manifest commands starting with python or python3 use this interpreter. "
-                "When resuming experiments, verify that existing implementation and environment reports still match the current runtime and the approved experiment plan. Regenerate stale environment reports. An earlier CPU-only environment is not a reason to replace a planned CUDA model with a CPU/sklearn surrogate; restore the planned model and verify real CUDA training before collecting its results. Environment failures must be reported and fixed rather than changing the scientific method. "
-                "When bash is available, install missing task dependencies into the actual execution environment and verify them. Dependency installation may write to that environment outside the workspace; source datasets remain read-only. "
-                "Use tools for file access and scripts; do not claim an action was done until a tool result confirms it. "
-                "Follow the current collaboration mode when deciding whether to ask the user. First check the battery resource library, registered local data and compute policy. "
-                "This tool waits for the user's answer in the same task. After it returns, continue from completed tool receipts without repeating completed actions. "
-                "Before lengthy operations and after important results, briefly tell the user your current goal, verified findings and next step in Chinese. These public progress notes are streamed to the terminal; do not disclose private chain-of-thought or invent completed work. "
-                "Produce evidence-backed content and preserve existing artifacts. "
-                "The local registered tools are authoritative; ignore ARIS slash commands, ARIS paths, and unavailable MCP tools mentioned in copied skill text. "
-                + (f"\nPersistent role: {self.role}. {ROLE_DESCRIPTIONS[self.role]}\n"
-                   "Earlier conversation is historical context, not current task authority. "
-                   "Only the current assignment, phase skill and currently registered tools govern this task. "
-                   "Re-read current project artifacts and user decisions; past success claims may be stale. "
-                   "Stop after the assigned task; do not independently advance downstream phases.\n" if self.role else "")
-                + compute_context(self.project) + self._experiment_template_context()
+        return (f"你是研究项目的执行 Agent。当前阶段：{self.phase}。\n"
+                + (f"当前角色：{self.role}。{ROLE_DESCRIPTIONS[self.role]}\n" if self.role else "")
+                + "按本次派单和当前 Skill 自行读取所需材料、完成交付；完成派单后停止，不自行推进下游阶段。"
+                  "历史会话和角色窗口的讨论不构成本次执行授权。审批由主控接收，不自行批准。"
+                  "使用当前已注册的工具；未获工具结果证实的操作不得声称已完成。\n"
                 + self._skill_prompt()
-                + "\nRuntime delivery policy: deliver the stage's required outputs. "
-                  "Choose your own document structure, helper files and review process. "
-                  "JSON visual-check manifests, per-figure hashes, fixed question counts, "
-                  "verbatim checkpoint excerpts and a paper/sections directory are optional. "
-                  "Use only the registered external-service tools; do not recreate old MCP or reviewer clients. "
-                  "The workflow runner owns paper reviews; improvement assignments only revise the supplied report. "
-                + '\n用户在角色窗口的聊天仅为讨论上下文，不构成修改MD或批准的指令。'
-                  '正式产物按本次主控派单生成。用户审批和面向用户的最终审阅问题由主控负责；'
-                  '你可以在交付中列出证据缺口和待决事项作为主控参考，不自行批准或推进阶段。'
+                + self._search_policy_prompt()
                 + interaction_instructions(self.interaction_mode))
 
     def go(self, prompt: str, *, phase: str | None = None,
@@ -512,7 +584,11 @@ class PhaseAgent(AgentLoop):
                 completion_check: Callable[[], None] | None = None) -> AgentState:
         """Execute one skill assignment in a durable, isolated role conversation."""
         self.project.mkdir(parents=True, exist_ok=True)
+        if task.phase == 'wiki' and hasattr(self, 'wiki_ingestion') and getattr(self.wiki_ingestion, 'started', False):
+            del self.wiki_ingestion
         self.configure(phase=task.phase)
+        if task.phase == 'wiki':
+            self.wiki_ingestion.started = True
         self.role = task.role
         session = RoleSession(self.project, task.role)
         with session.locked():
@@ -537,7 +613,11 @@ class PhaseAgent(AgentLoop):
                     f"Current assignment [{task.id}], phase={task.phase}, role={task.role}:\n{task.instruction}",
                     system_prompt=self._system_prompt(), phase=task.phase,
                     completion_check=completion_check, history=history)
-                record.update(status="completed", final=result.final)
+                status = ('failed' if task.phase == 'wiki' and self.wiki_ingestion.receipt.get('status') == 'failed'
+                          else 'completed')
+                record.update(status=status, final=result.final)
+                if status == 'failed':
+                    record['error'] = self.wiki_ingestion.receipt.get('error')
                 return result
             except BaseException as exc:
                 record.update(status="interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed",
@@ -572,9 +652,10 @@ class PhaseAgent(AgentLoop):
 
     def _compact_history(self, session: RoleSession, data: dict,
                          history: list[dict]) -> list[dict]:
-        if request_size(project_messages(history, for_summary=True)) > self.context_max_chars:
-            self._progress("role_context_compacting", role=self.role, session_id=data["session_id"])
-        return session.compact(data, history, self.model, self.context_max_chars)
+        return session.compact(data, history, self.model, self.context_max_tokens,
+                               on_compacting=lambda: self._context_compaction_event(True),
+                               on_compacted=lambda: self._context_compaction_event(False))
+
 
 
 def main() -> None:
@@ -586,8 +667,8 @@ def main() -> None:
                         help="workflow node to run (stops after this node)")
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-tool-rounds", dest="max_tool_rounds",
-                        type=int, default=100,
-                        help="tool-enabled model rounds per phase-agent invocation (default: 100); not workflow stages")
+                        type=int, default=300,
+                        help="model rounds per saved execution segment (default: 300); unfinished assignments continue automatically")
     parser.add_argument("--timeout", type=float, default=None,
                         help="model request timeout in seconds (default: 300)")
     parser.add_argument("--idea-max-total-gpu-hours", type=float, default=8.0)

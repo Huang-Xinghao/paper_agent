@@ -7,8 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .core import ToolContext, ToolResult, tool
-from .data_access import registered_data_sources
+from .core import ToolContext, ToolResult
 
 
 def summary(value, depth=0, budget=None):
@@ -38,14 +37,7 @@ def summary(value, depth=0, budget=None):
     return {'type': type(value).__name__}
 
 
-@tool(read_only=True)
-def list_battery_data_sources(ctx: ToolContext) -> ToolResult:
-    """List read-only dataset paths configured in battery resource README local-data fields."""
-    return ToolResult(json.dumps({'sources': registered_data_sources(ctx.knowledge_roots)}, ensure_ascii=False))
-
-
-@tool(read_only=True)
-def inspect_battery_data(ctx: ToolContext, path: str) -> ToolResult:
+def inspect_data_file(ctx: ToolContext, path: str) -> ToolResult:
     """Inspect real JSON/CSV/PKL fields, counts and bounded samples (not a full scientific audit).
 
     PKL files must come from trusted datasets explicitly registered by the user in

@@ -24,7 +24,7 @@ from paper_agent.agent.runtime.herdr import directory, _read, _relay, HerdrError
 from paper_agent.agent.runtime.sessions import RoleSession
 
 
-TITLES = {'main': 'Main', 'idea_generator': 'Idea Generator', 'experiment': 'Experiment', 'paper_writer': 'Paper Writer'}
+TITLES = {'main': 'Main', 'idea_generator': 'Idea Generator', 'experiment': 'Experiment', 'paper_writer': 'Paper Writer', 'wiki_agent': 'Wiki Agent'}
 HELP = ('Enter 发送 · Alt+Enter / Ctrl+J 换行 · Tab 补全命令\n'
         'PgUp/PgDn 浏览消息 · Ctrl+F 搜索 · Esc 返回输入\n'
         '/status 项目状态   /logs 执行日志   /clear 清屏   /quit 退出\n'
@@ -295,8 +295,15 @@ class RoleTerminal:
         kind = record.get('kind')
         if kind == 'model_start':
             self.set_activity(title + ' · 正在思考', record)
+        elif kind == 'operation_progress':
+            stages = {'parsing_pdf': '正在解析 PDF', 'grouping_figures': '正在分组图片',
+                      'reviewing': '正在审阅材料', 'checking_evidence': '正在核查证据',
+                      'writing_report': '正在生成审阅报告'}
+            self.set_activity(title + ' · ' + stages.get(record.get('stage'), '正在处理材料'), record)
         elif kind == 'context_prepared':
             self.set_activity(title + ' · 正在思考，等待模型响应', record)
+        elif kind == 'context_compacting':
+            self.set_activity(title + ' · 正在压缩上下文', record)
         elif kind == 'working_context_compacted':
             self.set_activity(title + ' · 已整理上下文，继续思考', record)
         elif kind == 'assistant_stream_start':
@@ -370,12 +377,7 @@ class RoleTerminal:
             elif value == '/status':
                 state = _read(self.project / 'workflow-state.json') or {}
                 self.append('· 项目状态', '\n'.join(f'{key}: {state.get(key) or "—"}' for key in ('status', 'current_node', 'project_goal', 'error')))
-                from paper_agent.agent.runtime.artifacts import ArtifactVersions
                 from paper_agent.agent.runtime.questions import UserQuestions
-                changes = ArtifactVersions(self.project).context()['changed_files']
-                if changes:
-                    self.append('· 产物改动提示', '\n'.join(
-                        f'{node}: {", ".join(paths)}' for node, paths in changes.items()))
                 for question in UserQuestions(self.project).pending():
                     self.append('◆ 待回答问题 · ' + TITLES[question['role']], question['question'] +
                                 '\n问题 ID: ' + question['id'] + '\n在 Main 输入 /answer 回答内容')

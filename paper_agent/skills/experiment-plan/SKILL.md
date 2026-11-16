@@ -1,7 +1,7 @@
 ---
 name: experiment-plan
 description: 根据 FINAL_PROPOSAL.md 分别规划电池数据集分析与方法实验，生成按 D/B 块组织的实验计划；runner 自动生成块级进度 tracker。
-allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, search_battery_resources, read_battery_resource, list_battery_data_sources, inspect_battery_data
+allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, battery_resources
 ---
 ## 概述
 
@@ -23,13 +23,43 @@ allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_w
 - **可选辅助贡献**
 - **哪个前沿技术基元是核心（如果有的话）**
 
+### 基础模板与实现交接
+
+结合提案和 Data Report，说明本项目怎样复用 `template`。已有项目代码时，沿用实际目录和入口；新项目默认由 bridge 复制到 `experiments/template/`。
+本阶段写清选择和实现方向，模板准备由实验执行阶段的 `prepare_experiment_template` 完成。
+
+#### 1. 明确任务与数据
+
+| 配置项 | 计划中说明的内容 |
+| --- | --- |
+| 研究对象 | `domain=cell` 或 `domain=electrolyte` |
+| 预测任务 | 电芯选择 `life/soh/trajectory/rul`；电解液选择 `conductivity/anion_ratio`，可组合任务 |
+| 数据集与路径 | 数据集名称、Data Report 中已确认的根路径，以及标签和划分来源 |
+| 观测与预测范围 | 输入信号、历史窗口、预测范围、单位，以及每个任务的真实标签定义 |
+| 评价单位 | 每电芯、每窗口、每个未来时间点或每配方；说明聚合方式与主要指标 |
+
+`life` 是总寿命；`rul` 是总寿命减去当前观测位置。电芯模板以保存记录序号作为观测位置，计划结合数据说明它与原始循环编号的关系。
+早期总寿命实验明确评价到第几个循环；滑窗实验明确窗口覆盖范围和电芯级汇总方式。
+
+#### 2. 对齐划分与模型
+
+- **默认划分**：电芯沿用 BatteryLife 固定 train/val/test 名单；电解液沿用配方分组划分，可使用 `split_file` 指定分组名单。
+- **特殊研究协议**：需要外折、跨域或其他划分时，写清各组实体、选参范围和待扩展的加载接口，供 bridge 实现。
+- **现成模型**：电芯为 IC2ML，电解液为 CompositionMLP。它们是可修改的基础实现。
+- **新增模型**：说明复用哪些数据与训练模块，以及需要新增的模型、输入转换、损失或任务输出。
+
+#### 3. 安排训练、验证与测试
+
+需要寻优时，将候选训练和验证、参数选择、正式训练与最终测试列为相互依赖的运行步骤。
+候选使用验证指标选参；最终测试读取确定配置对应的 checkpoint。固定配置的实验也按相同口径保存训练与评估证据。
+
 ### 第 1 阶段：构建实验故事情节
 
 结合提案读取项目配置的**电池资源库**，参考数据集和可用作对比模型的候选依据。
 
 | 选择对象 | 检索与阅读方式 | 提取内容 |
 | --- | --- | --- |
-| 数据集 | `search_battery_resources(query="任务 + 场景 + 所需信号/标签", stage="experiment_plan", resource_types=["dataset"])`，再用返回的 `resource_id` 调用 `read_battery_resource` | 数据集细节 |
+| 数据集、输入与方法 | 先复用 `data-search/DATA_REPORT.md`；有缺口时用 `battery_resources(action="search", query="任务 + 场景 + 所需信号/标签", resource_types=["dataset", "input", "method"])`，再用 `battery_resources(action="read", resource_id="返回的ID")` 定向阅读 | 数据集细节与可用方法 |
 | 输入表示 | 按实际可观测信号检索 `resource_types=["input"]` | 输入表示的构建条件、可观测信息、物理含义及泄漏风险 |
 | 对比方法 | 按任务、输入形式和核心困难检索 `resource_types=["method"]` | 方法家族、数据与标签要求、实施路线 |
 
@@ -41,7 +71,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_w
 
 数据分析块编号为 `D1、D2、D3…`，按实际分析问题拆分，不固定数量，去寻找数据集的特色并展示！
 
-方法实验块单独编号为 `B1、B2、B3…`，围绕一组紧凑的实验块设计论文。实验可参考wiki中的实验节点部分设计，寻找符合我们架构有意思的实验设计。
+方法实验块单独编号为 `B1、B2、B3…`，围绕一组紧凑的实验块设计论文。实验可参考wiki中的实验节点部分设计，寻找符合我们架构有意思的实验设计。每个实验默认跑5个随机种子[2026,2027,2028,2029,2030]
 默认为以下方向并删除任何不需要的：
 
 1. **主要锚点结果**——该方法是否解决了实际的瓶颈？
@@ -86,6 +116,15 @@ D/B 块 ID 是计划、manifest 和结果报告的统一关联标识。
 **问题**：[问题]
 **方法核心论点**：【一句话核心论点】
 **日期**：[今天]
+
+## 模板与实现交接
+- 基础代码：已有目录 / `experiments/template/`
+- 研究对象、任务与数据路径：
+- 输入、标签、观测窗口与预测范围：
+- 划分来源及需要扩展的接口：
+- 复用模块与待实现模型：
+- 评价单位、聚合方式与主要指标：
+- 训练验证、选参及最终测试安排：
 
 ## 论断地图
 | 论断 | 为什么它很重要 | 最低限度令人信服的证据 | 链接块 |
@@ -170,13 +209,13 @@ runner 从完整计划生成 tracker，一块一行；规划完成时均为“�
 
 根据方法、数据规模、已有配置和计算预算判断是否需要寻优。
 需要时读取 `skill_resource_read(name="experiment-plan", resource="references/hyperparameter-search.md")`，
-在 `refine-logs/EXPERIMENT_PLAN.md` 末尾写一个 `hpo-policy` JSON 围栏，明确核心机制、
-可调参数及范围、验证集选优指标、候选数、训练轮数层级和累计预算。
+在 `refine-logs/EXPERIMENT_PLAN.md` 中说明搜索策略、核心机制、
+可调参数及范围、验证集选优指标、候选数、训练额度和累计预算；不要求固定 JSON 格式。
 用中文说明范围及预算的依据；学习率、隐藏维度和层数等可调整，核心机制的有无属于正式消融。
 候选数、轮数和时间额度按任务与算力估计，接口示例数值不作为默认要求。
 
 选一个代表性总体性能 B 块，明确训练/验证划分、参数应用范围与基线调参口径。
-将训练入口、代码/划分文件和实际数据输入写入 `experiments/hpo_spec.json`；在计划中说明训练配置接口，
-供 bridge 实现和执行。最佳参数由 bridge 实际寻优产生。
-不需要寻优时写 `{"enabled":false,"reason":"具体原因"}`，并说明采用的固定配置及依据。
+在计划中说明待实现的入口、划分与配置接口，供 bridge 实现为普通 manifest 任务并执行。
+嵌套验证时明确每个外折、每个模型独立选参，最佳参数由真实验证结果产生。
+不需要寻优时说明原因、采用的固定配置及依据。
 专家模式随实验计划审阅；自动模式在项目资源限制内自行确定。

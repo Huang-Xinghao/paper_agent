@@ -27,7 +27,8 @@ description: experiment-bridge 内部使用的本地实验执行子 skill，负�
 ## 3. 通过队列执行
 
 准备好 manifest 后调用 `run_experiments()`，训练、评估及后处理 jobs 均交由运行器执行。
-运行器负责依赖调度、GPU 分配、并行限制、超时、预算、执行回执和有效结果复用；不要另用后台进程启动同一批实验。
+运行器统一负责依赖调度、设备、超时、预算和任务记录。manifest 直接调用实验入口，不编写 receipt 包装器、额外预算守护进程、哈希冻结或重复账本。
+每次 attempt 的 status.json 和 output.log 是执行记录来源；queue 和 tracker 是派生进度视图。不要另用后台进程启动同一批实验。
 
 脚本遵循运行器分配的 `PAPER_AGENT_DEVICE` 与 `CUDA_VISIBLE_DEVICES`。进程内的 `cuda:0` 可能对应另一张物理卡，不应手动覆盖可见设备来抢占 GPU。
 需要显式 CUDA 的任务若设备不可用，应定位环境或资源问题，不能静默改用其他后端。

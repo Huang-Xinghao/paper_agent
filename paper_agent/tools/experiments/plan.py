@@ -84,11 +84,9 @@ def write_experiment_tracker(project, blocks, jobs=(), job_states=()):
 
 
 EXPERIMENT_INTERFACE = """执行接口（由运行器维护）：
-实验计划含 enabled=true 的 hpo-policy 时，按计划实现训练配置接口和 experiments/hpo_spec.json。
-详细接口可用 skill_resource_read(name="experiment-plan", resource="references/hyperparameter-search.md") 读取。
-run_hyperparameter_search 仅执行 smoke/寻优；run_experiments 会先完成或复用寻优，再运行正式 manifest。
-正式 manifest 增加 "hpo": {"job_ids": ["需要使用最佳参数的训练job"]}，对应 argv 用独立参数 "{best_config}" 接收最终配置。
-HPO trial 使用独立状态，不写入正式 D/B tracker。正式脚本必须读取配置 parameters，并保存实际生效配置。
+寻优策略由实验agent按计划实现，与训练、评估和后处理一样声明为普通manifest任务。
+候选评估、选参和最终训练用depends_on表达依赖；脚本读取真实配置路径，保存候选指标和实际生效参数。
+嵌套验证按外折、模型分别保存选择结果；测试数据不参与选参。后端不解析hpo-policy，也不自动寻优或绑定最佳配置。
 通过 experiments/manifest.json 声明可执行任务及预期产物。
 任务退出成功且产物校验通过才记为完成。JSON 对象/数组和 CSV 表允许为空；要求非空时在对应 expected_outputs 条目设置 "nonempty": true。metrics 字段始终要求存在且数值有效。
 {

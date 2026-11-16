@@ -110,7 +110,7 @@ def _execute(run_id):
         else:
             options["continue_run"] = True
     options["wait_for_user"] = True
-    options["max_iterations"] = options.pop("max_tool_rounds", 100)
+    options["max_iterations"] = options.pop("max_tool_rounds", 300)
     on_event = lambda record: event(project["id"], record["kind"], record, run_id)
     if action == "proposal_revise":
         from .proposal_revision import run_revision
@@ -138,7 +138,7 @@ def _execute(run_id):
 
         agent = CoordinatorAgent(Path(project["path"]), model=options.get("model"),
                                  worker_max_iterations=options["max_iterations"],
-                                 timeout=options.get("timeout", 600), mode=options.get("mode") or "auto",
+                                 timeout=options.get("timeout", 600), mode=options.get("mode"),
                                  on_event=on_event, execution_guard=guard, wait_for_user=True,
                                  stage_task=options.get("stage_task"), revision_task=options.get("node_task") if action == "revise" else options.get("revision_task"))
         prompt = options["prompt"]

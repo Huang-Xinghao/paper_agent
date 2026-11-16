@@ -36,7 +36,7 @@ def _review(ctx: ToolContext, kind: str, paths: list[str], instructions: str) ->
     try:
         ctx.resolve(output, write=True)
         inputs = tuple(dict.fromkeys(ctx.resolve(path).relative_to(ctx.workspace.resolve()) for path in paths))
-        result = ReviewRunner(ctx.workspace).run(ReviewRequest(
+        result = ReviewRunner(ctx.workspace, on_progress=ctx.on_progress).run(ReviewRequest(
             kind=kind, instructions=instructions, inputs=inputs))
     except (OSError, ValueError) as exc:
         return ToolResult(str(exc), True)

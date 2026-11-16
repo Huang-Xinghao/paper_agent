@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import time
+import tempfile
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,7 +99,7 @@ class ReviewRunner:
 
     def __init__(self, workspace: Path, *, model: str | None = None,
                  reasoning_effort: str | None = None, timeout: float = 1200,
-                 termination_grace: float = 2, executable: str | None = None):
+                 termination_grace: float = 2, executable: str | None = None, on_progress=None):
         self.workspace = Path(workspace).resolve(strict=True)
         if not self.workspace.is_dir():
             raise ValueError("workspace must be a directory")
@@ -113,8 +114,19 @@ class ReviewRunner:
         self.timeout = timeout
         self.termination_grace = termination_grace
         self.executable = executable
+        self.on_progress = on_progress
 
     def run(self, request: ReviewRequest) -> ReviewResult:
+        from paper_agent.integrations.progress import OperationProgress
+        role = {'idea': 'idea_generator', 'code': 'experiment', 'paper': 'paper_writer'}.get(request.kind, 'main')
+        progress = OperationProgress(self.workspace, 'review', request.output or DEFAULT_REPORTS.get(request.kind, 'review'),
+                                     role=role, on_progress=self.on_progress)
+        with progress.running():
+            result = self._run(request, progress)
+            progress.update('finished', status=result.status)
+            return result
+
+    def _run(self, request: ReviewRequest, progress) -> ReviewResult:
         if request.kind not in RUBRICS:
             raise ValueError(f"unknown review kind: {request.kind}")
         if not request.instructions.strip() or not request.inputs:
@@ -163,15 +175,51 @@ class ReviewRunner:
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
             if diagnostic_dir is not None:
-                event_stream = (diagnostic_dir / "events.jsonl").open("w", encoding="utf-8")
-                error_stream = (diagnostic_dir / "stderr.log").open("w", encoding="utf-8")
+                event_stream = (diagnostic_dir / "events.jsonl").open("w+", encoding="utf-8")
+                error_stream = (diagnostic_dir / "stderr.log").open("w+", encoding="utf-8")
+            if event_stream is None:
+                event_stream = tempfile.TemporaryFile(mode='w+', encoding='utf-8')
+                error_stream = tempfile.TemporaryFile(mode='w+', encoding='utf-8')
+            cursor, pending, checks = 0, b'', 0
+
+            def read_activity():
+                nonlocal cursor, pending, checks
+                chunk = os.pread(event_stream.fileno(), 1024 * 1024, cursor)
+                cursor += len(chunk)
+                pending += chunk
+                lines = pending.split(b'\n')
+                pending = lines.pop()
+                for line in lines:
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    item = event.get('item') or {}
+                    if not isinstance(item, dict):
+                        continue
+                    if event.get('type') == 'thread.started':
+                        progress.update('reviewing')
+                    elif event.get('type') == 'item.started' and item.get('type') == 'command_execution':
+                        progress.update('checking_evidence')
+                    elif event.get('type') == 'item.completed' and item.get('type') == 'command_execution':
+                        checks += 1
+                        progress.update('reviewing', checks_completed=checks)
+                    elif event.get('type') == 'item.completed' and item.get('type') == 'agent_message':
+                        progress.update('writing_report')
+                    elif event.get('type') == 'turn.completed':
+                        progress.update('finalizing')
+
+            progress.tick = read_activity
+            progress.update('starting_reviewer')
             command = [self.executable or resolve_codex(), "exec"]
             command += ["--json", "--skip-git-repo-check", "-m", self.model,
                         "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
                         "-c", f"model_reasoning_effort={json.dumps(self.reasoning_effort)}", "-"]
             proc = subprocess.Popen(
                 command, cwd=self.workspace, stdin=subprocess.PIPE,
-                stdout=event_stream or subprocess.PIPE, stderr=error_stream or subprocess.PIPE,
+                stdout=event_stream, stderr=error_stream,
                 text=True, encoding="utf-8", errors="replace", start_new_session=True,
             )
             stdout, stderr = proc.communicate(prompt, timeout=self.timeout)
@@ -188,10 +236,15 @@ class ReviewRunner:
                 stdout, stderr = proc.communicate()
                 exit_code = proc.returncode
             if event_stream is not None:
-                event_stream.close()
-                error_stream.close()
-                stdout = (diagnostic_dir / "events.jsonl").read_text(encoding="utf-8", errors="replace")
-                stderr = (diagnostic_dir / "stderr.log").read_text(encoding="utf-8", errors="replace")
+                # Synchronize with the activity reader before closing its file.
+                with progress.lock:
+                    progress.tick = None
+                    event_stream.seek(0)
+                    error_stream.seek(0)
+                    stdout, stderr = event_stream.read(), error_stream.read()
+                    event_stream.close()
+                    error_stream.close()
+            progress.update('validating_report')
 
         completed, failed, content = False, False, ""
         usage_events = 0

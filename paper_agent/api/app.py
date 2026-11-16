@@ -259,7 +259,7 @@ class RunCreate(BaseModel):
     mode: Literal["auto", "expert"] | None = None
     start_node: str | None = None
     stop_after: str | None = None
-    max_tool_rounds: int = Field(default=100, ge=1, le=500)
+    max_tool_rounds: int = Field(default=300, ge=1, le=500)
     timeout: float = Field(default=600, gt=0, le=7200, allow_inf_nan=False)
     paper_review_timeout: float = Field(default=1800, gt=0, le=14400, allow_inf_nan=False)
     paper_review_round2_timeout: float = Field(default=1200, gt=0, le=14400, allow_inf_nan=False)
@@ -363,11 +363,17 @@ def detail(project, terminal_paths=None):
             and status not in ACTIVE):
         # 修订是旁路草稿任务，完成/失败都不能抹掉原研究的待审阅状态。
         status = state.get("status", "idle")
+    if (status not in ACTIVE and state.get('status') == 'awaiting_user'
+            and (state.get('expert_checkpoint') or {}).get('status') == 'pending'):
+        # A discussion or failed edit cannot dismiss a still-pending stage review.
+        status = 'awaiting_user'
     if project["path"] in terminal_paths:
         status = "external_running"
     elif not latest and status == "running":
         status = "interrupted"
     progress = read_json(Path(project["path"]) / "workflow-progress.json", {})
+    from paper_agent.integrations.progress import live_operations
+    progress["operations"] = live_operations(project["path"])
     review_progress = progress.get("improvement", {})
     if (status in ACTIVE and review_progress.get("stage") == "review"
             and review_progress.get("stage_started_at")):
@@ -376,6 +382,15 @@ def detail(project, terminal_paths=None):
                 (datetime.now(timezone.utc) - datetime.fromisoformat(review_progress["stage_started_at"])).total_seconds(), 1))}
         except (ValueError, TypeError):
             pass
+    pending_questions = UserQuestions(project['path']).pending()
+    from .agents import agent_views
+    last_events = rows(
+        "SELECT kind,data FROM events WHERE project_id=? AND run_id=? AND kind IN "
+        "('assignment_start','assignment_end','model_start','tool_start','assistant_output','role_task_start','user_question','context_compacting','working_context_compacted') "
+        "ORDER BY id DESC LIMIT 1",
+        (project['id'], latest['id'])) if latest and status in ACTIVE else []
+    last_event = ({**last_events[0], 'data': json.loads(last_events[0]['data'])}
+                  if last_events else None)
     return {
         **project,
         "status": status,
@@ -383,7 +398,8 @@ def detail(project, terminal_paths=None):
         "progress": progress,
         "runs": runs,
         "checkpoint_token": checkpoint_token(project, state),
-        "pending_questions": UserQuestions(project["path"]).pending(),
+        "pending_questions": pending_questions,
+        "agents": agent_views(project['path'], status, state, pending_questions, last_event),
     }
 
 
@@ -445,7 +461,7 @@ def start_run(project_id: str, body: RunCreate):
 
 class MessageCreate(BaseModel):
     prompt: str = Field(min_length=1, max_length=20000)
-    mode: Literal["auto", "expert"] = "expert"
+    mode: Literal["auto", "expert"] | None = None
     model: str | None = Field(default=None, max_length=200)
 
 
@@ -491,6 +507,12 @@ def create_run(project_id: str, body: RunCreate, *, message_prompt=None):
             raise HTTPException(409, "已有项目正在运行，请等待完成或先停止当前运行")
         state = read_json(Path(project["path"]) / "workflow-state.json", {})
         options = body.model_dump(exclude_none=True)
+        if body.action in {'start', 'resume', 'coordinate', 'revise'}:
+            from paper_agent.agent.runtime.modes import resolve_mode
+            options['mode'] = resolve_mode(project['path'], body.mode, default='expert')
+            if (state.get('status') == 'awaiting_user' and body.mode is not None
+                    and options['mode'] != state.get('mode')):
+                raise HTTPException(409, '请先审阅并批准或修订当前产物，再切换协作模式')
         if (state.get("status") == "awaiting_user" and state.get("current_node") == "refine"
                 and body.action not in {"review", "proposal_revise", "proposal_approve", "coordinate", "revise"}):
             raise HTTPException(409, "最终方案待审阅，请先提交修改意见或批准方案")

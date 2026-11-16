@@ -1,6 +1,8 @@
 """Validate and execute local experiment jobs without model or workflow routing."""
 from __future__ import annotations
 
+from paper_agent.storage import write_json as atomic_json
+
 import csv
 import importlib.util
 import json
@@ -53,8 +55,16 @@ def job_dependencies(jobs):
 
 
 def receipt_matches_job(receipt, job):
-    execution = lambda value: {k: v for k, v in value.items() if k not in {'depends_on', 'block_id'}}
+    def execution(value):
+        spec = {k: v for k, v in value.items() if k not in {'depends_on', 'block_id'}}
+        argv = spec.get('argv', [])
+        # Compatibility with projects that formerly wrapped every entrypoint.
+        # Historical attempts remain unchanged when the wrapper is removed.
+        if len(argv) >= 5 and argv[1] in {'experiments/receipt.py', 'experiments/receipt_v2.py'}:
+            spec['argv'] = argv[:1] + argv[4:]
+        return spec
     return receipt.get('status') == 'completed' and execution(receipt.get('job', {})) == execution(job)
+
 
 
 class ExperimentExecutor:
@@ -274,14 +284,14 @@ class ExperimentExecutor:
                    "log": str((directory / "output.log").relative_to(self.project))}
         record = directory / "status.json"
         receipt.update(effective_timeout_seconds=timeout, prior_experiment_seconds=used)
-        record.write_text(json.dumps(receipt, indent=2))
+        atomic_json(record, receipt)
         attempt_started = time.monotonic()
         try:
             with (directory / "output.log").open("w") as log:
                 process = subprocess.Popen(argv, cwd=self.project, env=env, stdout=log, stderr=subprocess.STDOUT,
                                            start_new_session=True)
                 receipt["pid"] = process.pid
-                record.write_text(json.dumps(receipt, indent=2))
+                atomic_json(record, receipt)
                 try:
                     while True:
                         if cancel_event is not None and cancel_event.is_set():
@@ -328,7 +338,7 @@ class ExperimentExecutor:
                     receipt["compute_backend"] = {"status": "unknown", "reason": f"Invalid runtime backend report: {exc}"}
             receipt["elapsed_seconds"] = time.monotonic() - attempt_started
             receipt["finished"] = datetime.now(timezone.utc).isoformat()
-            record.write_text(json.dumps(receipt, indent=2))
+            atomic_json(record, receipt)
         if receipt["status"] != "completed":
             log_tail = (directory / "output.log").read_text(errors="replace")[-12000:]
             if re.search(r"(?:HTTP(?:Error)?[ :]+|status(?: code)?[ :]+)(?:401|403)\b", log_tail, re.I):

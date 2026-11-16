@@ -59,7 +59,10 @@ assert 'Current research evidence' not in prompt
     assert result.report.read_text() == "# Review\nNeeds revisions"
     after = {p for p in tmp_path.rglob('*') if p.is_file()}
     usage_path = tmp_path / '.paper-agent/usage.jsonl'
-    assert after - before == {result.report, usage_path}
+    operations = set((tmp_path / '.paper-agent/operations').glob('*.json'))
+    assert len(operations) == 1
+    assert json.loads(next(iter(operations)).read_text())['status'] == 'completed'
+    assert after - before == {result.report, usage_path, *operations}
     event = json.loads(usage_path.read_text())
     assert event['usage']['input_tokens'] == 100
     assert event['source'] == 'review'
@@ -210,3 +213,34 @@ time.sleep(30)
     assert 'INCOMPLETE REVIEW' in (folder / 'partial.md').read_text()
     assert 'Partial findings' in (folder / 'events.jsonl').read_text()
     assert json.loads((folder / 'request.json').read_text())['inputs'][0]['sha256']
+
+
+def test_live_progress_is_visible_before_reviewer_finishes(tmp_path, monkeypatch):
+    import threading
+    from paper_agent.integrations.progress import OperationProgress, live_operations
+    monkeypatch.setattr(OperationProgress, 'interval', .02)
+    executable = fake_codex(tmp_path, '''
+print(json.dumps({'type':'thread.started', 'thread_id':'live-review'}), flush=True)
+print(json.dumps({'type':'item.started','item':{'type':'command_execution'}}), flush=True)
+while not os.path.exists('release'):
+    time.sleep(.02)
+''' + SUCCESS)
+    task = request(tmp_path)
+    events, results = [], []
+    runner = ReviewRunner(tmp_path, executable=executable, timeout=5,
+                          on_progress=lambda action, details: events.append(details))
+    worker = threading.Thread(target=lambda: results.append(runner.run(task)))
+    worker.start()
+    try:
+        deadline = time.monotonic() + 3
+        while not any(item['stage'] == 'checking_evidence' for item in events):
+            assert time.monotonic() < deadline
+            time.sleep(.02)
+        assert worker.is_alive()
+        assert live_operations(tmp_path)[0]['stage'] == 'checking_evidence'
+        assert not (tmp_path / 'idea-stage/review.md').exists()
+    finally:
+        (tmp_path / 'release').touch()
+        worker.join(timeout=6)
+    assert results[0].status == 'completed'
+    assert not live_operations(tmp_path)

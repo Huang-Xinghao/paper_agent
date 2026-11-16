@@ -40,7 +40,10 @@ def discover_local_papers(ctx: ToolContext, query: str = "", library_path: str |
     """Find PDFs in the shared research-wiki/raw-paper/ library.
 
     An optional library_path also searches a permitted read-only directory.
-    Returns readable paths and filename relevance scores. Use read_local_paper for content.
+    Use only to locate an especially relevant paper after Wiki leaves a concrete
+    decision-critical gap, or when the user requests original-source verification.
+    Filename scores are navigation clues, not evidence of relevance. Prefer Wiki
+    notes for screening; do not routinely read the returned PDF list.
     """
     roots: list[Path] = []
     if library_path:
@@ -77,7 +80,10 @@ def discover_local_papers(ctx: ToolContext, query: str = "", library_path: str |
 
 @tool(read_only=True)
 def read_local_paper(ctx: ToolContext, path: str, max_pages: int = 3) -> ToolResult:
-    """Extract the first pages of a local PDF for title, abstract, and introduction screening."""
+    """Read the first PDF pages only for a highly relevant paper with a specific
+    unresolved Wiki gap, or explicit original-source verification. Explain the
+    relevance and missing detail first; prefer Wiki notes for routine screening.
+    """
     target = ctx.resolve_read(path)
     if not target.is_file() or target.suffix.lower() != ".pdf":
         return ToolResult(f"PDF not found: {path}", True, {"error_code": "PDF_NOT_FOUND"})
@@ -100,7 +106,11 @@ def read_local_paper(ctx: ToolContext, path: str, max_pages: int = 3) -> ToolRes
 @tool(read_only=True)
 def read_paper_pages(ctx: ToolContext, path: str, start_page: int = 1,
                      page_count: int = 5) -> ToolResult:
-    """Read numbered PDF pages, allowing a paper to be reviewed beyond its abstract."""
+    """Verify specific pages of a highly relevant paper when Wiki lacks a critical
+    detail, or the user requests original-source verification. Explain relevance
+    and the unresolved question first. Stop once answered; next_page is a locator,
+    not an instruction to continue reading. Reuse pages already read.
+    """
     target = ctx.resolve_read(path)
     if not target.is_file() or target.suffix.lower() != ".pdf":
         return ToolResult(f"PDF not found: {path}", True, {"error_code": "PDF_NOT_FOUND"})

@@ -1,7 +1,7 @@
 ---
 name: paper-figure
 description: 承接实验计划和论文计划，基于真实电池实验结果生成出版质量、可复现的图表、正式图注和 LaTeX 引用片段。
-allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, search_wiki, read_wiki, search_figure_references, read_battery_resource
+allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, search_wiki, read_wiki, search_figure_references, battery_resources
 ---
 
 # 论文图表绘制
@@ -15,7 +15,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, 
 - 数值结果图：用 `write/edit` 编写或修改 Python 绘图脚本，用 `bash` 运行，导出 PDF 与同版 PNG；数据从真实产物读取。
 - 场景/架构图：按 Runner 要求调用 `generate_image`，依据真实方法生成；不能用它生成实验曲线、指标或统计图。
 - 视觉自检：调用 `view_image(path="figures/figure_3_example.png", detail="high", max_side=2048)`，当前模型会收到图片视觉输入。该工具只读图，不生成或修改图。
-- 修图：数值图修改脚本后重跑；image 工具生成的 PNG 如需修改，重新调用 `generate_image`，不要直接改 PNG，以保留回执哈希一致性。
+- 修图：数值图修改脚本后重跑；image 工具生成的 PNG 如需修改，重新调用 `generate_image`，保留最新版本并重新查看。
 
 ## 输入与职责边界
 
@@ -89,7 +89,7 @@ def save_fig(fig, name, fmt=FORMAT):
 
 如果用户指定了参考图，或说明需要结合参考图来画，则先根据以下逻辑来生成图1，否则略过**图一设计指南**
 
-直接调用：read_battery_resource(resource_id="代码和绘图指南/架构图1")；使用 `generate_image`生成
+直接调用：battery_resources(action="read", resource_id="代码和绘图指南/架构图1")；使用 `generate_image`生成
 
 ### 图 1设计指南：检索参考图并生成绘图 prompt
 
@@ -191,34 +191,14 @@ save_fig(fig, 'fig3_comparison')
 
 先看全图，小字仍不清时使用 `max_side=4096` 或生成局部预览再调用工具；不能仅凭放大的局部判断整图排版合格。复杂表格需检查其编译后的 PNG 预览，不能将 `.tex` 文本当作视觉检查。
 
-视觉检查记录统一维护在 `figures/visual_checks.json`，保存交付文件及预览的 SHA-256、问题、修正和检查状态。模型/API 不接受图片或工具调用失败时，在该记录中保存具体错误，保留未检查状态，不宣称通过。
-
-Runner 会核验 `latex_includes.tex`（含其引用的 TeX 文件）中每个 `includegraphics` 的检查记录。完成前写入 `figures/visual_checks.json`：
-
-```json
-{
-  "figures": [
-    {
-      "asset": "figures/example.pdf",
-      "preview": "figures/example.png",
-      "asset_sha256": "最终交付文件的 SHA-256",
-      "preview_sha256": "view_image 返回的最终预览 SHA-256",
-      "status": "passed",
-      "findings": "具体说明面板、文字、图例、边界和连线的检查结果，以及发现的问题",
-      "corrections": "修改了什么；无需修改时说明未发现可修复的排版问题"
-    }
-  ]
-}
-```
-
-每个实际引用的图一条，包含附录图。PNG/JPEG 直接交付时 asset 与 preview 可以相同；PDF 应渲染最终交付 PDF 生成预览，避免检查到不同版本。使用项目相对路径。每次续跑仍需用本次 `view_image` 查看复用的最终预览。文件修改后更新记录并重新查看；缺少记录、没有本次查看回执、哈希不匹配或状态未通过，Runner 会将错误反馈给你继续修复。
+在 figure_plan.md 简要记录检查中发现的问题、修复和仍有的限制；不要求额外视觉回执 JSON 或逐图哈希。
 
 ### 第 6 步：同步交付和续跑
 
 - 图注逐面板对应最新成图，注明实际样本与统计粒度、split、单位、样本数及区间定义；
 - `latex_includes.tex` 是正式 caption 的唯一维护位置，包含与实际产物和计划 ID 对应的 label、路径和图注；未生成项保留状态说明，不使用空白图或不存在的图片路径冒充完成。
 - 续跑时先检查已有图和脚本。输入、计划与输出仍适用的图可以复用，但仍需通过 `view_image` 查看；仅重画有缺口或问题的图，不默认重跑所有绘图脚本。
-- Runner 要求本次生成图1时，仍需本次成功的 `generate_image` 回执；已有图和 `view_image` 回执均不能替代生成回执。接口失败时明确报告图1未完成。
+- 图1生成接口失败时如实说明，按下述降级方式处理。
 
 ## 必须产出
 
@@ -227,9 +207,8 @@ Runner 会核验 `latex_includes.tex`（含其引用的 TeX 文件）中每个 `
 - `figure_plan.md`：上游图表/子图映射、输入、字段、判断任务、绘图脚本、输出路径和绘图执行状态；缺口保留到具体证据项。
 - `paper_plot_style.py` 及每张数据图的可重跑脚本。
 - 按计划实际生成的 PDF、至少 300 dpi PNG，以及独立 LaTeX 表格；不固定总数或图2之后的文件名。
-- 架构图的可编辑源/生成记录；Runner 要求的图1保留约定 PNG 路径和回执。
+- 架构图的可编辑源或生成记录及最终图片路径。
 - `latex_includes.tex`：保存与实际产物和计划 ID 对应的引用片段及正式 caption，供后续写作读取；图注注明数据来源、筛选条件、样本数、统计粒度、split、单位、聚合和区间定义。
-- `visual_checks.json`：视觉检查记录的唯一维护位置，保存最终交付图及预览的哈希、具体检查结果、修复记录和检查状态，供 Runner 核验。
 
 ### 图1生成失败后的降级
 

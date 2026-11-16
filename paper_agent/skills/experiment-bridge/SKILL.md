@@ -17,8 +17,8 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 1. **`refine-logs/EXPERIMENT_PLAN.md`**：实验类别、数据划分、实验设置及计划产物，是实现实验的主要依据。
 2. **`refine-logs/EXPERIMENT_TRACKER.md`**：runner 自动生成的块级进度视图，一块一行，仅供查看；具体 jobs 和依赖以 manifest 为准。
 3. **`refine-logs/FINAL_PROPOSAL.md`**：研究任务、方法定义和关键机制，用于确认代码实际实现的内容。
-4. **项目内基础模板（可选）**：读取项目已准备的参考代码和配置，在适合当前任务的模板上修改和扩展，例如 `experiments/BatteryLife/` 或 `experiments/bamboo_mixer/`。模板由当前项目的研究对象、计划和实际目录决定。
-6. **资源库的数据登记信息**：真实数据路径、字段及数据集说明。
+4. **项目内基础模板（可选）**：读取项目已准备的参考代码和配置，在适合当前任务的模板上修改和扩展，默认使用 `experiments/template/` 的 IC2ML 通用框架。模板由当前项目的研究对象、计划和实际目录决定。
+5. **资源库的数据登记信息**：用 `battery_resources(action="search", query="数据集名称")` 获取说明与登记路径，`action="read"` 配合 resource_id 阅读说明；实现加载器需要核对样本时，用 `action="inspect"` 配合 path 查看结构。
    同时读取 `data-search/DATA_REPORT.md`，利用数据包及配套文件索引定位标签、元数据、划分和加载代码；未在电芯子目录找到标签不能据此判断数据包缺失标签。
 
 ## Workflow
@@ -39,46 +39,89 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 区分实验类别的呈现顺序与任务的实际依赖顺序。计划是实验设计依据，tracker 是执行状态视图。方法定义
 不足以实现时，记录具体问题，不自行增加实验或用占位实现补齐。
 
-### Phase 2: Read the Project Base Template
+### Phase 2: Prepare and Understand the Base Template
 
-编码前，确认项目实际采用的基础模板：
+#### 2.1 选择或复用代码
 
-1. **了解目录与入口**：查看已有说明（若有）、配置和启动脚本，找到数据处理、训练、评估或生成的实际入口。
-2. **追踪数据路径**：阅读实际调用的数据加载、划分和预处理代码，确认字段、样本单位、标签及掩码、输入形状、单位与归一化逻辑；
-3. **追踪模型与训练**：阅读计划涉及的模型、损失函数和训练入口，确认前向输出、可训练部分、验证选型。
-4. **追踪评估与产物**：确认权重和预处理参数重载、真实标签来源、指标计算、测试路径及输出位置；涉及生成任务时核对条件和输出定义。
-5. **建立计划到代码的映射**：逐项记录数据、split、标签、模型、训练、指标和变体对应的实际文件与入口，以及哪些复用、修改或新增，再开始编码。
+从实验计划的“模板与实现交接”提取研究对象、任务、数据路径、划分及待实现模块。
+已有适用代码时沿用实际目录；新项目调用 `prepare_experiment_template` 准备可编辑代码：
 
-如果用户提供代码模版或存在研究基础，尽可能的复用已有代码，避免重复实现。若计划中有未实现的部分，先在基础模板上补充实现。
+```text
+domain="cell", tasks=["life"], dataset="Tongji",
+data_path="Data Report 已核实的数据根路径", destination="experiments/template"
+```
+
+电芯任务为 `life/soh/trajectory/rul`，电解液任务为 `conductivity/anion_ratio`，按计划选择单任务或组合。
+电解液使用 `domain="electrolyte", dataset="bamboo_mixer"`，现成模型是 CompositionMLP。
+工具返回配置、入口、工作目录与启动命令；依赖和数据位置结合当前执行环境确认。续跑复用已复制并修改的代码。
+
+#### 2.2 阅读实际调用链
+
+| 位置 | 重点确认 |
+| --- | --- |
+| `task_config.json`、`configuration.py` | 实际任务、数据路径、窗口、训练参数和命令行覆盖方式 |
+| `adapters/<domain>.py`、`data_provider/` | 输入输出、标签单位、mask、划分、归一化和样本 ID |
+| `models/registry.py`、模型文件 | 模型构造、前向接口、可训练部分和任务输出 |
+| `exp/experiment.py`、`run.py` | 训练、验证、checkpoint 恢复、评价口径和结果保存 |
+
+电芯默认沿用 BatteryLife 固定划分；电解液默认按配方分组，支持 `split_file`。
+将计划中的样本单位、观测窗口、标签及评价单位与加载器逐项对应。
+
+#### 2.3 确认扩展位置
+
+- **新增模型**：在 `models/` 实现并加入注册表，同步 adapter 的 `compatible_models`，使输入和任务输出对齐。
+- **特殊划分**：按计划在加载器中接入明确的实体名单或折号，并记录实际划分来源。
+- **统计口径**：模板默认按窗口/观测值计算指标；电芯级、固定早期窗口或其他聚合指标按计划增加筛选和后处理。
+
+将复用、修改和新增部分简要对应到计划 D/B 块，作为实现与后续审阅的依据。
 
 ### Phase 3: Implement Experiments on the Base Template
 
-对于每个里程碑，编写实验脚本：
+#### 3.1 实现计划中的方法
 
-1. **检查现有代码** — 查找现有实验脚本、模型代码、数据加载器。尽可能重复利用。参考`电池资源库/代码和绘图指南/代码设计.md`来设置batchsize和线程数
+围绕已读取的调用链补齐模型、基线、消融、损失及数据处理。任务设置写入配置，训练参数可通过命令行覆盖。
+batch size 和线程数结合实际算力，参考资源库中的 `代码和绘图指南/代码设计.md`。
 
-2. **实施缺失的部分：**
-   - 具有适当 argparse 的训练脚本（所有超参数均可配置）
-   - 计算指定指标的评估脚本
-   - 如果需要，数据加载/预处理
-   - 基线实现（如果尚未存在）
-   - 修复随机种子以提高可重复性
-   - 结果保存到 JSON/CSV 以供以后分析
+#### 3.2 分开训练验证与最终测试
 
-3. **遵循计划的运行顺序**
+模板支持以下运行方式：
 
-4. **部署前的自审稿：**
-   - EXPERIMENT_PLAN.md 中的所有超参数是否都反映在 argparse 中？
-   - 随机种子是固定可控的吗？
-   - 结果是否以可解析的格式保存（JSON/CSV）？
-   - 代码与 FINAL_PROPOSAL.md 的方法描述匹配吗？
-   - split 是否真的隔离了计划要求的实体/域，归一化和模型选择是否只使用合法训练/验证数据？
-   - 标签是否来自数据集真实目标，而不是另一模型预测；所有基线/消融是否使用相同输入和评价口径？
-   - 每个 seed 是否独立训练并保存结果；统计是否使用计划规定的样本与统计单位？
+| `--stage` | 用途与产物 |
+| --- | --- |
+| `train` | 训练并恢复最佳验证 checkpoint，保存 `validation_metrics.json` 和验证预测 |
+| `validate` | 恢复 checkpoint，计算验证指标 |
+| `test` | 恢复 checkpoint，保存最终测试指标与预测 |
+| `train_test` | 已确定配置时，依次训练、验证和测试 |
+
+候选搜索使用 `train` 返回的验证指标，保存最佳参数文件；正式配置读取该文件训练，再由依赖任务执行 `test`。
+训练早停默认使用所选任务的加权验证损失，候选选参指标按计划读取，例如 `life.mae`。
+
+manifest 的命令从项目根目录执行。使用工具返回的 `project_train_argv` 和 `project_test_argv`，按 job 补上配置、种子和 `--output_dir`。
+例如：
+
+```text
+python experiments/template/run.py --config experiments/template/task_config.json \
+  --stage train --tasks life --seed 17 \
+  --output_dir results/2_overall_performance/B1_Tongji_IC2ML/seed_17
+```
+
+最终测试使用相同的模型和数据配置，通过 `--checkpoint` 指向该训练目录。
+
+#### 3.3 组织结果与验证实现
+
+每组训练配置和种子使用独立结果目录，配套训练与测试共用该目录。
+`data_manifest.json` 记录实际参数、预处理和划分，CSV 通过 `sample_id + task + target_index` 关联真实值与预测。
+
+正式执行前，围绕以下项目核对实现：
+
+- **方法**：模型、损失和关键消融对应 FINAL_PROPOSAL 与实验计划。
+- **数据**：划分、预处理、观测范围和标签定义对应 Data Report；各方法使用一致的评价样本。
+- **运行**：命令可解析配置与种子，资源设置对应项目配置。
+- **产物**：指标字段、CSV、checkpoint 和样本标识与 manifest 对应，统计使用计划规定的单位。
 
 ### 独立代码审阅
 
-- 模型、数据处理、训练、评估及 manifest 的**完整调用链**准备好后（禁止写部分代码就调用），调用 `review_code`，通过 `files` 传入相关代码、配置和测试文件路径；
+- 模型、数据处理、训练、评估及 manifest 的**完整调用链**准备好后，调用 `review_code`，通过 `files` 传入相关代码、配置和测试文件路径；
 - reviewer 只审阅，修复由你完成。报告写入 `refine-logs/CODE_REVIEW.md`，正文返回当前对话。
 - 结合证据处理审阅意见，优先修复影响实验有效性的问题；有依据时可以不采纳，关键分歧简要说明。
 - 核心实现有较大修改时，可再次审阅。审阅执行成功不等于代码正确，运行正确性以实际执行回执和结果为准；调用失败时查看错误并重试，**最多review次数为两次**。
@@ -151,7 +194,7 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 
 交接前重新读取完整实验计划，核对必做项 X/Y、条件跳过及可选项；核对 runner 生成的 tracker，并更新结果摘要；不要手动改写 tracker。
 每个原计划图/子图的证据都要能指向实际产物，或明确指出尚缺什么。必做缺口不能留给 paper_plan 静默删减。
-必做项未完成则继续补齐；
+可修复的必做缺口继续补齐；无法完成时如实写出缺口及其对结论的影响，交由主控决定后续方向，不增设回执审批。
 
 
 ## 最小产物
@@ -160,8 +203,8 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 总体性能、对比、消融和不确定性实验至少保存：
 
 - 模型 checkpoint；复用模型时引用已有文件，无训练参数的方法注明不适用。
-- 真实值 CSV 和预测值 CSV，通过一致的样本 ID 关联到评测样本。
-- 模型超参数配置，能够关联到对应 checkpoint 和预测结果。
+- `targets.csv` 和 `predictions.csv`，通过 `sample_id + task + target_index` 关联到评测样本；`observed` 标记真实标签是否可用。
+- `data_manifest.json` 中的实际参数、预处理状态和划分，以及对应指标；已有 NPY 与样本 JSON 可保留供后处理使用。
 
 产物按计划统一写入
 `results/<实验类别>/<实验ID_数据集_模型或变体>/seed_<种子>/`；实验类别使用
@@ -177,24 +220,40 @@ description: 将电池实验计划实现为代码，调用本地执行子 skill 
 ```json
 {
   "backend": "local",
-  "required_inputs": ["项目内相对输入路径或已登记外部数据绝对路径"],
+  "required_inputs": ["experiments/template/task_config.json", "已登记的数据根路径"],
   "jobs": [
     {
-      "id": "B1_HUST_full_seed17",
+      "id": "B1_Tongji_IC2ML_train_seed17",
       "block_id": "B1",
       "depends_on": [],
-      "argv": ["python", "experiments/run.py", "--experiment-id", "B1", "--seed", "17", "--output-dir", "results/2_overall_performance/B1_HUST_full/seed_17"],
+      "argv": ["python", "experiments/template/run.py", "--config", "experiments/template/task_config.json", "--tasks", "life", "--stage", "train", "--seed", "17", "--output_dir", "results/2_overall_performance/B1_Tongji_IC2ML/seed_17"],
       "resources": {"device": "auto"},
       "timeout_seconds": 3600,
       "expected_outputs": [
-        {"path": "results/2_overall_performance/B1_HUST_full/seed_17/targets.csv"},
-        {"path": "results/2_overall_performance/B1_HUST_full/seed_17/predictions.csv"},
-        {"path": "results/2_overall_performance/B1_HUST_full/seed_17/metrics.json", "metrics": ["mae"]}
+        {"path": "results/2_overall_performance/B1_Tongji_IC2ML/seed_17/checkpoint.pth"},
+        {"path": "results/2_overall_performance/B1_Tongji_IC2ML/seed_17/data_manifest.json"},
+        {"path": "results/2_overall_performance/B1_Tongji_IC2ML/seed_17/validation_metrics.json", "metrics": ["life.mae"]}
+      ]
+    },
+    {
+      "id": "B1_Tongji_IC2ML_test_seed17",
+      "block_id": "B1",
+      "depends_on": ["B1_Tongji_IC2ML_train_seed17"],
+      "argv": ["python", "experiments/template/run.py", "--stage", "test", "--checkpoint", "results/2_overall_performance/B1_Tongji_IC2ML/seed_17"],
+      "resources": {"device": "auto"},
+      "timeout_seconds": 3600,
+      "expected_outputs": [
+        {"path": "results/2_overall_performance/B1_Tongji_IC2ML/seed_17/targets.csv", "nonempty": true},
+        {"path": "results/2_overall_performance/B1_Tongji_IC2ML/seed_17/predictions.csv", "nonempty": true},
+        {"path": "results/2_overall_performance/B1_Tongji_IC2ML/seed_17/metrics.json", "metrics": ["life.mae"]}
       ]
     }
   ]
 }
 ```
+
+将示例中的任务、数据路径和指标替换为当前计划的实际值。多任务指标按任务名读取，例如 `soh.rmse`、`rul.mae`。
+CSV 中的向量目标由 `target_index` 区分，后处理结合样本 JSON 解释电芯、观测位置或配方信息。
 
 正式 job 必须通过 `block_id` 关联计划中的 D/B 块。
 不要再使用 R001 等另一套实验编号。job ID 标识具体执行任务，块 ID 标识研究设计。

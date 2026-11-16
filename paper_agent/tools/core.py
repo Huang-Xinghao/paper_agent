@@ -35,6 +35,7 @@ class ToolContext:
     workspace: Path
     skill_dirs: tuple[Path, ...] = ()
     knowledge_roots: tuple[Path, ...] = ()
+    on_progress: Callable | None = field(default=None, compare=False, repr=False)
 
     def resolve_read(self, path: str | Path | None = None) -> Path:
         from .data_access import resolve_data_read

@@ -32,7 +32,8 @@ def chat(project, role, prompt):
             history = session.recover_messages(data['messages'])
             model = ModelClient(model=os.environ.get('PAPER_AGENT_MODEL', 'gpt-4o'), timeout=120)
             model.usage_workspace, model.usage_phase = project, 'role_chat'
-            history = session.compact(data, history, model, 60000)
+            from paper_agent.agent.context import CONTEXT_MAX_TOKENS
+            history = session.compact(data, history, model, CONTEXT_MAX_TOKENS)
             message = {'role': 'user', 'content': prompt}
             response = model.complete([{'role': 'system', 'content': ROLE_DESCRIPTIONS[role] +
                 '\n用户在此窗口的对话只进入本角色的讨论上下文，不修改方案或其他MD，不批准方案。'
@@ -49,7 +50,7 @@ def serve(root):
     root = Path(root).resolve()
     binding = _read(root / 'binding.json')
     project, role = Path(binding['project']).resolve(), binding['role']
-    if (role not in {'idea_generator', 'experiment', 'paper_writer'}
+    if (role not in {'idea_generator', 'experiment', 'paper_writer', 'wiki_agent'}
             or root != directory(project) / 'roles' / role
             or binding['pane_id'] != os.environ['HERDR_PANE_ID']):
         raise HerdrError('Role host identity mismatch')

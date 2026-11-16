@@ -1,7 +1,7 @@
 ---
 name: research-refine
 description: 将电池研究想法细化为可实现、可验证的最终研究方案。
-allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, search_battery_resources, read_battery_resource
+allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, battery_resources
 ---
 
 ## 概述
@@ -10,9 +10,10 @@ allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_w
 该节点产出`refine-logs/FINAL_PROPOSAL.md`，交付下一个阶段experiment-plan来设计具体的实验规划
 ## 输入与证据边界
 
+- 优先复用已有报告和 Wiki 正文，引用来源路径和栏目；只有高度相关论文在 Wiki 缺失或矛盾的关键细节影响方法选择时，才定向核实原文，不批量读 PDF 或补齐逐篇全文状态。
 - 优先读取 `idea-stage/IDEA_REPORT.md`，提取idea信息。
 - 结合 `data-search/DATA_REPORT.md` 数据集信息和输入输出格式。
-- 结合`电池资源库/`，可通过 `search_battery_resources` / `read_battery_resource` 访问。检查数据集的输入和标签格式。
+- 从 `data-search/DATA_REPORT.md` 理解输入和标签格式；需要补充资源说明时，用 `battery_resources(action="search", query="具体缺口")` 与 `battery_resources(action="read", resource_id="返回的ID")` 定向阅读。
 
 ### 第 0 阶段：冻结问题锚点
 

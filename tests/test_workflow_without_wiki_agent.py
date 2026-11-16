@@ -1,6 +1,7 @@
-"""Workflow completion and research access after removing WikiAgent."""
+"""Wiki role restoration, final approval and existing research access."""
 
 import json
+from types import SimpleNamespace as NS
 import pytest
 
 from paper_agent.agent import coordinator, role_cli, workflow_cli
@@ -37,25 +38,41 @@ def pending_final(project):
     write_json(project / 'workflow-state.json', state.to_dict())
 
 
-def test_cli_final_approval_completes_without_another_agent(final_paper, monkeypatch):
+def test_cli_final_approval_dispatches_research_archival(final_paper, monkeypatch):
     pending_final(final_paper)
-    monkeypatch.setattr(coordinator, 'CoordinatorAgent',
-                        lambda *a, **kw: pytest.fail('Final approval must not launch another agent'))
+    calls = []
+    class Main:
+        def __init__(self, *args, **kwargs): pass
+        def go(self, prompt, **kwargs):
+            state = json.loads((final_paper / 'workflow-state.json').read_text())
+            assert state['status'] == 'completed'
+            assert state['expert_checkpoint']['status'] == 'approved'
+            calls.append((prompt, kwargs))
+            return NS(status='completed', final='已沉淀到 Wiki。', error=None)
+    monkeypatch.setattr(coordinator, 'CoordinatorAgent', Main)
     result = workflow_cli.run_coordinated_workflow(final_paper, continue_run=True)
     assert result.status == 'completed'
     assert result.expert_checkpoint['status'] == 'approved'
     assert set(result.expert_checkpoint['confirmed_files']) == {
         'paper/PAPER_IMPROVEMENT_LOG.md', 'paper/main.tex', 'paper/main.pdf',
     }
-    assert not (final_paper / '.paper-agent/research-memory.json').exists()
+    assert len(calls) == 1 and calls[0][1]['archive_completed']
 
 
-def test_terminal_final_approval_completes_without_another_agent(final_paper, monkeypatch):
+def test_terminal_final_approval_dispatches_research_archival(final_paper, monkeypatch):
     pending_final(final_paper)
     monkeypatch.setenv('HERDR_ENV', '1')
     monkeypatch.setenv('HERDR_PANE_ID', 'test:p1')
-    monkeypatch.setattr(coordinator, 'CoordinatorAgent',
-                        lambda *a, **kw: pytest.fail('Final approval must not launch another agent'))
+    calls = []
+    class Main:
+        def __init__(self, *args, **kwargs): pass
+        def go(self, prompt, **kwargs):
+            state = json.loads((final_paper / 'workflow-state.json').read_text())
+            assert state['status'] == 'completed'
+            assert state['expert_checkpoint']['status'] == 'approved'
+            calls.append((prompt, kwargs))
+            return NS(status='completed', final='已沉淀到 Wiki。', error=None)
+    monkeypatch.setattr(coordinator, 'CoordinatorAgent', Main)
     folder = final_paper / '.paper-agent/main-terminal/turns/final-approval'
     write_json(folder / 'request.json', {
         'project': str(final_paper), 'prompt': '批准', 'options': {},
@@ -67,7 +84,7 @@ def test_terminal_final_approval_completes_without_another_agent(final_paper, mo
     state = json.loads((final_paper / 'workflow-state.json').read_text())
     assert state['expert_checkpoint']['status'] == 'approved'
     assert state['status'] == 'completed'
-    assert not (final_paper / '.paper-agent/research-memory.json').exists()
+    assert len(calls) == 1 and calls[0][1]['archive_completed']
 
 
 def test_main_accepts_final_stage_and_summarizes(final_paper, monkeypatch):
@@ -77,15 +94,23 @@ def test_main_accepts_final_stage_and_summarizes(final_paper, monkeypatch):
         def complete(self, messages, tools):
             self.calls += 1
             names = {tool['function']['name'] for tool in tools}
-            assert 'curate_wiki' not in names and 'archive_research' not in names
+            assert {'curate_wiki', 'archive_research'} <= names
             if self.calls == 1:
                 return ModelResponse(tool_calls=(ToolCall('final', 'delegate_stage', {
                     'assignment': {'node': 'improvement', 'role': 'paper_writer',
                                    'instruction': 'Finish the final revision'},
                 }),))
+            if self.calls == 2:
+                return ModelResponse(tool_calls=(ToolCall('archive', 'curate_wiki', {
+                    'project_evidence': True,
+                }),))
             return ModelResponse(content='最终修订已完成。')
 
+    calls = []
     def finished(*args, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get('kind') == 'wiki':
+            return NS(status='completed', error=None, wiki_result={'status': 'completed'})
         return WorkflowState('finished', project_goal='Research goal',
                              current_node='improvement', status='completed')
 
@@ -94,7 +119,8 @@ def test_main_accepts_final_stage_and_summarizes(final_paper, monkeypatch):
     agent = coordinator.CoordinatorAgent(final_paper, model_client=model,
                                           project_goal='Research goal', stop_after='improvement')
     result = agent.go('Finish the final revision')
-    assert model.calls == 2 and agent.assignments == 1
+    assert model.calls == 3 and agent.assignments == 1
+    assert calls[-1]["role"] == "wiki_agent" and calls[-1]["project_evidence"]
     assert result.status == 'completed' and result.final == '最终修订已完成。'
     assert not (final_paper / '.paper-agent/research-memory.json').exists()
 
@@ -145,59 +171,72 @@ def test_execution_contract_rejects_removed_role_node_and_kind(tmp_path, change)
                       })
 
 
-@pytest.mark.parametrize('command', [
-    'wiki --paper example.pdf',
-    'history --role wiki_agent',
-    'delegate --node literature --role wiki_agent --instruction Task',
-])
-def test_role_cli_rejects_wiki_requests(tmp_path, command):
+def test_role_cli_supports_wiki_dispatch_and_independent_history(tmp_path):
+    calls = []
+    value = role_cli.run('wiki --paper example.pdf --project-evidence --source results.json',
+                         project=tmp_path, curate=lambda task: calls.append(task) or {'status': 'completed'})
+    assert value['status'] == 'completed'
+    assert calls == [{'paper_path': 'example.pdf', 'project_evidence': True,
+                      'source_paths': ['results.json'], 'instruction': '', 'force': False}]
+    role_cli.run('history --role wiki_agent', project=tmp_path)
     with pytest.raises(ValueError):
-        role_cli.run(command, project=tmp_path)
+        role_cli.run('delegate --node literature --role wiki_agent --instruction Task', project=tmp_path)
 
 
-def test_phase_and_session_reject_removed_role(tmp_path):
-    with pytest.raises(ValueError):
-        PhaseTask('wiki', 'Task')
-    with pytest.raises(ValueError):
-        RoleSession(tmp_path, 'wiki_agent')
+def test_phase_and_session_support_standalone_wiki_role(tmp_path):
+    assert PhaseTask('wiki', 'Task').role == 'wiki_agent'
+    assert RoleSession(tmp_path, 'wiki_agent').path.name == 'wiki_agent.json'
     with pytest.raises(ValueError):
         StageAssignment(node='literature', role='wiki_agent', instruction='Task')
-    with pytest.raises(ValueError):
-        PhaseAgent(tmp_path, phase='wiki')
+    agent = PhaseAgent(tmp_path, phase='wiki', model_client=object())
+    assert {'wiki_prepare', 'wiki_read_source', 'wiki_review', 'wiki_publish', 'wiki_abort'} <= {
+        tool.name for tool in agent.tools}
+    from paper_agent.agent.stages import WORKFLOW_NODE_NAMES
+    assert 'wiki' not in WORKFLOW_NODE_NAMES
 
 
 def test_existing_wiki_still_supplies_verified_evidence_without_publication(tmp_path, monkeypatch):
-    from paper_agent.agent.wiki_research import collect_wiki_evidence
+    from paper_agent.tools.core import ToolContext
+    from paper_agent.tools.wiki import search_wiki, read_wiki
 
     wiki = tmp_path / 'wiki'
     page = wiki / 'papers/example.md'
     page.parent.mkdir(parents=True)
     page.write_text('# Example\n## Method\nRelaxation predicts capacity.\n')
     monkeypatch.setenv('PAPER_AGENT_WIKI_ROOT', str(wiki))
-    monkeypatch.delenv('PAPER_AGENT_EMBEDDING_DIR', raising=False)
-    monkeypatch.delenv('PAPER_AGENT_EMBEDDING_PYTHON', raising=False)
     before = {p.relative_to(wiki): p.read_bytes() for p in wiki.rglob('*') if p.is_file()}
-
-    class Reader:
-        calls = 0
-
-        def complete(self, messages, tools):
-            self.calls += 1
-            assert {tool['function']['name'] for tool in tools} <= {'search_wiki'}
-            if self.calls == 1:
-                return ModelResponse(tool_calls=(ToolCall(
-                    'search', 'search_wiki', {'query': 'Relaxation'},
-                ),))
-            return ModelResponse(content=json.dumps({
-                'summary': 'Capacity prediction evidence', 'assessment': 'sufficient',
-                'evidence': [{'claim': 'Relaxation is used to predict capacity.',
-                              'role': 'direct_method', 'wiki_path': 'papers/example.md',
-                              'section': 'Method', 'quote': 'Relaxation predicts capacity.'}],
-                'decisions': [], 'hypotheses': [], 'gaps': [], 'next_action': 'Review evidence',
-            }))
-
-    packet = collect_wiki_evidence(tmp_path / 'project', Reader(), 'Relaxation')
-    assert packet['status'] == 'ready_for_review'
-    assert packet['evidence'][0]['content_sha256']
-    assert not packet['validation_errors']
+    result = search_wiki(ToolContext(tmp_path / 'project'), 'Relaxation',
+                         strategy='lexical', include_relations=False)
+    assert not result.is_error
+    match = json.loads(result.output)['matches'][0]
+    result = read_wiki(ToolContext(tmp_path / 'project'), match['wiki_path'])
+    assert not result.is_error
+    card = json.loads(result.output)
+    assert card['wiki_path'] == 'papers/example.md'
+    assert card['content_sha256']
+    assert card['content'] == page.read_text()
+    assert card['content_complete']
     assert before == {p.relative_to(wiki): p.read_bytes() for p in wiki.rglob('*') if p.is_file()}
+
+
+def test_main_final_checkpoint_approval_requires_wiki_handoff(final_paper, monkeypatch):
+    pending_final(final_paper)
+    calls = []
+    def dispatched(*args, **kwargs):
+        calls.append(kwargs)
+        assert json.loads((final_paper / 'workflow-state.json').read_text())['status'] == 'completed'
+        return NS(status='completed', error=None, wiki_result={'status': 'completed'})
+    monkeypatch.setattr(coordinator, 'execute_stage', dispatched)
+    class Model:
+        n = 0
+        def complete(self, messages, tools):
+            self.n += 1
+            if self.n == 1:
+                return ModelResponse(tool_calls=(ToolCall('approve', 'approve_checkpoint', {}),))
+            if self.n == 2:
+                return ModelResponse(tool_calls=(ToolCall('archive', 'curate_wiki', {'project_evidence': True}),))
+            return ModelResponse(content='已批准并沉淀研究成果。')
+    model = Model()
+    result = coordinator.CoordinatorAgent(final_paper, model_client=model).go('批准')
+    assert result.status == 'completed' and len(calls) == 1
+    assert calls[0]['role'] == 'wiki_agent' and calls[0]['project_evidence']

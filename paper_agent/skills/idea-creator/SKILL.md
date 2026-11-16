@@ -23,9 +23,10 @@ description: 基于工作流提供的文献、Wiki 和项目约束生成、比�
 
 ## 工作方式
 
+- **文献依据**：优先复用文献报告和 Wiki 正文，保留来源路径和栏目。仅对影响机制选择且 Wiki 缺少关键细节的高度相关论文定向核实原文，不批量读 PDF 或补齐逐篇全文状态。
 - **优先使用已有材料**：从`literature/RESEARCH_REPORT.md`，`literature/RESEARCH_REPORT.md`中已核实的论文、研究缺口、`research-wiki/` 页面。
 - **数据集对应**：根据数据集信息`data-search/DATA_REPORT.md`，选择输入输出格式以及可以用于这种格式的其他领域方法做迁移
-- **进一步了解资源库（可选）**：可使用 `search_battery_resources` / `read_battery_resource` 了解资源库中的数据与方法。
+- **进一步了解资源库（可选）**：复用 Data Report；有缺口时用 `battery_resources(action="search", query="具体缺口")` 检索数据与方法说明，再用 `battery_resources(action="read", resource_id="返回的ID")` 定向阅读。
 
 ## 已有模版情况下的idea改进
 
@@ -34,8 +35,6 @@ description: 基于工作流提供的文献、Wiki 和项目约束生成、比�
 ## Phase 1：加载 Research Wiki 与寻找跨领域突破
 
 ### 加载 Research Wiki
-
-如果项目没有 `research-wiki/`，跳过 Wiki 加载部分，继续生成 Idea。
 
 ### 梳理领域图景
 

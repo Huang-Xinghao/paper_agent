@@ -22,9 +22,20 @@ def discover_gpus(executor):
     count = executor.available_devices()['cuda_count']
     if not count:
         return {}
-    result = subprocess.run(
-        ['nvidia-smi', '--query-gpu=index,uuid,memory.used', '--format=csv,noheader,nounits'],
-        capture_output=True, text=True, timeout=10, check=True)
+    environment = os.environ.copy()
+    library = environment.get('PAPER_AGENT_NVML_LIBRARY_PATH')
+    if library:
+        environment['LD_LIBRARY_PATH'] = library + (os.pathsep + environment['LD_LIBRARY_PATH']
+                                                   if environment.get('LD_LIBRARY_PATH') else '')
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,uuid,memory.used', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=10, check=True, env=environment)
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = (getattr(exc, 'stderr', '') or str(exc)).strip()[:2000]
+        raise RuntimeError('CUDA is available but NVIDIA management discovery failed: ' + detail +
+                           '. Check driver/NVML compatibility; PAPER_AGENT_NVML_LIBRARY_PATH '
+                           'can select an installed matching library.') from exc
     physical = [tuple(part.strip() for part in row.split(','))
                 for row in result.stdout.splitlines() if row.strip()]
     visible = os.environ.get('CUDA_VISIBLE_DEVICES')
@@ -58,7 +69,7 @@ def recover_receipts(executor):
         receipt = json.loads(record.read_text())
         if receipt.get('status') == 'running':
             pid = receipt.get('pid')
-            if not pid or Path(f'/proc/{pid}').exists():
+            if pid and Path(f'/proc/{pid}').exists():
                 raise AwaitingResults(f'Unfinished experiment receipt: {record}; verify the old process before resuming')
             receipt.update(status='interrupted', error='Queue restart: recorded process no longer exists')
             if 'finished' not in receipt:
@@ -78,25 +89,12 @@ def _schedule(executor, state, manifest, on_progress, *, track=True, queue_path=
     config = load_execution_config(executor.project)
     compute = load_compute_config(executor.project)
     configured_ids = config['gpu_ids']
-    # CPU/MPS-only queues do not require NVIDIA management tooling. CUDA/auto
-    # workloads still use real discovery and never silently fall back to CPU.
-    needs_cuda = any(j.get('resources', {}).get('device', 'auto') == 'cuda' or
-                     j.get('resources', {}).get('device', 'auto') == 'auto'
-                     and compute['device'] in {'auto', 'cuda'} for j in jobs)
-    initial = discover_gpus(executor) if needs_cuda else {}
-    allowed = (list(initial) if configured_ids == 'auto' else configured_ids) if needs_cuda else []
-    if compute['gpu_index'] is not None:
-        allowed = [i for i in allowed if i == compute['gpu_index']]
-    if any(i not in initial for i in allowed):
-        raise AwaitingResults(f'Configured GPU indices are unavailable: {allowed}')
-    gpu_limit = len(allowed) if config['max_parallel_gpu_jobs'] == 'auto' else min(len(allowed), config['max_parallel_gpu_jobs'])
     # Existing total budget counts cumulative job seconds. Keep it exact by serializing
     # budgeted attempts rather than letting simultaneous jobs overspend a shared limit.
     budgeted = compute['total_experiment_seconds'] is not None or getattr(executor, 'serial_budget', False)
     prior = [r for r in recover_receipts(executor) if r.get('status') == 'completed']
     if compute['total_experiment_seconds'] is not None:
         executor.seconds_used()
-    prior += state.experiment_completed_receipts
     completed = {}
     expected_jobs = {job['id']: job for job in jobs}
     for receipt in prior:
@@ -117,6 +115,18 @@ def _schedule(executor, state, manifest, on_progress, *, track=True, queue_path=
         for i in invalid:
             del completed[i]
     pending = {job['id']: job for job in jobs if job['id'] not in completed}
+    # CPU/MPS-only queues do not require NVIDIA management tooling. CUDA/auto
+    # workloads still use real discovery and never silently fall back to CPU.
+    needs_cuda = any(j.get('resources', {}).get('device', 'auto') == 'cuda' or
+                     j.get('resources', {}).get('device', 'auto') == 'auto'
+                     and compute['device'] in {'auto', 'cuda'} for j in pending.values())
+    initial = discover_gpus(executor) if needs_cuda else {}
+    allowed = (list(initial) if configured_ids == 'auto' else configured_ids) if needs_cuda else []
+    if compute['gpu_index'] is not None:
+        allowed = [i for i in allowed if i == compute['gpu_index']]
+    if any(i not in initial for i in allowed):
+        raise AwaitingResults(f'Configured GPU indices are unavailable: {allowed}')
+    gpu_limit = len(allowed) if config['max_parallel_gpu_jobs'] == 'auto' else min(len(allowed), config['max_parallel_gpu_jobs'])
     running = {}
     retries = {}
     retry_after = {}
@@ -127,11 +137,10 @@ def _schedule(executor, state, manifest, on_progress, *, track=True, queue_path=
     cancel = Event()
     queue_path = queue_path or executor.project / 'experiment-queue-state.json'
     tick = 0
+    last_wait_notice = 0.0
 
     def checkpoint():
         nonlocal tick
-        receipts = [completed[j['id']] for j in jobs if j['id'] in completed]
-        state.experiment_completed_receipts = receipts
         active = {job['id']: gpu for job, gpu in running.values()}
         blocked = set(failures)
         while True:
@@ -236,6 +245,19 @@ def _schedule(executor, state, manifest, on_progress, *, track=True, queue_path=
                             running[future] = (job, gpu)
                             del pending[job['id']]
                             checkpoint()
+                        if ready and not running and pending and failure is None:
+                            if time.monotonic() - last_wait_notice >= 30:
+                                last_wait_notice = time.monotonic()
+                                snapshot = json.loads(queue_path.read_text())
+                                waiting = dict(reason='waiting_for_gpu',
+                                               gpu_memory_used_mib={i: devices[i]['memory_used_mib']
+                                                                    for i in allowed if i in devices},
+                                               memory_threshold_mib=config['gpu_idle_memory_threshold_mib'])
+                                snapshot['waiting'] = waiting
+                                atomic_json(queue_path, snapshot)
+                                if on_progress:
+                                    on_progress('experiment_bridge', state, dict(
+                                        round=tick, stage='waiting_for_gpu', **waiting))
                     if pending or running:
                         time.sleep(config['poll_seconds'])
             except BaseException:

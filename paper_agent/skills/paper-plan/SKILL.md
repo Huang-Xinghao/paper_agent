@@ -1,7 +1,7 @@
 ---
 name: paper-plan
 description: 根据最终研究方案、实验计划和实际结果生成中文论文结构、主张证据矩阵、图表计划和引用计划。
-allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki, search_battery_resources, read_battery_resource
+allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_wiki
 ---
 
 # 论文规划
@@ -18,7 +18,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob, search_papers, search_wiki, read_w
 4. `results/`、`figures/`、`tables/` 中的实际 JSON/CSV 和图表数据
 5. `idea-stage/IDEA_REPORT.md` 和已有 narrative 文件
 
-实验交接摘要是入口，实际结果与执行回执是证据。对照原实验计划，为每个图/子图的证据任务保留采用、合并去向、附录位置或明确缺口。已有逐样本预测可完成的分析不能因没有现成汇总表而直接删除；必做证据缺失时报告需要回到 bridge 补齐，不以缩减图表冒充完成。
+实验交接摘要是入口，以真实结果、日志和必要的任务状态确认可用证据，不另设回执验收。对照原实验计划，为每个图/子图的证据任务保留采用、合并去向、附录位置或明确缺口。已有逐样本预测可完成的分析不能因没有现成汇总表而直接删除；必做证据缺失时报告需要回到 bridge 补齐，不以缩减图表冒充完成。
 
 ## 规划流程
 

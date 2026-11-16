@@ -89,6 +89,9 @@ WORKFLOW_NODE_NAMES = tuple(BY_NODE)
 NEXT_NODE = dict(zip(WORKFLOW_NODE_NAMES, (*WORKFLOW_NODE_NAMES[1:], None)))
 PHASE_ROLES = {stage.phase: stage.role for stage in STAGES}
 SKILL_BY_PHASE = {stage.phase: stage.skill for stage in STAGES}
+# Wiki curation is a standalone assignment, outside the research stage sequence.
+PHASE_ROLES["wiki"] = "wiki_agent"
+SKILL_BY_PHASE["wiki"] = "wiki-curation"
 
 
 def validate_outputs(workspace: Path, phase: str) -> None:

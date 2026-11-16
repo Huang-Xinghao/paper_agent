@@ -7,8 +7,6 @@ import math
 import os
 import time
 import uuid
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,27 +33,6 @@ def record_usage(workspace, *, source, model, usage=None, phase=None):
             os.close(fd)
     except OSError:
         logging.getLogger(__name__).warning('Could not persist usage', exc_info=True)
-
-
-@dataclass
-class RequestBudget:
-    remaining: int
-    max_output_tokens: int
-    used: int = 0
-
-
-_request_budget: ContextVar[RequestBudget | None] = ContextVar("model_request_budget", default=None)
-
-
-@contextmanager
-def limited_model_requests(limit: int = 3, max_output_tokens: int = 4000):
-    """给取证子流程单独限额，不修改其他并发项目的环境变量或请求设置。"""
-    budget = RequestBudget(limit, max_output_tokens)
-    token = _request_budget.set(budget)
-    try:
-        yield budget
-    finally:
-        _request_budget.reset(token)
 
 
 def _transient_request_error(exc: Exception) -> bool:
@@ -254,15 +231,6 @@ class ModelClient:
         retries = 0
         while True:
             options = dict(request)
-            budget = _request_budget.get()
-            if budget is not None:
-                if budget.remaining <= 0:
-                    raise RuntimeError("Model request budget exhausted")
-                budget.remaining -= 1
-                budget.used += 1
-                options["max_tokens"] = min(int(options.get("max_tokens", budget.max_output_tokens)), budget.max_output_tokens)
-                options["stream"] = False
-                options.pop("stream_options", None)
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -284,7 +252,7 @@ class ModelClient:
                     on_delta(result.content)
                 return result
             except Exception as exc:
-                if budget is not None or not retry:
+                if not retry:
                     raise
                 if not _transient_request_error(exc):
                     raise
@@ -334,23 +302,19 @@ class ModelClient:
         return response.content
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
-                 *, temperature: float = 0, on_delta=None, on_stream_reset=None) -> ModelResponse:
+                 *, temperature: float = 0, on_delta=None, on_stream_reset=None,
+                 retry: bool = True) -> ModelResponse:
         if self._responder is not None:
-            budget = _request_budget.get()
-            if budget is not None:
-                if budget.remaining <= 0:
-                    raise RuntimeError("Model request budget exhausted")
-                budget.remaining -= 1
-                budget.used += 1
             return _normalise_response(self._responder(messages=messages, tools=tools,
                                                        model=self.model, temperature=temperature))
         request = self._request_options(messages, temperature=temperature)
         if tools:
             request.update(tools=tools, tool_choice="auto")
-        attempts = 1 if _request_budget.get() is not None else 3
+        attempts = 3 if retry else 1
         for attempt in range(attempts):
             try:
-                return self._request_response(request, on_delta=on_delta, on_stream_reset=on_stream_reset)
+                return self._request_response(request, on_delta=on_delta,
+                                              on_stream_reset=on_stream_reset, retry=retry)
             except OutputLimitExceeded as exc:
                 if attempt == attempts - 1:
                     raise OutputLimitExceeded(

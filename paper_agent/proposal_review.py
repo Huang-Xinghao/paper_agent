@@ -202,7 +202,7 @@ def review_status(root: Path, draft: CanvasDraft | None):
             revision["synced"] = synced
             revision["approved"] = bool(record.get("approvedAt"))
         return {"revision": revision, "canApprove": bool(pending_refine(state) and synced
-                and not record.get("questions") and not record.get("approvedAt")),
+                and not record.get("approvedAt")),
                 "context": "checkpoint" if pending_refine(state) else "auto" if state.get("mode") == "auto" else "historical"}
     except (ValueError, OSError, KeyError):
         return {"revision": None, "canApprove": False, "context": "unavailable"}
@@ -213,8 +213,6 @@ def require_candidate(root: Path, expected_sha: str):
     record = load_record(root)
     if not record or record.get("draftHash") != draft_hash(draft):
         raise ValueError("当前修改尚未由 Agent 统一修订，请先提交修订并复审")
-    if record.get("questions"):
-        raise ValueError("仍有待决策问题，请补充意见并提交 Agent 修订")
     if record.get("approvedAt"):
         raise ValueError("这一版本已批准，请勿重复提交")
     return draft, record

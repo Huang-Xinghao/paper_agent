@@ -4,7 +4,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 import fcntl
-import hashlib
 import json
 import os
 import re
@@ -24,7 +23,7 @@ from paper_agent.storage import read_json_or_default as read_json
 Node = Literal['literature', 'data_search', 'ideas', 'refine', 'experiment_plan',
                'experiment_bridge', 'paper_plan', 'paper_figure', 'paper_write',
                'paper_compile', 'improvement']
-Role = Literal['idea_generator', 'experiment', 'paper_writer']
+Role = Literal['idea_generator', 'experiment', 'paper_writer', 'wiki_agent']
 
 
 class StageAssignment(BaseModel):
@@ -35,6 +34,8 @@ class StageAssignment(BaseModel):
 
     @model_validator(mode='after')
     def nonempty(self):
+        if self.role == 'wiki_agent':
+            raise ValueError('Use the standalone Wiki task for wiki_agent')
         if not self.instruction.strip():
             raise ValueError('Assignment must have a concrete instruction')
         return self
@@ -70,11 +71,11 @@ class ExecutionTask(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str = Field(pattern=r'^[a-f0-9]{32}$')
     project: str
-    node: Node
+    node: Node | Literal['wiki']
     role: Role
     instruction: str = Field(min_length=1)
     project_goal: str
-    kind: Literal['stage', 'revision'] = 'stage'
+    kind: Literal['stage', 'revision', 'wiki'] = 'stage'
     revision_task: RevisionTask | None = None
     revise: str | None = None
     options: dict = Field(default_factory=dict)
@@ -83,6 +84,8 @@ class ExecutionTask(BaseModel):
 
     @model_validator(mode='after')
     def consistent(self):
+        if (self.kind == 'wiki') != (self.node == 'wiki') or (self.role == 'wiki_agent') != (self.kind == 'wiki'):
+            raise ValueError('Wiki execution requires kind=wiki, node=wiki and role=wiki_agent')
         if (self.kind == 'revision') != (self.revision_task is not None):
             raise ValueError('Revision execution requires exactly one revision task')
         if self.revision_task and (self.revision_task.node != self.node or self.revise is not None):
@@ -145,7 +148,10 @@ class ExecutionOwner:
             if not active or active.get('consumed') or active.get('id') not in self._ids():
                 return None
             try:
-                if not (directory(self.project) / 'tasks' / active['id'] / 'result.json').exists():
+                task_folder = directory(self.project) / 'tasks' / active['id']
+                if not (task_folder / 'result.json').exists():
+                    recover_cancelled_local_task(task_folder)
+                if not (task_folder / 'result.json').exists():
                     raise RuntimeError('Task ' + active['id'] + ' outcome pending; inspect its original receipt')
                 reconcile(self.project, active['id'], wait_seconds=.01)
                 return None
@@ -153,6 +159,46 @@ class ExecutionOwner:
                 if time.monotonic() >= deadline:
                     return '角色任务取消结果仍需核查，不会自动重跑：' + str(exc)
                 time.sleep(.1)
+
+
+def recover_orphaned_task(folder):
+    """Close a lost outcome only after the worker releases its execution lock."""
+    folder = Path(folder)
+    if not (folder / 'started.json').exists():
+        return False
+    with (folder / 'execution.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        if (folder / 'result.json').exists():
+            return False
+        started = read_json(folder / 'started.json', {})
+        task = ExecutionTask.model_validate_json((folder / 'request.json').read_text())
+        # A late mailbox delivery must not restart the closed task.
+        (folder / 'cancel').touch()
+        backend = started.get('backend', 'local')
+        error = 'Worker released its execution lock without saving a result; continue using existing artifacts'
+        root = Path(task.project) / '.paper-agent/herdr'
+        inbox = root / 'roles' / task.role / 'inbox.json'
+        if read_json(inbox, {}).get('id') == task.id:
+            inbox.unlink(missing_ok=True)
+        _write_json(folder / 'result.json', {
+            'id': task.id, 'kind': task.kind, 'node': task.node, 'role': task.role,
+            'status': 'interrupted', 'error': error, 'final': '', 'artifacts': [],
+            'execution': {key: value for key, value in {
+                'backend': backend, 'execution_task_id': task.id,
+                'herdr_task_id': started.get('herdr_task_id'),
+                'pane_id': started.get('pane_id'),
+            }.items() if value is not None},
+            'ended_at': now(),
+        })
+        return True
+
+
+# Compatibility for callers using the previous local-only recovery helper.
+def recover_cancelled_local_task(folder):
+    return recover_orphaned_task(folder)
 
 
 def register_execution(project, task_id):
@@ -194,7 +240,7 @@ def execute_task(folder, *, on_event=None, execution=None):
             if on_event:
                 on_event(record)
 
-        files, final, state = [], '', None
+        files, final, state, wiki_result = [], '', None, None
         try:
             emit({'kind': 'execution_start', 'time': now(), 'node': task.node,
                   'role': task.role, 'task_kind': task.kind})
@@ -204,12 +250,23 @@ def execute_task(folder, *, on_event=None, execution=None):
             if task.kind == 'stage':
                 for key, cls in (('config', WorkflowConfig), ('idea_config', IdeaNodeConfig)):
                     if isinstance(options.get(key), dict):
+                        if key == 'config':
+                            options[key].pop('max_experiment_repairs', None)
                         options[key] = cls(**options[key])
                 state = execute_stage(project, task.node, task.instruction,
                                       role=task.role, project_goal=task.project_goal,
                                       revise=task.revise, execution=metadata, on_event=emit, **options)
                 status, error = state.status, state.error
                 files = [ref['path'] for ref in state.artifacts.get(task.node, [])]
+            elif task.kind == 'wiki':
+                from paper_agent.agent.wiki_role import run_wiki_role
+                wiki_result = run_wiki_role(
+                    project, task.instruction,
+                    on_progress=lambda kind, details: emit({'kind': kind, 'time': now(), **details}),
+                    **options)
+                status = 'completed' if wiki_result['status'] in {'completed', 'skipped'} else 'failed'
+                error = wiki_result.get('error') if status == 'failed' else None
+                final, files = wiki_result['final'], [wiki_result['receipt_path']]
             else:
                 from paper_agent.agent.runtime.revision import run_node_task
                 if task.node == 'refine':
@@ -226,106 +283,55 @@ def execute_task(folder, *, on_event=None, execution=None):
                 raise
             status = 'interrupted' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'failed'
             error = str(exc) or 'Task interrupted'
-        # Transport records outcomes. Only stage/checkpoint services write workflow state.
-        if state is None and (project / 'workflow-state.json').is_file():
-            try:
-                state_data = json.loads((project / 'workflow-state.json').read_text())
-            except (ValueError, OSError):
-                state_data = None
-        else:
-            state_data = state.to_dict() if state is not None else None
-        if task.kind == 'stage' and state_data is not None and status in {'failed', 'interrupted'}:
-            state_data = {**state_data, 'status': status, 'error': error,
-                          'current_node': task.node, 'failed_node': task.node}
-        snapshot_hash = None
-        if state_data is not None:
-            _write_json(folder / 'workflow.json', state_data)
-            snapshot_hash = hashlib.sha256((folder / 'workflow.json').read_bytes()).hexdigest()
-        artifacts = []
-        try:
-            if status in {'completed', 'awaiting_user'}:
-                artifacts = _artifact_receipts(project, files)
-                if task.kind == 'stage':
-                    expected = {ref['path']: ref['sha256']
-                                for ref in state.artifacts.get(task.node, [])}
-                    if any(ref['sha256'] != expected[ref['path']] for ref in artifacts):
-                        raise ValueError('Artifact changed after workflow validation')
-        except (ValueError, OSError) as exc:
-            status, error = 'failed', str(exc)
-        receipt = {'id': task.id, 'kind': task.kind, 'node': task.node, 'role': task.role,
-                   'status': status, 'error': error, 'final': final, 'artifacts': artifacts,
-                   'execution': metadata, 'ended_at': now(), 'state_sha256': snapshot_hash,
-                   'workflow_snapshot': 'workflow.json' if state_data is not None else None}
-        _write_json(folder / 'result.json', receipt)
+        # Keep only this task's outcome; workflow-state.json owns project state.
+        stage_result = None
+        if state is not None:
+            stage_result = {
+                'node_results': {task.node: state.node_results.get(task.node, {})},
+                'expert_checkpoint': state.expert_checkpoint,
+            }
+        result = {'id': task.id, 'kind': task.kind, 'node': task.node, 'role': task.role,
+                  'status': status, 'error': error, 'final': final,
+                  'artifacts': [{'path': name} for name in sorted(set(files))],
+                  'execution': metadata, 'ended_at': now(), 'stage_result': stage_result}
+        if task.kind == 'wiki':
+            result['wiki_result'] = wiki_result
+        _write_json(folder / 'result.json', result)
         emit({'kind': 'execution_end', 'time': now(), 'node': task.node, 'role': task.role,
               'task_kind': task.kind, 'status': status, 'error': error})
-        from paper_agent.agent.workflow import WorkflowState
-        snapshot = WorkflowState.from_dict(state_data) if state_data is not None else None
-        return _result(task, receipt, snapshot)
-
-
-def _artifact_receipts(project, files):
-    artifacts = []
-    for name in sorted(set(files)):
-        path = (project / name).resolve()
-        if not path.is_relative_to(project) or not path.is_file():
-            raise ValueError('Published artifact is missing or outside project')
-        artifacts.append({'path': name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
-    return artifacts
+        return _result(task, result)
 
 
 def read_result(folder, *, verify_artifacts=True):
-    """Read an immutable task snapshot, independent of the live workflow cursor."""
-    from paper_agent.agent.workflow import WorkflowState
+    """Read a task outcome. Later edits to project files do not invalidate it."""
     folder = Path(folder)
-    receipt = json.loads((folder / 'result.json').read_text())
-    if 'workflow_snapshot' not in receipt:
-        raise ValueError('Execution receipt is missing its required workflow_snapshot field')
+    result = json.loads((folder / 'result.json').read_text())
     task = ExecutionTask.model_validate_json((folder / 'request.json').read_text())
-    if any(receipt.get(key) != getattr(task, key) for key in ('id', 'kind', 'node', 'role')):
-        raise ValueError('Result identity mismatch')
-    if receipt.get('execution', {}).get('execution_task_id') != task.id:
-        raise ValueError('Execution identity mismatch')
-    snapshot = None
-    if receipt['workflow_snapshot'] is not None:
-        if receipt['workflow_snapshot'] != 'workflow.json':
-            raise ValueError('Invalid workflow snapshot path')
-        raw = (folder / 'workflow.json').read_bytes()
-        if hashlib.sha256(raw).hexdigest() != receipt['state_sha256']:
-            raise ValueError('Workflow snapshot changed after execution')
-        snapshot = WorkflowState.from_dict(json.loads(raw))
-    if verify_artifacts:
-        project = Path(task.project).resolve()
-        for ref in receipt['artifacts']:
-            artifact = (project / ref['path']).resolve()
-            if not artifact.is_relative_to(project) or not artifact.is_file():
-                raise ValueError('Artifact is missing or outside the project')
-            if hashlib.sha256(artifact.read_bytes()).hexdigest() != ref['sha256']:
-                raise ValueError('Artifact changed after execution; inspect the original receipt')
-    if task.kind == 'stage':
-        if snapshot is None:
-            snapshot = WorkflowState(task.id, project_goal=task.project_goal, current_node=task.node)
-        if receipt['status'] in {'completed', 'awaiting_user', 'awaiting_results'}:
-            executed = snapshot.node_results.get(task.node, {}).get('execution', {})
-            if (executed.get('execution_task_id') != task.id or snapshot.project_goal != task.project_goal
-                    or snapshot.status != receipt['status']):
-                raise ValueError('Workflow snapshot does not match the submitted stage')
-    return _result(task, receipt, snapshot)
+    if result.get('id') != task.id:
+        raise ValueError('Result belongs to another task')
+    # Read old results during migration, without revalidating old file hashes.
+    if 'stage_result' not in result and (folder / 'workflow.json').is_file():
+        old = json.loads((folder / 'workflow.json').read_text())
+        result['stage_result'] = {
+            'node_results': {task.node: old.get('node_results', {}).get(task.node, {})},
+            'expert_checkpoint': old.get('expert_checkpoint'),
+        }
+    return _result(task, result)
 
 
-def _result(task, receipt, snapshot):
-    """Build a return value from the in-memory result or a checked disk receipt."""
+def _result(task, result):
     if task.kind == 'stage':
-        if snapshot is None:
-            from paper_agent.agent.workflow import WorkflowState
-            snapshot = WorkflowState(task.id, project_goal=task.project_goal, current_node=task.node)
-        snapshot.status, snapshot.error = receipt['status'], receipt['error']
-        if snapshot.status in {'failed', 'interrupted'}:
-            snapshot.failed_node = snapshot.current_node = task.node
-        return snapshot
-    return SimpleNamespace(status=receipt['status'], error=receipt['error'], final=receipt['final'],
-                           files=[r['path'] for r in receipt['artifacts']],
-                           task_id=task.id, execution=receipt['execution'])
+        from paper_agent.agent.workflow import WorkflowState
+        state = WorkflowState(task.id, project_goal=task.project_goal, current_node=task.node,
+                              **(result.get('stage_result') or {}))
+        state.status, state.error = result['status'], result.get('error')
+        if state.status in {'failed', 'interrupted'}:
+            state.failed_node = task.node
+        return state
+    return SimpleNamespace(status=result['status'], error=result.get('error'), final=result.get('final', ''),
+                           files=[r['path'] for r in result.get('artifacts', [])],
+                           task_id=task.id, execution=result.get('execution', {}),
+                           wiki_result=result.get('wiki_result'))
 
 
 @contextmanager

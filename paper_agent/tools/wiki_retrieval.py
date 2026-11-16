@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections import Counter, defaultdict
@@ -218,38 +219,14 @@ def paper_owners(
         return {}, ["来源图无法读取；派生页面保留为独立结果，未猜测归属。"]
 
 
-CARD_HEADINGS = (
-    "One-line thesis",
-    "Problem / Gap",
-    "Method",
-    "Dataset and Features",
-    "Limitations / Failure Modes",
-)
-
-
-def paper_card(page: Page, root: Path, max_chars: int = 1000) -> dict:
-    fields = []
-    for heading in CARD_HEADINGS:
-        section = next((s for s in page.sections if s.heading == heading), None)
-        if section is None:
-            fields.append({"section": heading, "status": "missing", "content": ""})
-            continue
-        body = "\n".join(page.lines[section.start + 1 : section.end]).strip()
-        placeholder = not body or body.startswith(
-            ("_TODO", "_Not yet", "_To be", "<!--")
-        )
-        fields.append(
-            {
-                **location(page, section, root),
-                "status": "missing" if placeholder else "present",
-                "content": "" if placeholder else body[:max_chars],
-                "truncated": not placeholder and len(body) > max_chars,
-            }
-        )
+def paper_card(page: Page, root: Path) -> dict:
+    """Return the complete stored Markdown, including every section and frontmatter."""
     return {
         "title": page.title,
         "wiki_path": page.path.relative_to(root).as_posix(),
+        "read_path": str(page.path.resolve()),
         "content_sha256": page.fingerprint,
-        "fields": fields,
-        "note": "原栏目摘录，不是新生成的结论；present 仅表示有正文，不代表证据核验通过。",
+        "content": page.text,
+        "content_complete": True,
+        "note": "完整 Wiki MD 正文，不是搜索时新生成的总结，也不表示本轮已核验 PDF。",
     }

@@ -1,8 +1,6 @@
 """Run one scoped request with existing phase capabilities, without workflow routing."""
 
-import hashlib
 import json
-import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,75 +13,36 @@ from paper_agent.tools.paper_compile import compile_pdf
 from paper_agent.storage import write_json as _write_json
 
 
-IGNORED = {'.git', '.recovery', '.paper-agent', '__pycache__', '.web-run.lock'}
-BUILD_SUFFIXES = {'.aux', '.log', '.out', '.toc', '.fls', '.fdb_latexmk', '.xdv', '.synctex.gz', '.bbl', '.blg'}
-
-
-def fingerprint(path):
-    if path.is_symlink():
-        return 'symlink:' + os.readlink(path)
-    if not path.is_file():
-        return None
-    with path.open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
-
-
-def inventory(root):
-    result = {}
-    for base, dirs, names in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in IGNORED]
-        for name in dirs + names:
-            if (Path(base) / name).is_symlink():
-                raise ValueError('局部修改暂不支持含符号链接的项目，请先使用实际文件副本')
-        for name in names:
-            if name not in IGNORED:
-                path = Path(base) / name
-                result[path.relative_to(root).as_posix()] = fingerprint(path)
-    return result
-
-
-def clone_file(source, destination):
-    # Reflink where supported; never hard-link editable candidates to the project.
-    import fcntl
-    try:
-        with open(source, 'rb') as incoming, open(destination, 'wb') as outgoing:
-            fcntl.ioctl(outgoing.fileno(), 0x40049409, incoming.fileno())
-        shutil.copystat(source, destination)
-        return destination
-    except OSError:
-        return shutil.copy2(source, destination)
-
-
-def run_node_task(project, task, prompt, folder, *, model=None, max_iterations=100,
+def run_node_task(project, task, prompt, folder, *, model=None, max_iterations=300,
                   timeout=600, on_event=None):
     """Keep a role's accepted memory consistent with scoped artifact publication."""
     from paper_agent.agent.runtime.execution import RevisionTask
     validated = RevisionTask.model_validate(task)
     session = RoleSession(Path(project).resolve(), revision_role(Path(project).resolve(), validated.node))
-    with session.locked():
-        return _run_node_task(project, validated, prompt, folder,
-                              model=model, max_iterations=max_iterations,
-                              timeout=timeout, on_event=on_event, role_session=session)
+    # PhaseAgent owns the role-session lock; the dispatcher owns the project lock.
+    return _run_node_task(project, validated, prompt, folder,
+                          model=model, max_iterations=max_iterations,
+                          timeout=timeout, on_event=on_event, role_session=session)
 
 
-def _run_node_task(project, task, prompt, folder, *, model=None, max_iterations=100,
+def _run_node_task(project, task, prompt, folder, *, model=None, max_iterations=300,
                    timeout=600, on_event=None, role_session):
     project, folder = Path(project).resolve(), Path(folder).resolve()
-    from paper_agent.agent.runtime.artifacts import ArtifactVersions
-    versions = ArtifactVersions(project)
-    workspace = folder / 'workspace'
-    if workspace.exists():
-        raise ValueError('Task workspace already exists')
-    for name in task.files:
-        if not (project / name).resolve().is_relative_to(project):
-            raise ValueError('Target resolves outside project')
-    before = inventory(project)
-    shutil.copytree(project, workspace, symlinks=True, copy_function=clone_file,
-                    ignore=shutil.ignore_patterns(*IGNORED))
-    candidate_session = RoleSession(workspace, role_session.role)
-    candidate_session.folder.mkdir(parents=True, exist_ok=True)
-    if role_session.path.exists():
-        shutil.copy2(role_session.path, candidate_session.path)
+    # Back up only authorized targets; edits use the real project and role memory.
+    allowed = list(task.files)
+    if task.compile_pdf or task.node == 'paper_compile':
+        allowed.append('paper/main.pdf')
+    before = {}
+    backup = folder / 'before'
+    for name in allowed:
+        target = project / name
+        if not target.resolve().is_relative_to(project) or target.is_symlink():
+            raise ValueError('Target resolves outside project or is a symlink')
+        before[name] = target.read_bytes() if target.is_file() else None
+        if target.is_file():
+            saved = backup / name
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, saved)
     progress_path = project / 'workflow-progress.json'
 
     def emit(kind, **details):
@@ -113,14 +72,14 @@ def _run_node_task(project, task, prompt, folder, *, model=None, max_iterations=
             from paper_agent.integrations.review import paper_review_inputs
             if len(task.files) != 1 or not task.files[0].endswith('.md'):
                 raise ValueError('单独审稿需要指定一个 Markdown 报告输出文件')
-            review = ReviewRunner(workspace, timeout=1800).run(ReviewRequest(
+            review = ReviewRunner(project, timeout=1800).run(ReviewRequest(
                 'paper', instructions + '\n本次仅审阅，报告由运行器保存，不实施论文修改。',
-                paper_review_inputs(workspace), Path(task.files[0]), save_diagnostics=True))
+                paper_review_inputs(project), Path(task.files[0]), save_diagnostics=True))
             if review.status != 'completed':
                 raise RuntimeError(review.error)
             summary = '审阅报告已生成，未自动修改论文。'
         else:
-            agent = PhaseAgent(workspace, model=model, max_iterations=max_iterations, timeout=timeout,
+            agent = PhaseAgent(project, model=model, max_iterations=max_iterations, timeout=timeout,
                                assignment_role=role_session.role,
                                user_question_project=project,
                                on_progress=lambda kind, data: emit(kind, **data))
@@ -129,81 +88,36 @@ def _run_node_task(project, task, prompt, folder, *, model=None, max_iterations=
             summary = result.final
         if task.compile_pdf or task.node == 'paper_compile':
             emit('node_task_compile')
-            compile_pdf(workspace, min_pdf_bytes=0)
-        after = inventory(workspace)
-        changed = sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
-        allowed = set(task.files)
-        if task.compile_pdf or task.node == 'paper_compile':
-            allowed.add('paper/main.pdf')
-        def build_file(name):
-            return Path(name).parts[0] == 'paper' and any(name.endswith(ext) for ext in BUILD_SUFFIXES)
-        outside = [name for name in changed if name not in allowed and not build_file(name)]
-        _write_json(folder / 'changes.json', {'changed': changed, 'outside_scope': outside})
-        if outside:
-            raise RuntimeError('修改超出任务范围，候选文件已保留，未应用到项目：' + ', '.join(outside[:12]))
-        publish = [name for name in changed if name in allowed]
-        if not publish:
-            raise RuntimeError('没有检测到目标文件的修改，候选结果已保留')
-        # Preflight all paths and hashes before publishing any change.
-        for name in publish:
-            target, candidate = project / name, workspace / name
-            if (not target.resolve().is_relative_to(project) or candidate.is_symlink()
-                    or not candidate.resolve().is_relative_to(workspace) or not candidate.is_file()):
-                raise RuntimeError('不允许删除文件或发布符号链接：' + name)
-            if fingerprint(target) != before.get(name):
-                raise RuntimeError('项目文件在任务期间变化，未覆盖：' + name)
-            if not candidate.stat().st_size:
-                raise RuntimeError('目标产物为空：' + name)
-            if candidate.suffix == '.py':
-                import ast
-                ast.parse(candidate.read_text(encoding='utf-8'), filename=name)
-            if candidate.suffix.lower() in {'.png', '.jpg', '.jpeg'}:
-                from PIL import Image
-                with Image.open(candidate) as image:
-                    image.verify()
-            if candidate.suffix.lower() == '.pdf':
-                with candidate.open('rb') as stream:
-                    if stream.read(5) != b'%PDF-':
-                        raise RuntimeError('无效的 PDF：' + name)
-        backup = folder / 'before'
-        for name in publish:
+            compile_pdf(project, min_pdf_bytes=0)
+        publish = []
+        for name in allowed:
             target = project / name
-            if target.exists():
-                saved = backup / name
-                saved.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(target, saved)
-        applied = []
-        try:
-            for name in publish:
-                target = project / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                temporary = target.with_name('.node-task-' + target.name)
-                shutil.copy2(workspace / name, temporary)
-                temporary.replace(target)
-                applied.append(name)
-            # Rejected candidate work must never enter the project's role memory.
-            if candidate_session.path.exists():
-                candidate_archives = candidate_session.folder / 'archives' / role_session.role
-                if candidate_archives.exists():
-                    shutil.copytree(candidate_archives,
-                                    role_session.folder / 'archives' / role_session.role,
-                                    dirs_exist_ok=True)
-                role_session.save(candidate_session.load())
-        except BaseException:
-            for name in applied:
-                if (backup / name).exists():
-                    shutil.copy2(backup / name, project / name)
-                else:
-                    (project / name).unlink(missing_ok=True)
-            raise
-        versions.record(task.node, files=publish)
+            if not target.resolve().is_relative_to(project) or target.is_symlink() or not target.is_file():
+                raise ValueError('目标文件缺失或路径不合法：' + name)
+            if not target.stat().st_size:
+                raise ValueError('目标产物为空：' + name)
+            if target.suffix == '.py':
+                import ast
+                ast.parse(target.read_text(encoding='utf-8'), filename=name)
+            if target.read_bytes() != before[name]:
+                publish.append(name)
         emit('assistant_output', content=summary or '指定产物修改完成。')
         emit('node_task_end', files=publish)
         result = SimpleNamespace(status='completed', error=None, final=summary, files=publish)
-        # The execution service owns checkpoint routing; this worker records content
-        # versions without changing the workflow cursor.
-        shutil.rmtree(workspace)
         return result
-    except Exception as exc:
+    except BaseException as exc:
+        for name, original in before.items():
+            target = project / name
+            if not target.parent.resolve().is_relative_to(project):
+                raise RuntimeError('无法恢复项目之外的目标路径：' + name) from exc
+            if target.is_symlink():
+                target.unlink()
+            if original is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(original)
+        if not isinstance(exc, Exception):
+            raise
         emit('node_task_error', error=str(exc))
         return SimpleNamespace(status='failed', error=str(exc))

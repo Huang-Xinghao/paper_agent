@@ -36,7 +36,13 @@ def pages_from_structured(data: dict) -> list[dict]:
     return document_from_structured(data)["pages"]
 
 
-def read_mineru_paper(project: Path, pdf: Path) -> dict:
+def read_mineru_paper(project: Path, pdf: Path, *, on_progress=None, role='idea_generator') -> dict:
+    from paper_agent.integrations.progress import OperationProgress
+    with OperationProgress(project, 'pdf_parse', pdf, role=role, on_progress=on_progress).running() as progress:
+        return _read_mineru_paper(project, pdf, progress)
+
+
+def _read_mineru_paper(project: Path, pdf: Path, progress) -> dict:
     """Read the entire PDF and grouped figures from one required MinerU parse."""
     python = runtime_python()
     if not python:
@@ -46,6 +52,7 @@ def read_mineru_paper(project: Path, pdf: Path) -> dict:
     env.setdefault("MINERU_MODEL_VLM_ENGINE", "llama-cpp")
     env.setdefault("MINERU_MODEL_SOURCE", "local")
     timeout = float(env.get("PAPER_AGENT_MINERU_TIMEOUT", "1200"))
+    progress.update('checking_parser')
     version = subprocess.run(
         [python, "-c", "from importlib.metadata import version; print(version('mineru'))"],
         env=env, capture_output=True, text=True, check=True, timeout=30).stdout.strip()
@@ -64,15 +71,18 @@ def read_mineru_paper(project: Path, pdf: Path) -> dict:
             command = [str(Path(python).parent / "mineru-kit"), "parse", str(pdf),
                        "-o", str(archive), "--format", "zip", "--tier", "standard"]
             try:
+                progress.update('parsing_pdf')
                 subprocess.run(command, env=env, capture_output=True, text=True,
                                check=True, timeout=timeout)
                 # Read only the structured content; never extract arbitrary archive paths.
+                progress.update('reading_structure')
                 with zipfile.ZipFile(archive) as bundle:
                     names = [n for n in bundle.namelist() if Path(n).name == "structured_content.json"]
                     if len(names) != 1:
                         raise ValueError("MinerU output must contain one structured_content.json")
                     (work / "structured_content.json").write_bytes(bundle.read(names[0]))
                 pages_from_structured(json.loads((work / "structured_content.json").read_text(encoding="utf-8")))
+                progress.update('grouping_figures')
                 subprocess.run([python, str(Path(__file__).with_name("figure_grouping.py")), "--pdf", str(pdf),
                                 "--input", str(work / "structured_content.json"),
                                 "--output", str(work / "grouped")], env=env,
@@ -83,6 +93,9 @@ def read_mineru_paper(project: Path, pdf: Path) -> dict:
             # Publish complete results only; an interrupted run is never a cache hit.
             cache.mkdir(exist_ok=True)
             shutil.copytree(work, cache, dirs_exist_ok=True)
+    else:
+        progress.update('using_cached_parse')
+    progress.update("preparing_sources")
     report = json.loads(report_path.read_text(encoding="utf-8"))
     document = document_from_structured(
         json.loads(structured_path.read_text(encoding="utf-8")), pdf_sha256=sha,

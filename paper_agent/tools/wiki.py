@@ -88,7 +88,7 @@ def _search_wiki_lexical(ctx: ToolContext, query: str, entity_type: str | None =
                          limit: int = 10) -> ToolResult:
     """BM25 Wiki search with Chinese support and section/line locators. Default groups
     by source paper; entity_type selects ungrouped pages. Scores are not confidence.
-    The public wrapper attaches method/data/limitation passages for inspection.
+    The public wrapper returns titles or stored abstracts for screening.
     """
     if not query.strip():
         return ToolResult("query must not be empty", True, {"error_code": "EMPTY_QUERY"})
@@ -131,14 +131,14 @@ def _search_wiki_lexical(ctx: ToolContext, query: str, entity_type: str | None =
     return ToolResult(_json({"query": query, "count": len(matches), "matches": output,
                             "ranking": "bm25-cjk-v1", "grouped_by_paper": not bool(entity_type),
                             "warnings": warnings,
-                            "note": "词法排名不表示方法适用性；请阅读条件、限制和原文。"}))
+                            "note": "词法排名不表示方法适用性；请先阅读 Wiki 正文中的条件和限制。"}))
 
 
 def _search_candidates(ctx: ToolContext, query: str, entity_type: str | None = None,
                 limit: int = 10, strategy: str = "auto", purpose: str = "evidence") -> ToolResult:
     """Search Wiki candidates with exact locations. strategy: auto, lexical, hybrid.
     auto fuses BM25/E5 when configured, otherwise uses BM25; degradation is explicit.
-    Internal ranking channel; the public search_wiki attaches source passages.
+    Internal ranking channel; the public search_wiki returns screening results.
     Candidates are not validated support: read conditions and limitations before use.
     """
     if strategy not in {"auto", "lexical", "hybrid"} or purpose not in {"evidence", "method", "paper", "overview"}:
@@ -197,60 +197,103 @@ def _source_record(root: Path, path: Path) -> dict:
 @tool(read_only=True)
 def search_wiki(ctx: ToolContext, query: str, entity_type: str | None = None,
                 limit: int = 5, strategy: str = "auto", purpose: str = "evidence",
-                include_relations: bool = True) -> ToolResult:
-    """Retrieve local Wiki evidence with one call: rank relevant papers, read bounded
-    method/data/limitation passages and optionally follow one recorded graph hop.
-    query is a research question, keywords, title or identifier; refine it to fill gaps.
-    strategy: auto (BM25, optional local E5), lexical, hybrid. purpose: evidence, method,
-    paper, overview; overview is also query-ranked. Returns exact source cards, line
-    locations, content fingerprints and quality records, not new model summaries.
-    Candidates and graph relations are discovery clues, not verified scientific support.
+                include_relations: bool = True, view: str = "titles") -> ToolResult:
+    """Discover Wiki pages without loading full bodies into the conversation.
+    view: titles (default) returns titles and wiki_path identifiers; abstracts adds
+    the complete existing Abstract section, with missing abstracts marked explicitly.
+    No new summaries are generated. query can be keywords, a title or an identifier.
+    limit defaults to 5, maximum 10. strategy: auto, lexical, hybrid.
+    purpose: evidence, method, paper, overview. include_relations follows recorded
+    graph links from the best hit to discover up to two related candidates.
+    Use read_wiki(wiki_path) for a selected page's complete stored Markdown.
+    Titles, abstracts, rankings and graph links alone do not verify scientific claims.
     """
-    # Browsing, section reads and graph navigation are private implementation details.
-    # All purposes start from relevance ranking rather than the first filenames.
+    if view not in {"titles", "abstracts"}:
+        return ToolResult("view must be titles or abstracts", True)
     limit = max(1, min(limit, 10))
     result = _search_candidates(ctx, query, entity_type=entity_type, limit=limit,
                                 strategy=strategy,
                                 purpose="evidence" if purpose == "overview" else purpose)
     if result.is_error:
         return result
-    data = json.loads(result.output)
+    ranked = json.loads(result.output)
     root = _wiki_root()
-    count = max(1, min(limit, 10))
-    cards, seen = [], set()
+    matches, seen = [], set()
 
-    def add_card(relative):
+    def add_match(relative, *, origin="search", score=None):
         path = (root / relative).resolve()
-        if (path in seen or len(cards) >= count or not path.is_file()
-                or path.parent != root / "papers"):
+        if (path in seen or len(matches) >= limit or not path.is_file()
+                or path.suffix != ".md"
+                or path.parent not in {root / kind for kind in ENTITY_TYPES}):
             return
         seen.add(path)
         page = load_page(path)
-        cards.append({**paper_card(page, root, max_chars=700),
-                      "quality_records": _quality_records(root, path),
-                      "source_record": _source_record(root, path)})
+        match = {"title": page.title, "wiki_path": path.relative_to(root).as_posix(),
+                 "entity_type": path.parent.name, "origin": origin}
+        if score is not None:
+            match["score"] = score
+        if view == "abstracts":
+            section = next((s for s in page.sections
+                            if s.heading.casefold() in {"abstract", "摘要"}), None)
+            abstract = ("\n".join(page.lines[section.start + 1:section.end]).strip()
+                        if section else "")
+            missing = not abstract or abstract.startswith(("_TODO", "_Not yet", "_To be", "<!--"))
+            match.update(abstract="" if missing else abstract,
+                         abstract_status="missing" if missing else "present")
+        matches.append(match)
 
-    matches = data.get("matches", [])
-    # Reserve at most two reading slots for graph neighbors; always read the best hit.
-    for match in matches[:max(1, count - 2)]:
-        add_card(match["wiki_path"])
+    candidates = ranked.get("matches", [])
+    for match in candidates[:max(1, limit - 2)]:
+        add_match(match["wiki_path"], score=match.get("score"))
     relations, expansions = [], 0
-    if include_relations and matches:
+    warnings = ranked.get("warnings", [])
+    if include_relations and candidates:
         from .wiki_hybrid import expand_wiki_relations
         expansions = 1
-        expanded = expand_wiki_relations(ctx, matches[0]["wiki_path"], limit=2)
+        expanded = expand_wiki_relations(ctx, candidates[0]["wiki_path"], limit=2)
         if expanded.is_error:
-            data.setdefault("warnings", []).append("关系扩展不可用；保留文本检索结果。")
+            warnings.append("关系扩展不可用；保留文本检索结果。")
         else:
-            relation_data = json.loads(expanded.output)
-            relations = relation_data.get("neighbors", [])
-            data.setdefault("warnings", []).extend(relation_data.get("warnings", []))
-            for neighbor in relations:
+            graph = json.loads(expanded.output)
+            warnings.extend(graph.get("warnings", []))
+            for neighbor in graph.get("neighbors", []):
+                relations.append({k: neighbor[k] for k in (
+                    "wiki_path", "title", "relation", "from", "to", "status",
+                    "graph_line", "via_source_idea",
+                ) if k in neighbor})
                 for relative in neighbor.get("paper_read_paths", []):
-                    add_card(relative)
-    for match in matches:
-        add_card(match["wiki_path"])
-    data.update(purpose=purpose, cards=cards, relations=relations,
-                relation_expansions=expansions,
-                reading_policy="卡片为当前栏目原文摘录；截断和缺项会标记。按研究问题改写 query 可继续检索。")
-    return ToolResult(_json(data))
+                    add_match(relative, origin="graph")
+    for match in candidates:
+        add_match(match["wiki_path"], score=match.get("score"))
+    data = {k: ranked[k] for k in (
+        "query", "count", "ranking", "grouped_by_paper", "degraded", "semantic_status",
+    ) if k in ranked}
+    data.update(view=view, purpose=purpose, candidate_only=True, matches=matches,
+                returned_count=len(matches), relations=relations, relation_expansions=expansions,
+                warnings=list(dict.fromkeys(warnings)),
+                reading_policy="先按标题或已有摘要筛选，再用 read_wiki(wiki_path) 读取选中页面的完整 MD。缺少摘要不表示没有正文；复用已读内容，不反复重搜或重读同一页面。")
+    return ToolResult(json.dumps(data, ensure_ascii=False))
+
+
+@tool(read_only=True)
+def read_wiki(ctx: ToolContext, wiki_path: str) -> ToolResult:
+    """Read one selected Wiki page's complete stored Markdown, without truncation.
+    Pass the exact relative wiki_path returned by search_wiki, e.g. papers/example.md.
+    Returns content, title, citation path, fingerprint and quality/source records.
+    Reuse this result instead of repeatedly reading the same page. Wiki evidence
+    does not imply the original PDF has been checked in this run.
+    """
+    relative = Path(wiki_path)
+    root = _wiki_root()
+    path = (root / relative).resolve()
+    if (relative.is_absolute() or ".." in relative.parts or path.suffix != ".md"
+            or path.parent not in {root / kind for kind in ENTITY_TYPES}):
+        return ToolResult("wiki_path must identify a Markdown page inside the Wiki entity directories", True)
+    if not path.is_file():
+        return ToolResult(f"Wiki page not found: {wiki_path}", True)
+    page = load_page(path)
+    return ToolResult(json.dumps({
+        **paper_card(page, root),
+        "quality_records": _quality_records(root, path),
+        "source_record": _source_record(root, path),
+    }, ensure_ascii=False))

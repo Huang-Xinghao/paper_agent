@@ -1,1 +1,1 @@
-"""Experiment planning, execution, scheduling and parameter search."""
+"""Experiment planning, execution and scheduling for agent-authored jobs."""

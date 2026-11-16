@@ -14,8 +14,9 @@ description: 在文献调研与研究构思之间，根据研究背景选择数�
 
 **执行边界**
 - 可以根据问题自主选择检索路径、阅读深度和检查方式，使用资源库、原始论文、项目模板、数据说明和真实文件。
-- 通过 `list_battery_data_sources` 获取登记的数据目录或完整数据包根目录
-- 用 `ls` / `find` / `read` / `grep` / `inspect_battery_data` 探索；
+- 统一用 `battery_resources(action="search", query="数据集名称或任务", resource_types=["dataset"])` 获取说明和登记的数据路径；query 留空可浏览目录，按 next_offset 翻页。
+- 用 `battery_resources(action="read", resource_id="搜索返回的ID")` 阅读说明；长文按 next_offset 继续读取。
+- 用 `battery_resources(action="inspect", path="数据文件绝对路径")` 查看 JSON/CSV/PKL 的结构与少量样本；目录和配套文本可用 `ls` / `find` / `read` / `grep` 探索。
 - 需要自定义统计、复杂格式读取时，可用 `bash` 编写并运行项目内检查脚本
 
 ## 2. Phase 1：根据研究背景选择合适的数据集

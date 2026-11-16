@@ -73,6 +73,17 @@ class QuestionAnswer(BaseModel):
     answer: str = Field(min_length=1, max_length=20000)
 
 
+class AgentView(BaseModel):
+    role: str
+    status: str = 'idle'
+    phase: str | None = None
+    task_id: str | None = None
+    instruction: str = ''
+    updated_at: str | None = None
+    error: str | None = None
+    is_active: bool = False
+
+
 class ProjectView(BaseModel):
     id: str
     name: str
@@ -84,3 +95,4 @@ class ProjectView(BaseModel):
     runs: list[RunView]
     checkpoint_token: str
     pending_questions: list[QuestionView] = Field(default_factory=list)
+    agents: list[AgentView] = Field(default_factory=list)

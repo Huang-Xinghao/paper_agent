@@ -16,6 +16,29 @@ from paper_agent.tools.core import ToolContext
 from paper_agent.tools.image_generation import generate_image
 
 
+def test_dead_local_task_recovers_only_after_execution_lock_released(tmp_path):
+    import fcntl
+    from paper_agent.agent.runtime.execution import (
+        ExecutionTask, recover_cancelled_local_task, read_result,
+    )
+    from paper_agent.storage import write_json
+    task = ExecutionTask(id='a' * 32, project=str(tmp_path), node='experiment_plan',
+                         role='experiment', instruction='Plan the experiment', project_goal='Research')
+    folder = tmp_path / 'task'
+    folder.mkdir()
+    write_json(folder / 'request.json', task.model_dump())
+    write_json(folder / 'started.json', {'id': task.id, 'pid': 123})
+    with (folder / 'execution.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert not recover_cancelled_local_task(folder)
+        assert not (folder / 'result.json').exists()
+    assert recover_cancelled_local_task(folder)
+    assert read_result(folder).status == 'interrupted'
+    receipt = (folder / 'result.json').read_bytes()
+    assert not recover_cancelled_local_task(folder)
+    assert (folder / 'result.json').read_bytes() == receipt
+
+
 def test_image_success_survives_usage_storage_failure(tmp_path, monkeypatch):
     from paper_agent.integrations import model
     content = io.BytesIO()
@@ -124,12 +147,16 @@ def fail() -> str:
 if __name__ == "__main__": mcp.run(transport="stdio")
 ''')
     config = tmp_path / 'mcp.json'
-    config.write_text(json.dumps({'mcpServers': {'local': {'transport': 'stdio',
+    config.write_text(json.dumps({'mcpServers': {
+        'offline': {'transport': 'stdio', 'command': str(tmp_path / 'missing-server')},
+        'local': {'transport': 'stdio',
         'command': sys.executable, 'args': [str(server)], 'allow_tools': ['echo', 'fail']}}}))
 
     async def run():
-        manager = MCPManager.from_config(path=config, phase='literature')
+        manager = MCPManager.from_config(path=config, phase='literature', allow_unavailable=True)
         async with manager:
+            assert len(manager.unavailable) == 1
+            assert 'offline' in manager.unavailable[0]
             tools = {t.name: t for t in manager.tools}
             result = await tools['local__echo'].handler(None, value='evidence')
             assert not result.is_error
@@ -142,6 +169,37 @@ if __name__ == "__main__": mcp.run(transport="stdio")
             assert again.structured_content == {'value': 'still running'}
         assert manager.tools == () and manager._workers == []
     asyncio.run(run())
+
+
+def test_mcp_offline_agent_continues_but_explicit_discovery_fails(tmp_path, monkeypatch):
+    pytest.importorskip('mcp')
+    from paper_agent.agent.loop import AgentLoop
+    config = tmp_path / 'mcp.json'
+    config.write_text(json.dumps({'mcpServers': {
+        'offline': {'transport': 'stdio', 'command': str(tmp_path / 'missing-server')}}}))
+    monkeypatch.setenv('PAPER_AGENT_MCP_CONFIG', str(config))
+    events = []
+    loop = AgentLoop(None, workspace=tmp_path, tools=(),
+                     on_progress=lambda kind, data: events.append((kind, data)))
+
+    async def model_loop(prompt, **kwargs):
+        assert 'offline' in kwargs['system_prompt']
+        assert '工具不可用' in kwargs['system_prompt']
+        assert loop.tools == ()
+        return 'continued'
+
+    monkeypatch.setattr(loop, '_arun', model_loop)
+
+    async def run():
+        assert await loop.arun('research', system_prompt='system', phase='experiment_bridge') == 'continued'
+        manager = MCPManager.from_config(phase='experiment_bridge')
+        with pytest.raises(RuntimeError, match='connection/discovery failed'):
+            async with manager:
+                pytest.fail('Explicit discovery must report the offline service')
+        assert manager._workers == []
+
+    asyncio.run(run())
+    assert any(kind == 'mcp_unavailable' for kind, _ in events)
 
 
 def test_mcp_rejects_removed_transport_alias(tmp_path):

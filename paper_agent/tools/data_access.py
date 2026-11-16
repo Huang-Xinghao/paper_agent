@@ -23,7 +23,8 @@ def registered_data_sources(knowledge_roots):
                                 'exists': path.exists()})
         for document in sorted(root.rglob('*.md')):
             relative = document.relative_to(root)
-            if document.parent.name != '数据集' or any(part.startswith('.') for part in relative.parts):
+            if (document.parent.name != '数据集' or any(part.startswith('.') for part in relative.parts)
+                    or not document.resolve().is_relative_to(root.resolve())):
                 continue
             for kind, value in pattern.findall(document.read_text(encoding='utf-8')):
                 path = Path(value).resolve()
@@ -31,7 +32,7 @@ def registered_data_sources(knowledge_roots):
                     continue
                 sources.append({'resource_id': relative.with_suffix('').as_posix(),
                                 'kind': kind, 'path': str(path), 'exists': path.exists()})
-    return sources
+    return list({(source['resource_id'], source['path']): source for source in sources}.values())
 
 
 def resolve_data_read(workspace, knowledge_roots, value):
@@ -41,10 +42,13 @@ def resolve_data_read(workspace, knowledge_roots, value):
     candidate = candidate.resolve()
     if candidate.is_relative_to(Path(workspace).resolve()):
         return candidate
-    # Shared figures and original papers are readable from independent projects.
+    # Shared Wiki Markdown, figures and original papers are readable from independent projects.
     # Resolve both sides so symlinks cannot grant access outside those libraries.
     from .wiki import resolve_wiki_root, resolve_raw_paper_root
-    figure_root = (resolve_wiki_root() / 'figures').resolve()
+    wiki_root = resolve_wiki_root().resolve()
+    if candidate.suffix.lower() == '.md' and candidate.is_relative_to(wiki_root):
+        return candidate
+    figure_root = (wiki_root / 'figures').resolve()
     if candidate.is_relative_to(figure_root) or candidate.is_relative_to(resolve_raw_paper_root()):
         return candidate
     for source in registered_data_sources(knowledge_roots):

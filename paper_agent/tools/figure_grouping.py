@@ -181,17 +181,21 @@ def run(pdf_path, input_path, output):
         overlay = rendered.copy()
         draw = ImageDraw.Draw(overlay)
         w, h = rendered.size
+        occurrences = {}
         for g in groups:
+            base = f"page_{g['page']}_figure_{g['number']}"
+            occurrences[base] = occurrences.get(base, 0) + 1
+            stem = base if occurrences[base] == 1 else f"{base}_occurrence_{occurrences[base]}"
             if g['crop_bbox']:
                 x0,y0,x1,y1 = g['crop_bbox']
                 box = (round(x0*w), round(y0*h), round(x1*w), round(y1*h))
-                path = f"figures/page_{g['page']}_figure_{g['number']}.png"
+                path = f"figures/{stem}.png"
                 rendered.crop(box).save(output/path)
                 g['image'] = path
                 color = 'orange' if g['review_required'] else 'green'
                 draw.rectangle(box, outline=color, width=5)
                 draw.text((box[0], max(0,box[1]-18)), 'Figure '+g['number'], fill=color)
-            caption_path = f"figures/page_{g['page']}_figure_{g['number']}_caption.txt"
+            caption_path = f"figures/{stem}_caption.txt"
             (output/caption_path).write_text(g['caption']+'\n')
         overlay.save(output/f"page_{page['page_idx']+1}_overlay.jpg")
         pdf_page.close()

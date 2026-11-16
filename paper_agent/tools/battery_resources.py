@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .core import ToolContext, ToolResult, tool
+from .data_access import registered_data_sources
+from .dataset_inspection import inspect_data_file
 
 
 def _json(value: Any) -> str:
@@ -50,7 +52,8 @@ def _index(root: Path) -> list[dict[str, Any]]:
     resources: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*.md")):
         relative = path.relative_to(root)
-        if any(part.startswith(".") for part in relative.parts):
+        if (any(part.startswith(".") for part in relative.parts)
+                or not path.resolve().is_relative_to(root)):
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -82,61 +85,96 @@ def _public(item: dict[str, Any], *, score: int | None = None,
     return result
 
 
-@tool(read_only=True)
-def search_battery_resources(ctx: ToolContext, query: str, stage: str | None = None,
-                             resource_types: list[str] | None = None,
-                             top_k: int = 8) -> ToolResult:
-    """Search cell and electrolyte resources. Types: dataset, input, method, overview.
-
-    Overview includes the root catalog and shared guides (statistics, capacity
-    recording conventions, and data structure). Returns resource IDs for reading.
-    """
-    if not query.strip():
-        return ToolResult("query must not be empty", True, {"error_code": "EMPTY_QUERY"})
-    try:
-        root = _root(ctx)
-        resources = _index(root)
-    except (ValueError, FileNotFoundError) as exc:
-        return ToolResult(str(exc), True, {"error_code": "KNOWLEDGE_ROOT_UNAVAILABLE"})
-    terms = _tokens(f"{query} {stage or ''}")
+def _search(ctx: ToolContext, query: str, resource_types: list[str] | None,
+            top_k: int, offset: int) -> ToolResult:
+    root = _root(ctx)
+    resources = _index(root)
+    sources = registered_data_sources(ctx.knowledge_roots)
+    terms = _tokens(query)
     allowed = set(resource_types or ())
+    if allowed - {"dataset", "input", "method", "overview"}:
+        raise ValueError("resource_types must contain dataset, input, method or overview")
     ranked = []
     for item in resources:
         if allowed and item["type"] not in allowed:
             continue
         score = len(terms & item["tokens"])
-        if score:
+        if score or not terms:
             ranked.append((score, item))
     ranked.sort(key=lambda pair: (-pair[0], pair[1]["path"]))
     limit = max(1, min(int(top_k), 30))
+    selected = ranked[offset:offset + limit]
+    matched_ids = {item["resource_id"] for _, item in ranked}
+    matching_sources = [source for source in sources
+                        if (not allowed or "dataset" in allowed)
+                        and (not terms or source["resource_id"] in matched_ids
+                             or terms & _tokens(f'{source["resource_id"]} {source["path"]}'))]
     return ToolResult(_json({
-        "query": query, "stage": stage, "resource_types": sorted(allowed),
+        "query": query, "resource_types": sorted(allowed),
         "knowledge_root": str(root), "indexed": len(resources),
-        "count": min(len(ranked), limit),
-        "resources": [_public(item, score=score, query=query) for score, item in ranked[:limit]],
-        "note": "Resource presence does not prove that a dataset contains the required fields; verify locally.",
-    }), metadata={"count": min(len(ranked), limit), "indexed": len(resources)})
+        "count": len(selected), "total": len(ranked),
+        "resources": [{**_public(item, score=score, query=query),
+                       "data_sources": [source for source in sources
+                                        if source["resource_id"] == item["resource_id"]]}
+                      for score, item in selected],
+        "sources": matching_sources[offset:offset + limit], "total_sources": len(matching_sources),
+        "next_offset": offset + limit if offset + limit < max(len(ranked), len(matching_sources)) else None,
+    }), metadata={"count": len(selected), "indexed": len(resources)})
+
+
+def _read(ctx: ToolContext, resource_id: str, offset: int, limit: int) -> ToolResult:
+    root = _root(ctx)
+    relative = Path(resource_id + ".md")
+    target = (root / relative).resolve()
+    if (relative.is_absolute() or ".." in relative.parts or not target.is_relative_to(root)
+            or any(part.startswith('.') for part in relative.parts) or not target.is_file()):
+        return ToolResult(f"Battery resource not found: {resource_id}", True,
+                          {"error_code": "RESOURCE_NOT_FOUND"})
+    lines = target.read_text(encoding="utf-8").splitlines()
+    limit = max(1, min(int(limit), 2000))
+    selected = lines[offset:offset + limit]
+    return ToolResult(_json({
+        "resource_id": resource_id, "type": _resource_type(relative),
+        "path": relative.as_posix(), "absolute_path": str(target),
+        "citation_markdown": f'[{resource_id}](<{target}>)',
+        "content": "\n".join(f"{offset + i + 1}: {line}" for i, line in enumerate(selected)),
+        "total_lines": len(lines),
+        "next_offset": offset + limit if offset + limit < len(lines) else None,
+        "data_sources": [source for source in registered_data_sources(ctx.knowledge_roots)
+                         if source["resource_id"] == resource_id],
+    }), metadata={"resource_id": resource_id})
 
 
 @tool(read_only=True)
-def read_battery_resource(ctx: ToolContext, resource_id: str, max_chars: int = 24000) -> ToolResult:
-    """Read one resource returned by search_battery_resources by stable resource ID."""
+def battery_resources(ctx: ToolContext, action: Literal["search", "read", "inspect"],
+                      query: str = "", resource_id: str = "", path: str = "",
+                      resource_types: list[str] | None = None, top_k: int = 8,
+                      offset: int = 0, limit: int = 200) -> ToolResult:
+    """One read-only entry for battery resources and registered local datasets.
+
+    search: query keywords (empty lists the catalog), optional resource_types
+    (dataset/input/method/overview), top_k<=30 and offset. Returns resource IDs,
+    matching descriptions and registered data paths together; never opens samples.
+    read: resource_id from search, offset/limit in lines, next_offset for continuation.
+    inspect: path to one trusted JSON/CSV/PKL dataset file; returns bounded structural
+    samples using the runner Python, not a scientific audit. Source data is read-only.
+    Select one action per call. Read project files with ordinary file tools.
+    """
     try:
-        root = _root(ctx)
-        matches = [item for item in _index(root) if item["resource_id"] == resource_id]
-    except (ValueError, FileNotFoundError) as exc:
-        return ToolResult(str(exc), True, {"error_code": "KNOWLEDGE_ROOT_UNAVAILABLE"})
-    if not matches:
-        return ToolResult(f"Battery resource not found: {resource_id}", True,
-                          {"error_code": "RESOURCE_NOT_FOUND"})
-    item = matches[0]
-    limit = max(1000, min(int(max_chars), 60000))
-    text = item["text"]
-    truncated = len(text) > limit
-    return ToolResult(_json({
-        "resource_id": item["resource_id"], "type": item["type"],
-        "title": item["title"], "path": item["path"],
-        "absolute_path": str((root / item["path"]).resolve()),
-        "citation_markdown": f'[{item["resource_id"]}](<{(root / item["path"]).resolve()}>)',
-        "content": text[:limit], "truncated": truncated,
-    }), metadata={"resource_id": resource_id, "truncated": truncated})
+        if offset < 0:
+            raise ValueError("offset must be nonnegative")
+        if action == "search":
+            if resource_id or path:
+                raise ValueError("search uses query, not resource_id or path")
+            return _search(ctx, query, resource_types, top_k, offset)
+        if action == "read":
+            if not resource_id or path or query:
+                raise ValueError("read requires resource_id only")
+            return _read(ctx, resource_id, offset, limit)
+        if action == "inspect":
+            if not path or resource_id or query:
+                raise ValueError("inspect requires path only")
+            return inspect_data_file(ctx, path)
+        raise ValueError("action must be search, read or inspect")
+    except (ValueError, OSError) as exc:
+        return ToolResult(str(exc), True, {"error_code": type(exc).__name__})

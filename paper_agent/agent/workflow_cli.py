@@ -83,7 +83,7 @@ def approve_checkpoint(project, expected):
         return state, stop_after
 
 
-def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 100,
+def _run_workflow(project: Path, prompt: str = "", *, max_iterations: int = 300,
                  timeout: float = 300, start_node: str | None = None,
                  config: WorkflowConfig | None = None,
                  idea_config: IdeaNodeConfig | None = None,
@@ -268,6 +268,8 @@ def execute_stage(project: Path, node: str, instruction: str, *, role: str, proj
 def refresh_revision_checkpoint(project, node, project_goal=None):
     from .workflow import WorkflowRunner
     saved = read_json(project / 'workflow-state.json', {})
+    if saved.get('mode', 'auto') == 'auto':
+        return False
     checkpoint = saved.get('expert_checkpoint') or {}
     was_approved = any(item.get('event') == 'expert_approved' and item.get('node') == node
                        for item in saved.get('history', []))
@@ -299,7 +301,7 @@ def refresh_revision_checkpoint(project, node, project_goal=None):
 def run_coordinated_workflow(project: Path, prompt: str = "", *, start_node=None,
                              stop_after=None, mode=None, continue_run=False, revise=None, resume_run=False,
                              proposal_review_sha=None,
-                             model=None, max_iterations=100, timeout=300, on_event=None,
+                             model=None, max_iterations=300, timeout=300, on_event=None,
                              execution_guard=None, wait_for_user=False, **workflow_options):
     """All user-facing advancement goes through main; runner only supplies stages."""
     from types import SimpleNamespace
@@ -329,6 +331,11 @@ def run_coordinated_workflow(project: Path, prompt: str = "", *, start_node=None
             saved = runner.resume_checkpoint(saved, proposal_review_sha=proposal_review_sha)
             _write_json(path, saved.to_dict())
             if saved.status == "completed":
+                if saved.current_node == 'improvement':
+                    CoordinatorAgent(project, model=model, timeout=timeout, mode=saved.mode,
+                                     on_event=on_event, wait_for_user=wait_for_user).go(
+                        '最终修订产物已正式批准，完整研究已完成。调用 curate_wiki(project_evidence=true) 沉淀成果后总结。',
+                        archive_completed=True)
                 return saved
         start_node = saved.current_node
         prompt = revise if revise is not None else saved.project_goal
@@ -387,10 +394,8 @@ def main() -> None:
     parser.add_argument("--mode", choices=("auto", "expert"), default=None,
                         help="auto 默认自动运行；expert 在每个节点完成后暂停审阅")
     parser.add_argument("--max-tool-rounds", dest="max_tool_rounds",
-                        type=int, default=100,
-                        help="tool-enabled model rounds per phase-agent invocation (default: 100); not workflow stages")
-    parser.add_argument("--max-experiment-repairs", type=int, default=3,
-                        help="experiment repair limit across workflow resumes; 0 disables")
+                        type=int, default=300,
+                        help="model rounds per saved execution segment (default: 300); unfinished assignments continue automatically")
     parser.add_argument("--model", default=None,
                         help="model name; defaults to PAPER_AGENT_MODEL or gpt-4o")
     parser.add_argument("--timeout", type=float, default=300,
@@ -413,8 +418,6 @@ def main() -> None:
     if args.single_node and (args.start_node and args.start_node != args.single_node
                              or args.stop_after and args.stop_after != args.single_node):
         parser.error("--single-node must match --start-node and --stop-after when combined")
-    if args.max_experiment_repairs < 0:
-        parser.error("--max-experiment-repairs must be nonnegative")
     if args.timeout <= 0 or args.max_tool_rounds < 1:
         parser.error("--timeout and --max-tool-rounds must be positive")
     if not 0 < args.idea_max_total_gpu_hours < float("inf"):
@@ -423,7 +426,6 @@ def main() -> None:
                          model=args.model,
                          idea_config=IdeaNodeConfig(max_total_gpu_hours=args.idea_max_total_gpu_hours),
                          config=WorkflowConfig(start_node="literature",
-                                               max_experiment_repairs=args.max_experiment_repairs,
                                                improvement_start_round=args.improvement_start_round,
                                                paper_review_timeout=args.paper_review_timeout,
                                                paper_review_round2_timeout=args.paper_review_round2_timeout))

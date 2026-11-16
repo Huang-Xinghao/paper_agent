@@ -12,10 +12,13 @@ def load_compute_config(project):
     document = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
     if not isinstance(document, dict) or set(document) - {'compute', 'execution'}:
         raise ValueError('project-config.json supports only compute and execution objects')
-    config = document.get('compute', {})
+    return validate_compute_config(document.get('compute', {}))
+
+
+def validate_compute_config(config):
     allowed = {'device', 'gpu_index', 'cpu_threads', 'max_job_seconds', 'total_experiment_seconds'}
     if not isinstance(config, dict) or set(config) - allowed:
-        raise ValueError(f'{path.name} has unsupported compute fields')
+        raise ValueError('project-config.json has unsupported compute fields')
     result = {'device': 'auto', 'gpu_index': None, 'cpu_threads': None,
               'max_job_seconds': None, 'total_experiment_seconds': None, **config}
     if result['device'] not in {'auto', 'cpu', 'cuda', 'mps'}:
@@ -38,7 +41,10 @@ def load_execution_config(project):
     document = json.loads(path.read_text()) if path.exists() else {}
     if not isinstance(document, dict) or set(document) - {'compute', 'execution'}:
         raise ValueError('project-config.json supports only compute and execution objects')
-    config = document.get('execution', {})
+    return validate_execution_config(document.get('execution', {}))
+
+
+def validate_execution_config(config):
     defaults = dict(gpu_ids='auto', max_parallel_gpu_jobs='auto',
                     gpu_idle_memory_threshold_mib=500, oom_max_retries=2,
                     oom_retry_delay_seconds=120, poll_seconds=2)
@@ -61,6 +67,40 @@ def load_execution_config(project):
     return result
 
 
+def update_resources(project, *, device=None, gpu_ids=None, cpu_threads=None,
+                     budget_hours=None, max_job_seconds=None,
+                     max_parallel_gpu_jobs=None, gpu_idle_memory_threshold_mib=None):
+    """Translate resource requests and atomically publish a validated configuration."""
+    import fcntl
+    from paper_agent.storage import write_json
+    project = Path(project).resolve()
+    directory = project / '.paper-agent'
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'resource-config.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        compute = load_compute_config(project)
+        execution = load_execution_config(project)
+        for key, value in {'device': device, 'cpu_threads': cpu_threads,
+                           'max_job_seconds': max_job_seconds}.items():
+            if value is not None:
+                compute[key] = value
+        if budget_hours is not None:
+            if type(budget_hours) not in (int, float) or not math.isfinite(budget_hours) or budget_hours <= 0:
+                raise ValueError('budget_hours must be finite and positive')
+            compute['total_experiment_seconds'] = budget_hours * 3600
+        if gpu_ids is not None:
+            execution['gpu_ids'] = gpu_ids
+            compute['gpu_index'] = None  # Queue allocates a logical device from gpu_ids.
+        for key, value in {'max_parallel_gpu_jobs': max_parallel_gpu_jobs,
+                           'gpu_idle_memory_threshold_mib': gpu_idle_memory_threshold_mib}.items():
+            if value is not None:
+                execution[key] = value
+        config = {'compute': validate_compute_config(compute),
+                  'execution': validate_execution_config(execution)}
+        write_json(project / 'project-config.json', config)
+        return config
+
+
 def effective_job_seconds(project):
     configured = load_compute_config(project)["max_job_seconds"]
     return min(MAX_JOB_SECONDS, configured) if configured is not None else MAX_JOB_SECONDS
@@ -74,21 +114,3 @@ def validate_job_timeout(project, job):
             f"Job {job.get('id', '<missing>')}: timeout_seconds={value!r} must be finite and "
             f"0 < timeout_seconds <= {limit} (effective max_job_seconds). "
             "Split multi-seed/variant searches into executable jobs; do not use the whole experiment budget as one job timeout.")
-
-
-def compute_context(project):
-    return ('User-owned project compute policy (do not edit or override):\n' +
-            json.dumps(load_compute_config(project), ensure_ascii=False) +
-            '\nUser-owned execution policy:\n' + json.dumps(load_execution_config(project), ensure_ascii=False) +
-            '\nManifest jobs may declare depends_on as a list of upstream job IDs. '
-            'Omit depends_on or use [] for independent jobs; list prerequisite job IDs for dependent jobs. '
-            '\nExecution limits: ' + json.dumps({'effective_max_job_seconds': effective_job_seconds(project),
-                                                    'runner_max_job_seconds': MAX_JOB_SECONDS}) +
-            '\nnull means no project-specific limit, not missing approval; the runner limit still applies. '
-            'Split long searches by seed/variant into separate executable jobs, each within the effective limit. '
-            'Choose and record reasonable job budgets within configured limits. '
-            'Use these resources to size models, seeds and searches. Total budget includes '
-            'all experiment attempts across resumes; it excludes model API time. '
-            'HPO smoke, trials and confirmation runs consume this same total, plus their '
-            'separate cumulative max_seconds allowance in the confirmed experiment-plan hpo-policy. '
-            'Inspect real device availability before execution; auto is a preference, not proof of a GPU.\n')

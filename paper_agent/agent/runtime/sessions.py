@@ -18,6 +18,7 @@ ROLE_DESCRIPTIONS = {
     "idea_generator": "Develop evidence-backed research questions, literature and data understanding, ideas, novelty assessments and the final proposal.",
     "experiment": "Plan, implement and execute approved experiments; verify real execution receipts and explain results without inventing evidence.",
     "paper_writer": "Plan the paper, create figures, write, compile and revise using verified project evidence; distinguish claims from untested hypotheses.",
+    "wiki_agent": "Read papers and project evidence, author grounded Wiki drafts, obtain independent review and publish verified Wiki records.",
 }
 
 
@@ -92,14 +93,19 @@ class RoleSession:
         from paper_agent.storage import write_json
         write_json(self.path, value)
 
-    def compact(self, data: dict, history: list[dict], model, max_chars: int) -> list[dict]:
-        from paper_agent.agent.context import project_messages, request_size, resume_memory, summarize_messages
+    def compact(self, data: dict, history: list[dict], model, max_tokens: int, *,
+                on_compacting=None, on_compacted=None) -> list[dict]:
+        from paper_agent.agent.context import compact_threshold, project_messages, request_tokens, resume_memory, summarize_messages
         messages = resume_memory(history, data.get("context_memory"))
         reused = messages is not history
-        if request_size(project_messages(messages, for_summary=True)) > max_chars:
+        compacted = False
+        if request_tokens(project_messages(messages, for_summary=True)) > compact_threshold(max_tokens):
+            if on_compacting:
+                on_compacting()
             # Reused memory is summarized only with the uncompressed tail;
             # the covered raw prefix never goes back into another model call.
-            messages = [{"role": "user", "content": summarize_messages(model, messages, max_chars)}]
+            messages = [{"role": "user", "content": summarize_messages(model, messages, compact_threshold(max_tokens))}]
+            compacted = True
         elif not reused:
             return history
         archive = self.folder / "archives" / self.role
@@ -108,6 +114,8 @@ class RoleSession:
         data["messages"] = messages
         data.pop("context_memory", None)
         self.save(data)
+        if compacted and on_compacted:
+            on_compacted()
         return messages
 
     @staticmethod

@@ -211,14 +211,17 @@ class MCPManager:
     only the session's owner task enters/exits SDK context managers.
     """
 
-    def __init__(self, servers: tuple[ServerConfig, ...]):
+    def __init__(self, servers: tuple[ServerConfig, ...], *, allow_unavailable: bool = False):
         self.servers = servers
+        self.allow_unavailable = allow_unavailable
+        self.unavailable: list[str] = []
         self.tools: tuple[ToolSpec, ...] = ()
         self._workers: list[asyncio.Task] = []
 
     @classmethod
-    def from_config(cls, *, phase: str, path: str | Path | None = None):
-        return cls(load_servers(path, phase=phase))
+    def from_config(cls, *, phase: str, path: str | Path | None = None,
+                    allow_unavailable: bool = False):
+        return cls(load_servers(path, phase=phase), allow_unavailable=allow_unavailable)
 
     async def __aenter__(self):
         if not self.servers:
@@ -239,7 +242,18 @@ class MCPManager:
                     self._serve(server, queue, ready), name=f"mcp:{server.name}"
                 )
                 self._workers.append(worker)
-                discovered = await ready
+                try:
+                    discovered = await ready
+                except Exception as exc:
+                    if not self.allow_unavailable:
+                        raise
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+                    self._workers.remove(worker)
+                    # Do not expose exception messages: URLs/headers can contain credentials.
+                    self.unavailable.append(
+                        f"MCP server {server.name}: connection/discovery failed ({_error_kind(exc)})")
+                    continue
                 allow = server.options.get("allow_tools")
                 if allow is not None and set(allow) - {r.name for r in discovered}:
                     raise ValueError("Configured MCP tool is not advertised by server")
