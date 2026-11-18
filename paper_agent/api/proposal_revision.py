@@ -15,7 +15,7 @@ from paper_agent.tools import BUILTIN_TOOLS
 from paper_agent.proposal_review import (
     CANVAS, PROPOSAL, RECORD, CanvasDraft, RevisionResult,
     draft_hash, json_bytes, load_draft, owned_path, sha,
-    write_group,
+    write_group, require_revision_changes,
 )
 from .store import REPO
 
@@ -55,6 +55,7 @@ def run_revision(root, expected_sha, run_id, folder, *, model=None, timeout=600,
     root, folder = Path(root), Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     incoming = load_draft(root, expected_sha)
+    require_revision_changes(root, incoming)
     source = owned_path(root, PROPOSAL).read_text(encoding="utf-8")
     original_hash = sha(source.encode("utf-8"))
     state_path = owned_path(root, "workflow-state.json")
@@ -89,7 +90,8 @@ def run_revision(root, expected_sha, run_id, folder, *, model=None, timeout=600,
             parts.clear()
         elif kind == "assistant_delta":
             receive(data["content"])
-        if on_event:
+        # The completion is an internal JSON candidate, not a conversation reply.
+        if on_event and kind not in {"assistant_delta", "assistant_output"}:
             on_event({"kind": kind, "node": "refine", "role": "idea_generator", **data})
 
     reader = AgentLoop(

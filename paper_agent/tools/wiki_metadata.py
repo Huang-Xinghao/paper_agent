@@ -1,5 +1,6 @@
 """Canonical per-paper metadata paths."""
 from pathlib import Path
+from .wiki_layout import entity_paths
 
 KINDS = {'source', 'quality', 'references', 'figures', 'relations'}
 
@@ -12,7 +13,7 @@ def metadata_path(paper: Path, kind: str) -> Path:
 
 
 def metadata_records(root: Path, kind: str):
-    for paper in sorted((root / 'papers').glob('*.md')):
+    for paper in entity_paths(root, 'papers'):
         path = metadata_path(paper, kind)
         if path.is_file():
             yield paper, path

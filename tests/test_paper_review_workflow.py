@@ -125,3 +125,39 @@ def test_resume_second_round_preserves_first_round(tmp_path, monkeypatch):
         assert (paper / name).read_text() == existing[name]
     assert (paper / "PAPER_IMPROVEMENT_LOG.md").read_text().startswith("First round log\n")
     assert (paper / "main_round2.pdf").exists()
+
+
+def test_failed_compile_is_repaired_without_a_compile_skill(tmp_path, monkeypatch):
+    from paper_agent.integrations.model import ModelResponse
+
+    paper = tmp_path / 'paper'
+    paper.mkdir()
+    source = paper / 'main.tex'
+    source.write_text('broken source')
+    requests = []
+
+    class Model:
+        def complete(self, messages, tools):
+            requests.append(messages)
+            assert 'Undefined control sequence' in str(messages)
+            assert '## Skill:' not in messages[0]['content']
+            source.write_text('repaired source')
+            return ModelResponse(content='Fixed the LaTeX error.')
+
+    agent = PhaseAgent(tmp_path, model_client=Model(), phase='paper_compile')
+    runner = WorkflowRunner(agent)
+
+    def compile_pdf():
+        if source.read_text() != 'repaired source':
+            raise RuntimeError('Undefined control sequence')
+        output = paper / 'main.pdf'
+        output.write_bytes(b'%PDF-' + b'0' * 100)
+        return output
+
+    monkeypatch.setattr(runner, '_compile_pdf', compile_pdf)
+    state = runner.start_from_project('paper_compile', 'Compile the paper')
+    result = runner.run('Compile the paper', state=state, stop_after='paper_compile')
+    assert result.status == 'completed', result.error
+    assert len(requests) == 1
+    assert (paper / 'main.pdf').is_file()
+    assert agent.last_state.role == 'paper_writer'

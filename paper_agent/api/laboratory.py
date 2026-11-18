@@ -59,6 +59,9 @@ class BtsSnapshotView(LaboratoryView):
     stale: bool = False
     message: str | None = None
     devices: list[BtsDeviceView] = Field(default_factory=list)
+    discovery_only: bool = False
+    status_available: bool = True
+    measurements_available: bool = True
 
 
 def _now():
@@ -187,7 +190,14 @@ def assemble_snapshot(
         observed_at=health.get("observed_at"),
         last_success_at=_now(),
         stale=stale,
-        message="部分通道数据未更新，请稍后刷新。" if stale else None,
+        discovery_only=health.get("discovery_only", False),
+        status_available=health.get("status_available", True),
+        measurements_available=health.get("measurements_available", True),
+        message=(
+            "已读取蓝电通道目录；通道在线情况、实时运行状态和测量值尚未接入。"
+            if health.get("discovery_only")
+            else ("部分通道数据未更新，请稍后刷新。" if stale else None)
+        ),
         devices=list(devices.values()),
     )
 
@@ -195,7 +205,8 @@ def assemble_snapshot(
 class BtsMonitor:
     """Coalesce concurrent viewers; keep last observations visibly stale on disconnect."""
 
-    def __init__(self):
+    def __init__(self, vendor: str = "bts"):
+        self.vendor = vendor
         self._cached: BtsSnapshotView | None = None
         self._last_good: BtsSnapshotView | None = None
         self._expires = 0.0
@@ -213,11 +224,15 @@ class BtsMonitor:
             servers = tuple(
                 s
                 for s in load_servers(phase="laboratory")
-                if s.name == os.environ.get("PAPER_AGENT_LAB_BTS_SERVER", "bts")
+                if s.name
+                == os.environ.get(
+                    f"PAPER_AGENT_LAB_{self.vendor.upper()}_SERVER", self.vendor
+                )
             )
             if not servers:
                 result = BtsSnapshotView(
-                    connection="unconfigured", message="尚未连接新威 BTS 设备。"
+                    connection="unconfigured",
+                    message=f"尚未连接{self.vendor.upper()}设备。",
                 )
             else:
                 async with asyncio.timeout(20):
@@ -250,12 +265,16 @@ class BtsMonitor:
                 )
                 if result.is_error:
                     raise RuntimeError("BTS query failed")
-                payload = result.structured_content if result.structured_content is not None else json.loads(result.output)
+                payload = (
+                    result.structured_content
+                    if result.structured_content is not None
+                    else json.loads(result.output)
+                )
                 if not isinstance(payload, dict):
                     raise ValueError("Invalid BTS response")
                 return payload
 
-            health = await call("bts_health")
+            health = await call(f"{self.vendor}_health")
             if health.get("reachable") is not True:
                 raise RuntimeError("BTS not reachable")
             ids = list(
@@ -265,8 +284,8 @@ class BtsMonitor:
             partial = False
             for start in range(0, len(ids), 40):
                 for name, target in (
-                    ("bts_get_status", statuses),
-                    ("bts_get_measurements", measurements),
+                    (f"{self.vendor}_get_status", statuses),
+                    (f"{self.vendor}_get_measurements", measurements),
                 ):
                     try:
                         part = await call(name, channel_ids=ids[start : start + 40])
@@ -289,3 +308,8 @@ class BtsMonitor:
 @router.get("/bts", response_model=BtsSnapshotView)
 async def bts_snapshot(request: Request):
     return await request.app.state.bts_monitor.snapshot()
+
+
+@router.get("/land", response_model=BtsSnapshotView)
+async def land_snapshot(request: Request):
+    return await request.app.state.land_monitor.snapshot()

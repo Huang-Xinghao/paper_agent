@@ -244,3 +244,73 @@ while not os.path.exists('release'):
         worker.join(timeout=6)
     assert results[0].status == 'completed'
     assert not live_operations(tmp_path)
+
+
+def manuscript(tmp_path, pages=5):
+    import pymupdf
+    path = tmp_path / 'paper/main.pdf'
+    path.parent.mkdir(exist_ok=True)
+    with pymupdf.open() as document:
+        for number in range(pages):
+            page = document.new_page()
+            page.insert_text((72, 72), f'Current manuscript page {number + 1}')
+        document.save(path)
+    return path
+
+
+@pytest.mark.parametrize('save_diagnostics, custom_name', [(False, False), (True, False), (True, True)])
+def test_paper_review_attaches_native_images_covering_every_page(tmp_path, save_diagnostics, custom_name):
+    pdf = manuscript(tmp_path)
+    if custom_name:
+        pdf = pdf.rename(tmp_path / 'submission.pdf')
+    original = pdf.read_bytes()
+    executable = fake_codex(tmp_path, '''
+from pathlib import Path
+from PIL import Image
+attachments = [sys.argv[i+1] for i, value in enumerate(sys.argv) if value == '--image']
+assert len(attachments) == 2
+for name in attachments:
+    with Image.open(name) as image:
+        assert image.size == (1840, 2480)
+folder = Path(attachments[0]).parent
+assert len(list(folder.glob('page-*.png'))) == 5
+assert 'page 1:' in prompt and 'page 5:' in prompt
+assert 'actual images' in prompt
+assert 'Do not print base64' in prompt
+assert 'data:image/' not in prompt
+Path('attached-images.json').write_text(json.dumps(attachments))
+''' + SUCCESS)
+    result = ReviewRunner(tmp_path, executable=executable).run(ReviewRequest(
+        'paper', 'Review current manuscript', (pdf.relative_to(tmp_path),),
+        save_diagnostics=save_diagnostics))
+    assert result.status == 'completed', result.error
+    assert pdf.read_bytes() == original
+    paths = json.loads((tmp_path / 'attached-images.json').read_text())
+    assert all(Path(path).exists() == save_diagnostics for path in paths)
+
+
+def test_invalid_manuscript_does_not_start_reviewer_or_publish_report(tmp_path):
+    pdf = tmp_path / 'paper/main.pdf'
+    pdf.parent.mkdir()
+    pdf.write_bytes(b'%PDF-broken')
+    executable = fake_codex(tmp_path, "open('reviewer-started', 'w').write('yes')\n" + SUCCESS)
+    result = ReviewRunner(tmp_path, executable=executable).run(ReviewRequest(
+        'paper', 'Review manuscript', (Path('paper/main.pdf'),)))
+    assert result.status == 'failed' and result.error
+    assert not result.report.exists()
+    assert not (tmp_path / 'reviewer-started').exists()
+
+
+def test_preview_preparation_uses_review_timeout_budget(tmp_path, monkeypatch):
+    import subprocess
+    from paper_agent.integrations import review_images
+    manuscript(tmp_path)
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired('render previews', 1)
+    monkeypatch.setattr(review_images, 'manuscript_previews', timeout)
+    executable = fake_codex(tmp_path, "open('reviewer-started', 'w').write('yes')\n" + SUCCESS)
+    result = ReviewRunner(tmp_path, executable=executable).run(ReviewRequest(
+        'paper', 'Review manuscript', (Path('paper/main.pdf'),)))
+    assert result.status == 'timed_out'
+    assert not (tmp_path / 'reviewer-started').exists()
+    assert not result.report.exists()

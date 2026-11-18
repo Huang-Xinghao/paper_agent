@@ -132,3 +132,33 @@ def test_text_tokens_uses_bpe_not_character_count():
     text = '上下文研究 evidence ' * 10
     assert text_tokens(text) == len(tiktoken.get_encoding('o200k_base').encode(text))
     assert text_tokens(text) != len(text)
+
+
+def test_historical_write_and_edit_bodies_remain_real_content():
+    """Historical tool arguments must not become synthetic file contents."""
+    import copy
+    import json
+    from paper_agent.agent.context import project_messages
+
+    code = 'print("real implementation")\n' * 150
+    messages = [
+        {'role': 'assistant', 'content': '', 'tool_calls': [
+            {'id': 'write-1', 'type': 'function', 'function': {
+                'name': 'write', 'arguments': json.dumps({'path': 'report.py', 'content': code})}},
+        ]},
+        {'role': 'tool', 'tool_call_id': 'write-1', 'name': 'write', 'content': 'Wrote report.py'},
+        {'role': 'assistant', 'content': '', 'tool_calls': [
+            {'id': 'edit-1', 'type': 'function', 'function': {
+                'name': 'edit', 'arguments': json.dumps({'path': 'report.py', 'old_text': code,
+                                                        'new_text': code + '# revised\n'})}},
+        ]},
+        {'role': 'tool', 'tool_call_id': 'edit-1', 'name': 'edit', 'content': 'Edited report.py'},
+        *[{'role': 'user', 'content': 'Continue remaining work'} for _ in range(10)],
+    ]
+    original = copy.deepcopy(messages)
+    for for_summary in [False, True]:
+        projected = project_messages(messages, for_summary=for_summary)
+        assert projected == original
+        assert json.loads(projected[0]['tool_calls'][0]['function']['arguments'])['content'] == code
+        assert 'archived_body' not in json.dumps(projected)
+    assert messages == original

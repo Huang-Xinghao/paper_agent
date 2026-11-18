@@ -394,3 +394,42 @@ def test_review_format_failure_does_not_spend_revision_budget(curation):
     ingestion.model = good_model
     assert not ingestion.wiki_review(ctx, str(ingestion.draft_path)).is_error
     assert ingestion.review_count == 1
+
+@pytest.mark.parametrize('project_evidence', [False, True])
+def test_split_library_publishes_and_reads_both_origins(curation, project_evidence):
+    from paper_agent.tools.research_wiki import init_wiki
+    from paper_agent.tools.wiki import read_wiki
+    from paper_agent.tools.wiki_relations import refresh_citations
+    from paper_agent.api.library import list_library, paradigm_graph, read_document
+    f = curation
+    init_wiki(str(f.root), separate_origins=True)
+    pdf = f.root / 'literature/raw-paper/source.pdf'
+    f.pdf.rename(pdf)
+    f.pdf = pdf
+    test_pdf_to_searchable_wiki_and_unchanged_input_skip(f, project_evidence)
+    origin = 'autoresearch' if project_evidence else 'literature'
+    papers = list((f.root / origin / 'papers').glob('*.md'))
+    assert len(papers) == 1
+    assert not (f.root / 'papers').exists()
+    relative = papers[0].relative_to(f.root).as_posix()
+    assert not read_wiki(ToolContext(f.project), relative).is_error
+    assert not read_wiki(ToolContext(f.project), 'papers/' + papers[0].name).is_error
+    assert read_document('paradigms', 'papers/' + papers[0].name)['path'] == relative
+    catalog = list_library('paradigms', q='', category='papers', limit=1000)
+    assert catalog['items'][0]['category'] == origin + '/papers'
+    graph = paradigm_graph()
+    assert len(graph['nodes']) == 3 and len(graph['edges']) == 2
+    assert all(n['category'] in {'papers', 'ideas', 'experiments'} for n in graph['nodes'])
+    refresh_citations(f.root / origin)
+
+
+def test_first_download_initializes_one_shared_graph(curation):
+    f = curation
+    pdf = f.root / 'literature/raw-paper/source.pdf'
+    pdf.parent.mkdir(parents=True)
+    f.pdf.rename(pdf)
+    f.pdf = pdf
+    test_pdf_to_searchable_wiki_and_unchanged_input_skip(f, False)
+    assert (f.root / 'graph/edges.jsonl').is_file()
+    assert not (f.root / 'literature/graph').exists()
+    assert len(list((f.root / 'literature/papers').glob('*.md'))) == 1

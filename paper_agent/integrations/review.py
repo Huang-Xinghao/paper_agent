@@ -163,6 +163,7 @@ class ReviewRunner:
         proc = None
         stdout, stderr = "", ""
         diagnostic_dir = None
+        preview_temp = None
         event_stream = error_stream = None
         if request.save_diagnostics:
             diagnostic_dir = (self.workspace / ".paper-agent" / "reviews" / request.kind / report.stem /
@@ -212,23 +213,45 @@ class ReviewRunner:
                         progress.update('finalizing')
 
             progress.tick = read_activity
+            attachments = []
+            manuscripts = [self.workspace / item['path'] for item in inputs
+                           if Path(item['path']).suffix.lower() == '.pdf']
+            canonical = self.workspace / 'paper/main.pdf'
+            if canonical in manuscripts:
+                manuscripts = [canonical]
+            if request.kind == 'paper' and manuscripts:
+                from .review_images import manuscript_previews
+                progress.update('preparing_visuals')
+                if diagnostic_dir is not None:
+                    preview_dir = diagnostic_dir / 'previews'
+                else:
+                    preview_temp = tempfile.TemporaryDirectory(prefix='paper-review-images-')
+                    preview_dir = Path(preview_temp.name)
+                for number, manuscript in enumerate(manuscripts, 1):
+                    images, visual_instructions = manuscript_previews(
+                        manuscript, preview_dir / f'document-{number:04d}', deadline=started + self.timeout)
+                    attachments.extend(images)
+                    prompt += f'\nVisual evidence for {manuscript}:\n' + visual_instructions
             progress.update('starting_reviewer')
             command = [self.executable or resolve_codex(), "exec"]
             command += ["--json", "--skip-git-repo-check", "-m", self.model,
                         "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
-                        "-c", f"model_reasoning_effort={json.dumps(self.reasoning_effort)}", "-"]
+                        "-c", f"model_reasoning_effort={json.dumps(self.reasoning_effort)}"]
+            for attachment in attachments:
+                command += ['--image', str(attachment)]
+            command.append('-')
             proc = subprocess.Popen(
                 command, cwd=self.workspace, stdin=subprocess.PIPE,
                 stdout=event_stream, stderr=error_stream,
                 text=True, encoding="utf-8", errors="replace", start_new_session=True,
             )
-            stdout, stderr = proc.communicate(prompt, timeout=self.timeout)
+            stdout, stderr = proc.communicate(prompt, timeout=max(.001, self.timeout - (time.monotonic() - started)))
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
             status, error = "timed_out", f"Review exceeded {self.timeout:g} seconds"
         except (KeyboardInterrupt, SystemExit) as exc:
             status, error, interrupted = "interrupted", "Review interrupted", exc
-        except OSError as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             error = str(exc)
         finally:
             if proc is not None and (status in {"timed_out", "interrupted"} or proc.poll() is None):
@@ -245,6 +268,8 @@ class ReviewRunner:
                     event_stream.close()
                     error_stream.close()
             progress.update('validating_report')
+            if preview_temp is not None:
+                preview_temp.cleanup()
 
         completed, failed, content = False, False, ""
         usage_events = 0

@@ -73,7 +73,7 @@ def execute(run_id):
 
 
 def _execute(run_id):
-    from paper_agent.agent.workflow_cli import run_coordinated_workflow
+    from paper_agent.agent.workflow_cli import is_review_approval, run_coordinated_workflow
     from paper_agent.tools.experiments.executor import check_runtime
 
     run = rows("SELECT * FROM runs WHERE id=?", (run_id,))[0]
@@ -95,7 +95,9 @@ def _execute(run_id):
         ):
             raise ValueError("审阅文件已变化，请刷新后重新确认")
         # Use the same semantic revision contract as the terminal entry point.
-        if answer.strip():
+        if answer.strip() and not is_review_approval(
+            answer, (state.get("expert_checkpoint") or {}).get("questions", [])
+        ):
             options["revise"] = (
                 "用户已回答当前节点的专家审阅问题。先读取现有报告，将回答整合到当前节点全部相关产物，"
                 "消除与回答冲突的建议，保留有效证据及用户回答以供追溯。"

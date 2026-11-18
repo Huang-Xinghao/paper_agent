@@ -9,6 +9,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from .wiki_layout import entity_paths
 
 ENTITY_TYPES = ("papers", "ideas", "experiments", "claims")
 STOPWORDS = set(
@@ -26,7 +27,7 @@ def tokenize(text: str) -> list[str]:
             if len(word) == 1:
                 result.append(word)
         elif word not in STOPWORDS:
-            result.append(word)
+            result.append("battery" if word == "batteries" else word)
     return result
 
 
@@ -44,6 +45,8 @@ class Page:
     lines: list[str]
     title: str
     sections: list[Section]
+    metadata: dict | None = None
+    aliases: tuple[str, ...] = ()
 
     @property
     def fingerprint(self) -> str:
@@ -74,7 +77,29 @@ def load_page(path: Path) -> Page:
         Section(h, i, headings[n + 1][0] if n + 1 < len(headings) else len(lines))
         for n, (i, h) in enumerate(headings)
     )
-    return Page(path, text, lines, title, sections)
+    metadata = {}
+    if start:
+        for line in lines[1:start - 1]:
+            key, sep, value = line.partition(":")
+            if sep:
+                try:
+                    metadata[key.strip()] = json.loads(value.strip())
+                except ValueError:
+                    metadata[key.strip()] = value.strip().strip('"').strip("'")
+    aliases = []
+    if path.parent.name == "papers":
+        references = path.parent.parent / "metadata" / path.stem / "references.json"
+        try:
+            record = json.loads(references.read_text(encoding="utf-8"))
+            for term in record.get("coined_terms", []):
+                name = term.get("name", "")
+                # Only distinctive model-like names; generic phrases are topic evidence.
+                if (re.fullmatch(r"[A-Za-z][A-Za-z0-9²_-]{3,60}", name)
+                        and (sum(c.isupper() for c in name) >= 2 or any(c.isdigit() for c in name))):
+                    aliases.append(name)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return Page(path, text, lines, title, sections, metadata, tuple(aliases))
 
 
 def load_pages(root: Path) -> list[Page]:
@@ -82,7 +107,7 @@ def load_pages(root: Path) -> list[Page]:
     return [
         load_page(path.resolve())
         for kind in ENTITY_TYPES
-        for path in sorted((root / kind).glob("*.md"))
+        for path in entity_paths(root, kind)
         if path.is_file() and path.resolve().is_relative_to(root)
     ]
 
@@ -91,14 +116,50 @@ def _body(page: Page) -> str:
     return "\n".join(page.lines[page.sections[0].start :]) if page.sections else ""
 
 
+def identity_priority(page: Page, query: str) -> int:
+    """Prioritize declared identities, never names merely mentioned in another body."""
+    normalize = lambda value: re.sub(r"[^\w]", "", value.casefold())
+    normalized = normalize(query)
+    if not normalized:
+        return 0
+    meta = page.metadata or {}
+    names = [page.title, page.path.stem]
+    prefix, separator, _ = page.title.partition(":")
+    if separator and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{3,60}", prefix):
+        names.append(prefix)
+    names.extend(str(meta[k]) for k in ("doi", "arxiv") if meta.get(k))
+    if normalized in {normalize(name) for name in names}:
+        return 2
+    # Full titles may be embedded in a longer discovery query.
+    query_words = " ".join(tokenize(query))
+    title_words = " ".join(tokenize(page.title))
+    if title_words and len(tokenize(page.title)) >= 4 and title_words in query_words:
+        return 2
+    for alias in page.aliases:
+        if re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", query, re.I):
+            return 1
+    return 0
+
+
 def rank_pages(pages: list[Page], query: str) -> list[tuple[Page, float]]:
     terms = set(tokenize(query))
-    counts = [Counter(tokenize(page.title + "\n" + _body(page))) for page in pages]
+    counts = []
+    coverage = []
+    for page in pages:
+        meta = page.metadata or {}
+        labels = " ".join(str(v) for key in ("task", "research_field", "method")
+                          for v in (meta.get(key) or []) if isinstance(v, str))
+        salient = set(tokenize(page.title + " " + labels + " " + " ".join(page.aliases)))
+        coverage.append(len(terms & salient) / max(1, len(terms)))
+        count = Counter(tokenize(_body(page)))
+        count.update(tokenize(page.title) * 3)
+        count.update(tokenize(labels) * 2)
+        counts.append(count)
     lengths = [sum(count.values()) for count in counts]
     mean = sum(lengths) / max(1, len(lengths))
     frequency = Counter(term for count in counts for term in count)
     ranked = []
-    for page, count, length in zip(pages, counts, lengths):
+    for page, count, length, covered in zip(pages, counts, lengths, coverage):
         score = sum(
             math.log(1 + (len(pages) - frequency[t] + 0.5) / (frequency[t] + 0.5))
             * count[t]
@@ -107,8 +168,10 @@ def rank_pages(pages: list[Page], query: str) -> list[tuple[Page, float]]:
             for t in terms
             if count[t]
         )
-        if score > 0:
-            ranked.append((page, score))
+        priority = identity_priority(page, query)
+        score = score * (0.25 + 0.75 * covered)
+        if score > 0 or priority:
+            ranked.append((page, score + (2000 if priority == 2 else 25 * covered if priority else 0)))
     return sorted(ranked, key=lambda item: (-item[1], item[0].path.as_posix()))
 
 

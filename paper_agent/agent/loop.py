@@ -67,7 +67,10 @@ def tool_schema(spec: ToolSpec) -> dict[str, Any]:
             parameter_schema = {"type": "object"}
         elif origin in (list, tuple, set):
             item_type = get_args(annotation)[0] if get_args(annotation) else Any
-            item_schema = {"type": "object" if get_origin(item_type) is dict or item_type is dict else "string"}
+            item_schema = {"type": (
+                "object" if get_origin(item_type) is dict or item_type is dict
+                else {int: "integer", float: "number", bool: "boolean"}.get(item_type, "string")
+            )}
             parameter_schema = {"type": "array", "items": item_schema}
         else:
             parameter_schema = {"type": "string"}
@@ -111,6 +114,8 @@ class AgentLoop:
                  on_progress: Callable[[str, dict[str, Any]], None] | None = None,
                  connect_mcp: bool = True, retry_model_requests: bool = True):
         self.model, self.workspace, self.tools = model, workspace, tools
+        from .image_store import ImageStore
+        self.image_store = ImageStore(workspace)
         self.skill_dirs = self.DEFAULT_SKILL_DIRS
         self.knowledge_roots = tuple(
             path for path in self.DEFAULT_KNOWLEDGE_DIRS if path.is_dir()
@@ -207,12 +212,14 @@ class AgentLoop:
                 if isinstance(self.model, ModelClient):
                     self.model.usage_workspace = self.workspace
                     self.model.usage_phase = phase
+                previous_memory = state.context_memory
                 request_messages = working_context.prepare(
                     state, self.model, getattr(self, "context_max_tokens", CONTEXT_MAX_TOKENS),
                     lambda: self._context_compaction_event(False, phase, iteration),
-                    tools=schemas,
+                    tools=schemas, image_store=self.image_store,
                     on_compacting=lambda: self._context_compaction_event(True, phase, iteration))
-                self._save_conversation(state)
+                if state.context_memory is not previous_memory:
+                    self._save_conversation(state)
                 self._progress("context_prepared", phase=phase, iteration=iteration,
                                transcript_chars=len(json.dumps(state.messages, ensure_ascii=False)),
                                request_chars=len(json.dumps(request_messages, ensure_ascii=False)),
@@ -517,6 +524,8 @@ class PhaseAgent(AgentLoop):
 
     def _skill_prompt(self) -> str:
         name = self.SKILL_BY_PHASE.get(self.phase, self.phase)
+        if name is None:
+            return ""
         path = self.skills_root / name / "SKILL.md"
         if path.is_file():
             prompt = f"\n## Skill: {name}\n{path.read_text(encoding='utf-8')}"

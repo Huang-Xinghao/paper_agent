@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 
 from .store import REPO
 from paper_agent.tools.wiki import resolve_wiki_root
+from paper_agent.tools.wiki_layout import corpus_roots, entity_paths, resolve_legacy_path
 
 router = APIRouter(prefix="/api/libraries", tags=["libraries"])
 Library = Literal["paradigms", "battery"]
@@ -31,7 +32,8 @@ def document(path, relative):
     excerpt = " ".join(line.strip() for line in body.splitlines()
                        if line.strip() and not line.startswith(("#", "_", "|", "```")))[:240]
     return {"path": relative.as_posix(), "title": title,
-            "category": relative.parts[0] if len(relative.parts) > 1 else "overview",
+            "category": ("/".join(relative.parts[:2]) if relative.parts[0] in {"literature", "autoresearch"}
+                         else relative.parts[0]) if len(relative.parts) > 1 else "overview",
             "excerpt": excerpt, "modified": path.stat().st_mtime}, body
 
 
@@ -52,9 +54,6 @@ def list_library(library: Library, q: str = Query("", max_length=200),
             try:
                 if path.stat().st_size > MAX_TEXT:
                     continue
-                if len(documents) >= 5000:
-                    truncated = True
-                    break
                 item, body = document(path, path.relative_to(root))
                 documents.append((item, body))
             except OSError:
@@ -66,7 +65,7 @@ def list_library(library: Library, q: str = Query("", max_length=200),
         counts[item["category"]] = counts.get(item["category"], 0) + 1
     terms = q.casefold().split()
     matches = [item for item, body in documents
-               if (not category or item["category"] == category)
+               if (not category or (item["category"] == category or item["category"].endswith("/" + category)))
                and all(term in f'{item["title"]} {item["path"]} {body}'.casefold() for term in terms)]
     matches.sort(key=lambda item: (item["category"] != "overview", item["path"]))
     return {"available": True, "items": matches[:limit],
@@ -79,7 +78,7 @@ def public_path(library, relative, suffixes):
     parts = Path(relative).parts
     if not relative or Path(relative).is_absolute() or any(part.startswith(".") for part in parts):
         raise HTTPException(400, "资源路径无效")
-    path = root / relative
+    path = resolve_legacy_path(root, relative) if library == "paradigms" else root / relative
     resolved = path.resolve()
     if (not resolved.is_relative_to(root) or not resolved.is_file()
             or resolved.suffix.lower() not in suffixes
@@ -93,7 +92,7 @@ def read_document(library: Library, path: str = Query(max_length=1000)):
     target = public_path(library, path, {".md"})
     if target.stat().st_size > MAX_TEXT:
         raise HTTPException(413, "文档过大，暂不支持预览")
-    item, body = document(target, Path(path))
+    item, body = document(target, target.relative_to(library_root(library)))
     return {**item, "content": body}
 
 
@@ -108,8 +107,11 @@ def paradigm_graph():
     """Expose recorded wiki relationships, never infer scientific links from labels."""
     import json
 
-    catalog = list_library('paradigms', q='', category='', limit=1000)
     root = library_root('paradigms')
+    catalog = {'items': [document(path, path.relative_to(root))[0]
+                         for kind in ('papers', 'ideas', 'experiments', 'claims')
+                         for path in entity_paths(root, kind)],
+               'available': root.is_dir(), 'truncated': False}
     nodes = []
     for item in catalog['items']:
         target = public_path('paradigms', item['path'], {'.md'})
@@ -127,7 +129,7 @@ def paradigm_graph():
                         metadata[key] = value.strip('\"\'')
         if not isinstance(metadata.get('node_id'), str):
             continue
-        nodes.append({**item, 'id': metadata['node_id'],
+        nodes.append({**item, 'category': target.parent.name, 'id': metadata['node_id'],
                       'tags': [tag for key in ('task', 'method', 'scenario', 'research_field')
                                for tag in (metadata.get(key) if isinstance(metadata.get(key), list) else [])
                                if isinstance(tag, str)]})
@@ -139,8 +141,8 @@ def paradigm_graph():
     if edge_path.exists():
         try:
             target = public_path('paradigms', 'graph/edges.jsonl', {'.jsonl'})
-            if target.stat().st_size <= MAX_TEXT:
-                for line in target.read_text(encoding='utf-8', errors='replace').splitlines():
+            with target.open(encoding='utf-8', errors='replace') as stream:
+                for line in stream:
                     try:
                         edge = json.loads(line)
                     except ValueError:
@@ -171,8 +173,9 @@ def paradigm_figures():
         papers[Path(item['path']).stem] = item
     items = []
     truncated = False
-    figure_root = root / 'figures'
-    if figure_root.is_dir() and not figure_root.is_symlink():
+    for figure_root in (corpus / 'figures' for corpus in corpus_roots(root)):
+        if not figure_root.is_dir() or figure_root.is_symlink():
+            continue
         for directory, folders, files in os.walk(figure_root, followlinks=False):
             folders[:] = sorted(name for name in folders if not name.startswith('.')
                                 and not (Path(directory) / name).is_symlink())

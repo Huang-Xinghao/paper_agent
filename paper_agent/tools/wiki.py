@@ -8,6 +8,7 @@ import json
 import hashlib
 import os
 from pathlib import Path
+from .wiki_layout import corpus_root, entity_dirs, resolve_legacy_path
 from typing import Any
 
 from .core import ToolContext, ToolResult, tool
@@ -33,7 +34,10 @@ def resolve_wiki_root() -> Path:
 
 def resolve_raw_paper_root() -> Path:
     """The shared PDF library follows the configured Wiki location."""
-    return (resolve_wiki_root() / "raw-paper").resolve()
+    root = resolve_wiki_root()
+    if not root.exists() or not any(root.iterdir()):
+        return root / "literature" / "raw-paper"
+    return (corpus_root(root) / "raw-paper").resolve()
 
 
 def _wiki_root() -> Path:
@@ -45,7 +49,7 @@ def _wiki_root() -> Path:
 
 def _quality_records(root: Path, target: Path) -> list[dict]:
     """读取分页内容时也附带问题；Idea/Experiment 只沿论文来源边追溯两步。"""
-    papers = {target} if target.parent == root / "papers" else set()
+    papers = {target} if target.parent.name == "papers" else set()
     node_type = {"ideas": "idea", "experiments": "exp"}.get(target.parent.name)
     graph = root / "graph" / "edges.jsonl"
     if node_type and graph.is_file():
@@ -56,8 +60,8 @@ def _quality_records(root: Path, target: Path) -> list[dict]:
                 nodes = {e["from"] for e in edges if e.get("type") == "tested_by" and e.get("to") in nodes}
             for edge in edges:
                 if edge.get("type") == "inspired_by" and edge.get("from") in nodes and str(edge.get("to", "")).startswith("paper:"):
-                    paper = (root / "papers" / (edge["to"][6:] + ".md")).resolve()
-                    if paper.parent == (root / "papers").resolve():
+                    paper = resolve_legacy_path(root, "papers/" + edge["to"][6:] + ".md").resolve()
+                    if paper.parent in entity_dirs(root):
                         papers.add(paper)
         except (OSError, ValueError, KeyError, TypeError):
             return [{"status": "unavailable", "reason": "论文来源关系无法读取，请核对 graph/edges.jsonl。"}]
@@ -179,7 +183,7 @@ def _search_candidates(ctx: ToolContext, query: str, entity_type: str | None = N
 
 
 def _source_record(root: Path, path: Path) -> dict:
-    if path.parent != root / "papers":
+    if path.parent.name != "papers" or path.parent not in entity_dirs(root):
         return {}
     source = metadata_path(path, "source")
     if not source.is_file():
@@ -204,7 +208,8 @@ def search_wiki(ctx: ToolContext, query: str, entity_type: str | None = None,
     No new summaries are generated. query can be keywords, a title or an identifier.
     limit defaults to 5, maximum 10. strategy: auto, lexical, hybrid.
     purpose: evidence, method, paper, overview. include_relations follows recorded
-    graph links from the best hit to discover up to two related candidates.
+    graph links from the best hit to discover up to two related candidates,
+    returned separately in related_matches so they never displace ranked matches.
     Use read_wiki(wiki_path) for a selected page's complete stored Markdown.
     Titles, abstracts, rankings and graph links alone do not verify scientific claims.
     """
@@ -219,17 +224,20 @@ def search_wiki(ctx: ToolContext, query: str, entity_type: str | None = None,
     ranked = json.loads(result.output)
     root = _wiki_root()
     matches, seen = [], set()
+    graph_matches = []
 
     def add_match(relative, *, origin="search", score=None):
-        path = (root / relative).resolve()
-        if (path in seen or len(matches) >= limit or not path.is_file()
+        path = resolve_legacy_path(root, relative).resolve()
+        destination = graph_matches if origin == "graph" else matches
+        if (path in seen or len(destination) >= (2 if origin == "graph" else limit) or not path.is_file()
                 or path.suffix != ".md"
-                or path.parent not in {root / kind for kind in ENTITY_TYPES}):
+                or path.parent not in entity_dirs(root)):
             return
         seen.add(path)
         page = load_page(path)
         match = {"title": page.title, "wiki_path": path.relative_to(root).as_posix(),
-                 "entity_type": path.parent.name, "origin": origin}
+                 "entity_type": path.parent.name, "origin": origin,
+                 "collection": path.parent.parent.name if path.parent.parent.name in {"literature", "autoresearch"} else "literature"}
         if score is not None:
             match["score"] = score
         if view == "abstracts":
@@ -240,10 +248,10 @@ def search_wiki(ctx: ToolContext, query: str, entity_type: str | None = None,
             missing = not abstract or abstract.startswith(("_TODO", "_Not yet", "_To be", "<!--"))
             match.update(abstract="" if missing else abstract,
                          abstract_status="missing" if missing else "present")
-        matches.append(match)
+        destination.append(match)
 
     candidates = ranked.get("matches", [])
-    for match in candidates[:max(1, limit - 2)]:
+    for match in candidates:
         add_match(match["wiki_path"], score=match.get("score"))
     relations, expansions = [], 0
     warnings = ranked.get("warnings", [])
@@ -263,13 +271,12 @@ def search_wiki(ctx: ToolContext, query: str, entity_type: str | None = None,
                 ) if k in neighbor})
                 for relative in neighbor.get("paper_read_paths", []):
                     add_match(relative, origin="graph")
-    for match in candidates:
-        add_match(match["wiki_path"], score=match.get("score"))
     data = {k: ranked[k] for k in (
         "query", "count", "ranking", "grouped_by_paper", "degraded", "semantic_status",
     ) if k in ranked}
     data.update(view=view, purpose=purpose, candidate_only=True, matches=matches,
-                returned_count=len(matches), relations=relations, relation_expansions=expansions,
+                returned_count=len(matches), related_matches=graph_matches,
+                relations=relations, relation_expansions=expansions,
                 warnings=list(dict.fromkeys(warnings)),
                 reading_policy="先按标题或已有摘要筛选，再用 read_wiki(wiki_path) 读取选中页面的完整 MD。缺少摘要不表示没有正文；复用已读内容，不反复重搜或重读同一页面。")
     return ToolResult(json.dumps(data, ensure_ascii=False))
@@ -285,9 +292,9 @@ def read_wiki(ctx: ToolContext, wiki_path: str) -> ToolResult:
     """
     relative = Path(wiki_path)
     root = _wiki_root()
-    path = (root / relative).resolve()
+    path = resolve_legacy_path(root, relative).resolve()
     if (relative.is_absolute() or ".." in relative.parts or path.suffix != ".md"
-            or path.parent not in {root / kind for kind in ENTITY_TYPES}):
+            or path.parent not in entity_dirs(root)):
         return ToolResult("wiki_path must identify a Markdown page inside the Wiki entity directories", True)
     if not path.is_file():
         return ToolResult(f"Wiki page not found: {wiki_path}", True)

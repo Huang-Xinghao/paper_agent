@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -57,6 +58,8 @@ class RoleSession:
         if role not in ROLE_DESCRIPTIONS:
             raise ValueError(f"Unknown role: {role}")
         self.role = role
+        from paper_agent.agent.image_store import ImageStore
+        self.images = ImageStore(project)
         self.folder = project / ".paper-agent" / "role-sessions"
         if channel not in {"execution", "discussion"}:
             raise ValueError("Unknown conversation channel")
@@ -85,10 +88,21 @@ class RoleSession:
         value = json.loads(self.path.read_text(encoding="utf-8"))
         if value["role"] != self.role or value.get("channel") != self.channel:
             raise ValueError("Role session identity mismatch")
+        # Preserve valid summary coverage when migrating an older inline transcript.
+        memory = value.get('context_memory') or {}
+        cutoff = memory.get('cutoff')
+        covered = (isinstance(cutoff, int) and 0 < cutoff <= len(value['messages']) and
+                   hashlib.sha256(json.dumps(value['messages'][:cutoff], ensure_ascii=False).encode()).hexdigest()
+                   == memory.get('prefix_sha256'))
+        self.images.externalize(value.get('messages', []))
+        if covered:
+            memory['prefix_sha256'] = hashlib.sha256(
+                json.dumps(value['messages'][:cutoff], ensure_ascii=False).encode()).hexdigest()
         return value
 
 
     def save(self, value: dict):
+        self.images.externalize(value.get('messages', []))
         value["updated_at"] = now()
         from paper_agent.storage import write_json
         write_json(self.path, value)

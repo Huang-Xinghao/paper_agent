@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+from .wiki_layout import resolve_legacy_path
 import re
 import subprocess
 import tempfile
@@ -29,15 +30,9 @@ from .wiki_retrieval import (
     rank_pages,
 )
 
-RELATIONS = {
-    "cites",
-    "addresses_same_problem",
-    "shares_method",
-    "may_apply_to",
-    "inspired_by",
-    "tested_by",
-    "contradicts",
-}
+from .wiki_schema import READABLE_RELATION_TYPES as RELATIONS
+from .wiki_retrieval import identity_priority
+
 NODE_TYPES = {
     "papers": "paper",
     "ideas": "idea",
@@ -211,19 +206,7 @@ def _chunk_result(chunk: Chunk, root: Path):
 
 
 def _exact_paths(pages: list[Page], query: str):
-    query = query.strip().casefold()
-    normalized = re.sub(r"\W", "", query)
-    if not normalized:
-        return set()
-    matches = set()
-    for page in pages:
-        title = page.title.casefold()
-        # 完整标题、slug、DOI或标题冒号前的方法名；不把任意子串当精确命中。
-        names = {title, page.path.stem.casefold(), title.split(":", 1)[0]}
-        names |= set(re.findall(r"10\.\d{4,9}/[^\s<>\"）)]+", page.text.casefold()))
-        if normalized in {re.sub(r"\W", "", name) for name in names}:
-            matches.add(page.path)
-    return matches
+    return {page.path for page in pages if identity_priority(page, query) > 0}
 
 
 def search_wiki_hybrid(
@@ -359,7 +342,7 @@ def expand_wiki_relations(
     pages = load_pages(root)
     by_node = {f"{NODE_TYPES[p.path.parent.name]}:{p.path.stem}": p for p in pages}
     by_path = {p.path: node for node, p in by_node.items()}
-    source = (root / path).resolve()
+    source = resolve_legacy_path(root, path).resolve()
     node = path if path in by_node else by_path.get(source)
     if (
         node is None

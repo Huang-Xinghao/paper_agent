@@ -5,7 +5,11 @@
       "url": "http://127.0.0.1:18765/mcp",
       "bearer_token_file": "~/.config/paper-agent/bts-mcp.token",
       "timeout": 90,
-      "phases": ["experiment_bridge", "bts_smoke", "laboratory"],
+      "phases": [
+        "experiment_bridge",
+        "bts_smoke",
+        "laboratory"
+      ],
       "allow_tools": [
         "bts_health",
         "bts_list_channels",
@@ -20,9 +24,32 @@
       "enabled": false,
       "transport": "stdio",
       "command": "/absolute/path/to/python",
-      "args": ["/absolute/path/to/mcp_server.py"],
-      "env": {"API_KEY": "${EXAMPLE_API_KEY}"},
-      "phases": ["literature"]
+      "args": [
+        "/absolute/path/to/mcp_server.py"
+      ],
+      "env": {
+        "API_KEY": "${EXAMPLE_API_KEY}"
+      },
+      "phases": [
+        "literature"
+      ]
+    },
+    "land": {
+      "transport": "http",
+      "url": "http://127.0.0.1:18766/mcp",
+      "bearer_token_file": "~/.config/paper-agent/land-mcp.token",
+      "timeout": 30,
+      "phases": [
+        "experiment_bridge",
+        "laboratory",
+        "land_smoke"
+      ],
+      "allow_tools": [
+        "land_health",
+        "land_list_channels",
+        "land_get_status",
+        "land_get_measurements"
+      ]
     }
   }
 }

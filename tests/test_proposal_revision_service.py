@@ -77,14 +77,15 @@ def test_revision_publication_boundary(tmp_path, monkeypatch, outcome):
     monkeypatch.setattr(proposal_revision, 'ModelClient', lambda **kwargs: ModelClient('fixture', client=client))
     def forbid_mcp(*args, **kwargs): raise AssertionError('Local revision must not connect MCP')
     monkeypatch.setattr('paper_agent.integrations.mcp.MCPManager.from_config', forbid_mcp)
+    events = []
     folder = tmp_path / '.paper-agent/revisions/test'
     if outcome == 'complete':
-        assert proposal_revision.run_revision(tmp_path, expected, 'test', folder).status == 'completed'
+        assert proposal_revision.run_revision(tmp_path, expected, 'test', folder, on_event=events.append).status == 'completed'
         result = load_draft(tmp_path)
         assert len(result.review.sections) == 1 and result.review.sections[0].id == 'unified'
     else:
         with pytest.raises((ConnectionError, ValueError)):
-            proposal_revision.run_revision(tmp_path, expected, 'test', folder)
+            proposal_revision.run_revision(tmp_path, expected, 'test', folder, on_event=events.append)
         if outcome == 'interrupted': assert (tmp_path / CANVAS).read_bytes() == baseline
         else: assert load_draft(tmp_path).changes == ['Newer user edit']
     assert source.read_text().startswith('# Goal\nExisting evidence')
@@ -92,6 +93,8 @@ def test_revision_publication_boundary(tmp_path, monkeypatch, outcome):
     assert len(calls) == 3
     assert {t['function']['name'] for t in calls[0]['tools']} == {
         'read', 'find', 'ls', 'grep', 'skill', 'skill_resource_read'}
+    assert not any(item['kind'] in {'assistant_delta', 'assistant_output'} for item in events)
+    assert any(item['kind'] == 'proposal_revision_progress' for item in events)
     assert (folder / 'response.txt').read_text() == content
     assert (tmp_path / '.paper-agent/usage.jsonl').is_file()
     submission = json.loads((folder / 'submission.json').read_text())

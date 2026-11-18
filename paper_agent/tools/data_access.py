@@ -46,10 +46,13 @@ def resolve_data_read(workspace, knowledge_roots, value):
     # Resolve both sides so symlinks cannot grant access outside those libraries.
     from .wiki import resolve_wiki_root, resolve_raw_paper_root
     wiki_root = resolve_wiki_root().resolve()
+    from .wiki_layout import corpus_roots, resolve_legacy_path
+    if candidate.is_relative_to(wiki_root):
+        candidate = resolve_legacy_path(wiki_root, candidate.relative_to(wiki_root)).resolve()
     if candidate.suffix.lower() == '.md' and candidate.is_relative_to(wiki_root):
         return candidate
-    figure_root = (wiki_root / 'figures').resolve()
-    if candidate.is_relative_to(figure_root) or candidate.is_relative_to(resolve_raw_paper_root()):
+    if any(candidate.is_relative_to(corpus / kind)
+           for corpus in corpus_roots(wiki_root) for kind in ('figures', 'raw-paper')):
         return candidate
     for source in registered_data_sources(knowledge_roots):
         if candidate.is_relative_to(Path(source['path'])):

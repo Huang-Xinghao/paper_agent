@@ -11,6 +11,27 @@ from paper_agent.tools.wiki_assets import figure_candidates
 from paper_agent.tools.wiki_recovery import apply_edits, repair_bibliography, source_quote
 
 
+@pytest.mark.parametrize('author,surname', [
+    ('Chen Ma (马晨)', 'Ma'),
+    ('Dongzhen Lyu（吕东祯）', 'Lyu'),
+    ('Jia-hui Li (李嘉辉)', 'Li'),
+    ('Lin Su (苏琳)', 'Su'),
+    ('Yican Wang (王伊璨)', 'Wang'),
+    ('Dirk Uwe Sauer', 'Sauer'),
+    ('王伊璨', '王伊璨'),
+])
+def test_author_annotations_do_not_replace_romanized_surname(author, surname):
+    assert research_wiki._last_name(author) == surname
+
+
+def test_paper_filename_uses_surname_without_changing_author_metadata(tmp_path):
+    research_wiki.init_wiki(str(tmp_path))
+    paper = research_wiki.ingest_paper(str(tmp_path), title='A lean statistical cell-to-pack framework',
+                                     authors=['Chen Ma (马晨)'], year=2026)
+    assert paper.name == 'ma2026_lean_statistical_celltopack.md'
+    assert 'Chen Ma (马晨)' in paper.read_text()
+
+
 @pytest.mark.parametrize('slug', ['hübotter2024_theory', 'zhou2026_kclcacl₂licl', '李嘉辉2025_battery'])
 def test_unicode_node_paths_preserve_explicit_identity(tmp_path, slug):
     research_wiki.init_wiki(str(tmp_path))
@@ -307,3 +328,70 @@ def test_citation_index_preserves_conflicts_and_ambiguous_matches():
                 for year in [None, 2024, 2025]:
                     ref = dict(doi=doi, arxiv_id=arxiv, title=title, year=year, authors=['Smith'])
                     assert _match(ref, papers) == _match(ref, _citation_candidates(ref, lookup))
+
+
+@pytest.mark.parametrize('text', [
+    '| A | B |\n| --- | --- |\n| x | p(y|x) |',
+    '| A | B |\n| --- | --- |\n| x | `a|b` |',
+    '## Limitations\n_TODO._',
+])
+def test_publication_rejects_rendering_loss_and_unfinished_sections(text):
+    from paper_agent.tools.wiki_publication import markdown_errors
+    assert markdown_errors(text)
+
+
+def test_publication_accepts_escaped_math_and_fenced_examples():
+    from paper_agent.tools.wiki_publication import markdown_errors
+    assert not markdown_errors('| A | B |\n| --- | --- |\n| x | p(y\\|x) |')
+    assert not markdown_errors('```text\nTODO example\n| A | B |\n| --- | --- |\n| a|b|c |\n```')
+
+
+def test_publisher_checks_existing_identity_before_overwrite(curation):
+    from test_wiki_curation import prepared
+    f = curation
+    research_wiki.init_wiki(str(f.root))
+    other = research_wiki.ingest_paper(str(f.root), title='Another study',
+        authors=['Different Researcher'], year=2024, doi='10.1234/template')
+    before = other.read_bytes()
+    f.draft['metadata']['doi'] = '10.1234/template'
+    ingestion, ctx = prepared(f)
+    ingestion.wiki_read_source(ctx)
+    assert not ingestion.wiki_review(ctx, str(ingestion.draft_path)).is_error
+    with pytest.raises(ValueError, match='identity conflict'):
+        ingestion.wiki_publish(ctx, str(ingestion.draft_path))
+    assert other.read_bytes() == before
+
+
+def test_republication_refreshes_identity_and_archives_only_generated_experiments(curation):
+    from test_wiki_curation import prepared
+    from paper_agent.tools.wiki_layout import resolve_legacy_path
+    f = curation
+    ingestion, ctx = prepared(f)
+    ingestion.wiki_read_source(ctx)
+    assert not ingestion.wiki_review(ctx, str(ingestion.draft_path)).is_error
+    assert not ingestion.wiki_publish(ctx, str(ingestion.draft_path)).is_error
+    paper = next((f.root / 'papers').glob('*.md'))
+    old = next((f.root / 'experiments').glob('*.md'))
+    old_content = old.read_bytes()
+    manual = research_wiki.add_experiment(str(f.root), paper.stem + '-manual',
+        idea='idea:' + paper.stem + '-paper-idea', title='User experiment', tags=['manual'])
+    f.draft['idea']['title'] = 'Updated idea title'
+    f.draft['metadata']['arxiv_id'] = '2611.00001'
+    f.draft['experiments'][0]['title'] += ' revised'
+    from paper_agent.tools.wiki_ingest import WikiIngestion
+    from test_wiki_curation import CurationModel
+    ingestion = WikiIngestion(f.project, model=CurationModel(f))
+    ingestion.assign(paper_path=str(f.pdf), complete_relations=False, force=True)
+    ingestion.wiki_prepare(ctx, str(f.pdf))
+    from paper_agent.storage import write_json
+    write_json(ingestion.draft_path, f.draft)
+    ingestion.wiki_read_source(ctx)
+    assert not ingestion.wiki_review(ctx, str(ingestion.draft_path)).is_error
+    assert not ingestion.wiki_publish(ctx, str(ingestion.draft_path)).is_error
+    assert '2611.00001' in paper.read_text()
+    assert '_TODO' not in paper.read_text()
+    assert 'Updated idea title' in next((f.root / 'ideas').glob('*.md')).read_text()
+    assert not old.exists() and manual.exists()
+    assert resolve_legacy_path(f.root, old.relative_to(f.root)).read_bytes() == old_content
+    edges = [json.loads(line) for line in (f.root / 'graph/edges.jsonl').read_text().splitlines()]
+    assert not any('exp:' + old.stem in (e['from'], e['to']) for e in edges)

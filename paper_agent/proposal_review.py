@@ -188,6 +188,40 @@ def pending_refine(state) -> bool:
             and cp.get("status") == "pending" and cp.get("next_node") == "experiment_plan")
 
 
+def can_adopt_proposal(state) -> bool:
+    # Adopting a design must not silently invalidate an already executed plan.
+    return (state.get('mode') == 'auto' and state.get('status') == 'completed'
+            and state.get('current_node') == 'refine' and not state.get('expert_checkpoint')
+            and not any(item.get('node') not in {'literature', 'data_search', 'ideas', 'refine'}
+                        for item in state.get('history', []) if item.get('node')))
+
+
+def require_revision_changes(root: Path, draft: CanvasDraft):
+    """Reject unchanged submissions before spending a model call."""
+    record = load_record(root)
+    if record:
+        archive = owned_path(root, f"refine-logs/review-history/{record['id']}.json")
+        if archive.exists():
+            previous = CanvasDraft.model_validate(json.loads(archive.read_bytes())['draft'])
+            def content(value):
+                result = value.model_dump(exclude={'changes', 'sourceHash'})
+                for node in result['nodes']:
+                    node.pop('position', None)
+                return result
+            if content(previous) != content(draft):
+                return
+        elif record.get('draftHash') != draft_hash(draft):
+            return
+    else:
+        # Initial canvas generation adds a notice, not a user revision.
+        notices = {'已按提案标题整理候选模块，模块职责与连接关系待人工核对。'}
+        if (any(change not in notices for change in draft.changes)
+                or draft.review and (draft.review.feedback.strip()
+                                     or any(section.edited for section in draft.review.sections))):
+            return
+    raise ValueError('没有实际修改，请先修改方案或添加意见，再提交 Agent 修订')
+
+
 def review_status(root: Path, draft: CanvasDraft | None):
     try:
         record = load_record(root)
@@ -203,6 +237,7 @@ def review_status(root: Path, draft: CanvasDraft | None):
             revision["approved"] = bool(record.get("approvedAt"))
         return {"revision": revision, "canApprove": bool(pending_refine(state) and synced
                 and not record.get("approvedAt")),
+                "canApply": bool(can_adopt_proposal(state) and synced and not record.get('approvedAt')),
                 "context": "checkpoint" if pending_refine(state) else "auto" if state.get("mode") == "auto" else "historical"}
     except (ValueError, OSError, KeyError):
         return {"revision": None, "canApprove": False, "context": "unavailable"}
@@ -257,7 +292,7 @@ def write_group(root: Path, changes: dict[str, bytes]):
         raise
 
 
-def publish_candidate(root: Path, expected_sha: str):
+def publish_candidate(root: Path, expected_sha: str, *, adopt: bool = False):
     """在工作流锁内调用；正式文件和冻结副本来自用户复审的同一正文。"""
     from datetime import datetime, timezone
     draft, record = require_candidate(root, expected_sha)
@@ -273,5 +308,18 @@ def publish_candidate(root: Path, expected_sha: str):
               "formalHash": formal_hash, "frozenPath": frozen, "draftHash": draft_hash(draft)}
     changes = {f"refine-logs/review-history/{record['id']}-before-approval.md": before,
                frozen: formal, PROPOSAL: formal, CANVAS: json_bytes(draft.model_dump()), RECORD: json_bytes(record)}
+    if adopt:
+        state = json.loads(owned_path(root, 'workflow-state.json').read_bytes())
+        if not can_adopt_proposal(state):
+            raise ValueError('仅支持采用自动模式下已完成且尚未进入实验规划的方案')
+        state.setdefault('history', []).append({
+            'event': 'auto_selected', 'node': 'refine', 'report': PROPOSAL,
+            'sha256': formal_hash, 'proposal_review_id': record['id'],
+            'timestamp': record['approvedAt'],
+        })
+        for artifact in state.get('artifacts', {}).get('refine', []):
+            if artifact.get('path') == PROPOSAL:
+                artifact['bytes'] = len(formal)
+        changes['workflow-state.json'] = json_bytes(state)
     write_group(root, changes)
     return {"proposal_review_id": record["id"], "frozen_report": frozen}

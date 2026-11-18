@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+from .wiki_layout import corpus_root, library_root, resolve_legacy_path, split_layout
 import re
 from typing import Any, Callable, NamedTuple
 from uuid import uuid4
@@ -30,6 +31,8 @@ from .wiki_assets import (
     publish_figures,
 )
 from .wiki_metadata import metadata_path
+from .wiki_publication import (assert_same_identity, markdown_errors,
+                               remove_template_placeholders, retire_generated_experiments)
 from .wiki_prompts import PROMPT_VERSION, PROJECT_SOURCE_PROMPT
 from .wiki_review import (
     QUALITY_VERSION,
@@ -1078,6 +1081,8 @@ class WikiPublisher:
         if not candidate.is_absolute():
             candidate = self.project / candidate
         candidate = candidate.resolve()
+        if not candidate.exists() and candidate.is_relative_to(self.wiki_root):
+            candidate = resolve_legacy_path(self.wiki_root, candidate.relative_to(self.wiki_root))
         if not candidate.is_relative_to(self.wiki_root):
             raise ValueError("Published page must be inside the selected Wiki")
         return candidate
@@ -1129,6 +1134,13 @@ class WikiPublisher:
         annotations=None,
     ) -> WikiPublication:
         """Render and verify reviewed content; the caller owns approval and publication locking."""
+        for text in [*draft["sections"].values(), draft["idea"]["structure"],
+                     draft["idea"]["thesis"],
+                     *(e[k] for e in draft["experiments"]
+                       for k in ("question", "hypothesis", "protocol", "results"))]:
+            errors = markdown_errors(text)
+            if errors:
+                raise ValueError("Invalid publication Markdown: " + "; ".join(errors))
         state = WikiPublication(
             paper_path=paper_path, page_count=len(document["pages"])
         )
@@ -1188,7 +1200,10 @@ class WikiPublisher:
 
         self._progress("wait_publication")
         with publication_lock if publication_lock is not None else nullcontext():
-            root = self.wiki_root
+            if (not self.wiki_root.exists() or not any(self.wiki_root.iterdir())
+                    or (split_layout(self.wiki_root) and not (self.wiki_root / "graph").is_dir())):
+                research_wiki.init_wiki(str(self.wiki_root), separate_origins=True)
+            root = corpus_root(self.wiki_root, "autoresearch" if research_id else "literature")
             if not (root / "papers").is_dir():
                 self._progress("initialize_wiki", path=str(root))
                 research_wiki.init_wiki(str(root))
@@ -1209,6 +1224,18 @@ class WikiPublisher:
                 raise ValueError("Existing paper must be a wiki paper page")
             if path is None:
                 path = self._existing_paper_by_doi(root, metadata.get("doi") or "")
+            if path is None and not research_id:
+                # ingest_paper also reuses title slugs/arXiv identifiers.
+                candidate = root / "papers" / (research_wiki.slugify(
+                    title, research_wiki._last_name(authors[0]) if authors else "", year) + ".md")
+                arxiv_match = research_wiki._find_existing_page_by_arxiv(
+                    root, metadata.get("arxiv_id") or "") if metadata.get("arxiv_id") else None
+                for existing in (candidate, arxiv_match):
+                    if existing is not None and existing.is_file():
+                        assert_same_identity(existing, metadata)
+                        path = existing
+            if path is not None and path.is_file() and not research_id:
+                assert_same_identity(path, metadata)
             if path is None or not path.is_file():
                 path = research_wiki.ingest_paper(
                     str(root),
@@ -1222,8 +1249,8 @@ class WikiPublisher:
                     refresh_indexes=False,
                     slug=f"autoresearch-{research_id}" if research_id else "",
                 )
-            elif research_id:
-                # Preserve extra notes while refreshing this project's citation metadata.
+            else:
+                # Preserve extra notes while refreshing the verified citation metadata.
                 content = path.read_text(encoding="utf-8")
                 front, body = content[4:].split("\n---\n", 1)
                 for key, value in (
@@ -1232,6 +1259,8 @@ class WikiPublisher:
                     ("year", year),
                     ("venue", metadata.get("venue") or "unpublished"),
                 ):
+                    if not research_id and key == "venue" and not metadata.get("venue"):
+                        continue
                     front = re.sub(
                         rf"(?m)^{key}:.*$",
                         lambda _: f"{key}: " + json.dumps(value, ensure_ascii=False),
@@ -1241,6 +1270,8 @@ class WikiPublisher:
                     ("doi", metadata.get("doi")),
                     ("arxiv", metadata.get("arxiv_id")),
                 ):
+                    if not research_id and not value:
+                        continue
                     front = re.sub(
                         rf"(?m)^  {key}:.*$",
                         lambda _: f"  {key}: " + json.dumps(value or None),
@@ -1264,10 +1295,15 @@ class WikiPublisher:
             research_wiki.update_paper_sections(
                 str(root), state.slug, sections, refresh_indexes=False
             )
+            remove_template_placeholders(path)
             idea_slug = f"{state.slug}-paper-idea"
             self._progress("write_idea", slug=idea_slug)
             idea_path = root / "ideas" / f"{idea_slug}.md"
             if idea_path.exists():
+                content = idea_path.read_text(encoding="utf-8")
+                content = re.sub(r"(?m)^title:.*$", lambda _: "title: " + json.dumps(idea["title"], ensure_ascii=False), content, count=1)
+                content = re.sub(r"(?m)^# [^\n]+", lambda _: "# " + idea["title"], content, count=1)
+                idea_path.write_text(content, encoding="utf-8")
                 research_wiki.update_idea_sections(
                     str(root),
                     idea_slug,
@@ -1315,6 +1351,10 @@ class WikiPublisher:
                     refresh_indexes=False,
                 )
                 state.experiment_paths.append(self._display(exp_path))
+            if not research_id:
+                retire_generated_experiments(root, idea_slug,
+                                             {Path(p).name for p in state.experiment_paths},
+                                             "paper-reported")
             state.steps.append("add_reported_experiments")
             node_paths = [
                 path,
@@ -1340,6 +1380,10 @@ class WikiPublisher:
                         raise RuntimeError(
                             f"Wiki classification write could not be verified: {node_path}"
                         )
+            for final_path in node_paths:
+                errors = markdown_errors(final_path.read_text(encoding="utf-8"))
+                if errors:
+                    raise RuntimeError(f"Invalid final Wiki page {final_path}: {errors}")
             _verify_sections(path, sections, "Wiki")
             _verify_sections(
                 idea_path,
@@ -1357,7 +1401,7 @@ class WikiPublisher:
                 )
             edges = [
                 json.loads(line)
-                for line in (root / "graph" / "edges.jsonl")
+                for line in (library_root(root) / "graph" / "edges.jsonl")
                 .read_text(encoding="utf-8")
                 .splitlines()
                 if line.strip()
@@ -1374,10 +1418,18 @@ class WikiPublisher:
                 or not expected <= actual
             ):
                 raise RuntimeError("Wiki entity write could not be verified")
+            from shutil import copy2
+            archived_pdf = root / "raw-paper" / f"{state.slug}.pdf"
+            archived_pdf.parent.mkdir(parents=True, exist_ok=True)
+            input_pdf = self.project.joinpath(state.paper_path).resolve()
+            if input_pdf.is_relative_to(root / "raw-paper"):
+                archived_pdf = input_pdf
+            elif input_pdf != archived_pdf.resolve():
+                copy2(input_pdf, archived_pdf)
             source_record = {
                 "source": provenance or {},
                 "annotations": annotations or [],
-                "pdf_path": state.paper_path,
+                "pdf_path": str(archived_pdf),
                 "pdf_sha256": pdf_sha256,
                 "document_id": document["document_id"],
                 "parser": document["parser"],
@@ -1471,8 +1523,8 @@ class WikiPublisher:
 
     def refresh_relationships(self, paper_path: str | Path) -> dict[str, Any]:
         """Enrich published notes without parsing, generating or reviewing them again."""
-        root = self.wiki_root
         path = self._published_path(paper_path)
+        root = path.parent.parent
         if path.parent != root / "papers" or path.suffix != ".md" or not path.is_file():
             raise ValueError(
                 "Relationship completion requires a published wiki paper page"
@@ -1529,6 +1581,7 @@ class WikiPublisher:
 
 def retire_experiments(root: Path, research_id: str, current: set[Path]) -> None:
     """Keep superseded project experiments out of retrieval, retaining their old notes."""
+    root = corpus_root(root, "autoresearch")
     removed = set()
     for path in (root / "experiments").glob(f"autoresearch-{research_id}-*.md"):
         if path.resolve() in current:
@@ -1538,7 +1591,7 @@ def retire_experiments(root: Path, research_id: str, current: set[Path]) -> None
         path.replace(archive / path.name)
         removed.add(f"exp:{path.stem}")
     if removed:
-        graph = root / "graph/edges.jsonl"
+        graph = library_root(root) / "graph/edges.jsonl"
         edges = [
             json.loads(line) for line in graph.read_text().splitlines() if line.strip()
         ]

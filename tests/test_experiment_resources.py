@@ -10,6 +10,17 @@ from paper_agent.tools.experiments import queue
 from paper_agent.tools.experiments.executor import ExperimentExecutor
 
 
+def test_gpu_ids_schema_matches_configure_validation(tmp_path):
+    from paper_agent.agent.loop import tool_schema
+    from paper_agent.tools import builtin_tools
+
+    spec = next(tool for tool in builtin_tools() if tool.name == 'experiment_resources')
+    properties = tool_schema(spec)['function']['parameters']['properties']
+    assert properties['gpu_ids'] == {'type': 'array', 'items': {'type': 'integer'}}
+    experiment_resources(ToolContext(tmp_path), 'configure', gpu_ids=[0, 1, 2, 3])
+    assert load_execution_config(tmp_path)['gpu_ids'] == [0, 1, 2, 3]
+
+
 def test_configure_translates_and_preserves_resource_policy(tmp_path):
     ctx = ToolContext(tmp_path)
     experiment_resources(ctx, 'configure', device='cuda', gpu_ids=[1, 2],

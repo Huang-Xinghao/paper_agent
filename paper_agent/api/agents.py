@@ -71,3 +71,22 @@ def agent_views(project, status, state, questions, last_event=None):
             value['status'] = 'awaiting_user'
         result.append(value)
     return result
+
+
+def activity_role_filter(role):
+    """Filter before pagination so a busy role cannot hide another role's history."""
+    if role not in ROLE_DESCRIPTIONS:
+        raise ValueError('Unknown agent role')
+    phase_roles = {**PHASE_ROLES, **{node: spec.role for node, spec in BY_NODE.items()},
+                   'coordinator': 'main'}
+    phase_case = "CASE COALESCE(json_extract(data, '$.phase'), json_extract(data, '$.node')) "
+    phase_case += ' '.join('WHEN ? THEN ?' for _ in phase_roles) + ' END'
+    actor = ("CASE WHEN kind='conversation_turn' THEN 'main' "
+             "ELSE COALESCE(json_extract(data, '$.role'), " + phase_case + ") END")
+    clause = (" AND (CASE WHEN kind IN ('assignment_start','assignment_end') THEN "
+              "(?='main' OR COALESCE(json_extract(data, '$.assignment.role'), "
+              "json_extract(data, '$.role'))=?) ELSE " + actor + "=? END)")
+    values = [role, role]
+    for phase, actor_role in phase_roles.items():
+        values.extend([phase, actor_role])
+    return clause, [*values, role]

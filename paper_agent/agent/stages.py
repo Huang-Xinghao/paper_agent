@@ -13,7 +13,7 @@ from pathlib import Path
 class StageSpec:
     node: str
     phase: str
-    skill: str
+    skill: str | None
     role: str
     inputs: tuple[str, ...] = ()
     outputs: tuple[str, ...] = ()
@@ -73,7 +73,7 @@ STAGES = (
         outputs=("paper/main.tex",),
     ),
     StageSpec(
-        node="paper_compile", phase="paper_compile", skill="paper-compile", role="paper_writer",
+        node="paper_compile", phase="paper_compile", skill=None, role="paper_writer",
         inputs=("paper/main.tex",), outputs=("paper/main.tex", "paper/main.pdf"),
     ),
     StageSpec(

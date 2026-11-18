@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -110,7 +111,11 @@ def ls(ctx: ToolContext, path: str | None = None, limit: int = 500) -> ToolResul
 
 @tool(read_only=True)
 def read(ctx: ToolContext, path: str, offset: int = 0, limit: int = 200) -> ToolResult:
-    """Read a text file by line range."""
+    """Read a text file by line range: offset is the number of lines to skip
+    (zero-based), and limit is the number of lines to read (default 200, max 2000).
+    Output includes one-based line numbers. These units are lines, unlike the
+    coordinator's read_project_file, which uses characters.
+    """
     target = ctx.resolve_read(path)
     if not target.exists():
         return _error(f"File not found: {path}", "FILE_NOT_FOUND")
@@ -209,10 +214,17 @@ async def sleep(ctx: ToolContext, seconds: float) -> ToolResult:
 
 @tool()
 async def bash(ctx: ToolContext, command: str, cwd: str | None = None, timeout_seconds: int = 600) -> ToolResult:
-    """Run a shell command in the workspace with bounded output and timeout."""
+    """Run a shell command in the workspace with bounded output and timeout.
+
+    Failures return the exit code and changed, explicitly redirected workspace
+    log tails. Chain dependent generation steps with && so failure is preserved.
+    After generating previews, confirm success and list actual nonempty output
+    files before calling view_image; never guess page filenames or page counts.
+    """
     workdir = ctx.resolve(cwd)
     if not workdir.is_dir():
         return ToolResult(f"Not a directory: {cwd or '.'}", True, {"error_code": "NOT_DIRECTORY"})
+    logs = _bash_redirected_logs(ctx, workdir, command)
     try:
         process = await asyncio.create_subprocess_shell(
             command, cwd=workdir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -223,7 +235,52 @@ async def bash(ctx: ToolContext, command: str, cwd: str | None = None, timeout_s
         await process.wait()
         return ToolResult(f"Command timed out: {command}", True, {"error_code": "BASH_TIMEOUT"})
     output = (stdout + stderr).decode("utf-8", errors="replace")[-12000:]
+    if process.returncode != 0:
+        summaries = []
+        for path, before in logs:
+            try:
+                # Recheck containment after execution in case a command replaced a path.
+                path = ctx.resolve(path)
+                stat = path.stat()
+                if not path.is_file() or (stat.st_ino, stat.st_mtime_ns, stat.st_size) == before:
+                    continue
+                with path.open('rb') as stream:
+                    stream.seek(max(0, stat.st_size - 2000))
+                    tail = stream.read(2000).decode('utf-8', errors='replace')
+                summaries.append(f"Log tail ({ctx.display_path(path)}):\n{tail}")
+            except (OSError, ValueError):
+                continue
+        details = '\n\n'.join(summaries) or 'No updated redirected workspace log found; inspect the command log.'
+        output = (f"Command failed (exit code {process.returncode}).\n"
+                  "Stop dependent preview/image checks. Fix the error, rerun generation, "
+                  "then confirm success and list actual nonempty output files before view_image.\n\n"
+                  f"{details}\n\nConsole output:\n{output or '(empty)'}")[:12000]
     return ToolResult(output, process.returncode != 0, {"returncode": process.returncode})
+
+
+def _bash_redirected_logs(ctx: ToolContext, workdir: Path, command: str):
+    """Find literal log redirects only; never evaluate shell text or scan directories."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|<>')
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    logs = {}
+    for operator, filename in zip(tokens, tokens[1:]):
+        if operator not in {'>', '>>', '&>'}:
+            continue
+        if any(char in filename for char in '$`*?[]'):
+            continue
+        try:
+            path = ctx.resolve(workdir / filename)
+            if path.suffix.lower() not in {'.log', '.txt', '.out', '.err'}:
+                continue
+            stat = path.stat() if path.exists() else None
+            logs[path] = (stat.st_ino, stat.st_mtime_ns, stat.st_size) if stat else None
+        except (OSError, ValueError):
+            continue
+    return list(logs.items())[-2:]
 
 
 def _skill_root(ctx: ToolContext, name: str) -> Path:

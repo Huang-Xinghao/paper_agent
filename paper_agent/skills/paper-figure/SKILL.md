@@ -24,7 +24,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, 
 1. `PAPER_PLAN.md`：论文主张和叙事顺序。
 2. `refine-logs/FINAL_PROPOSAL.md`、实际模型代码/配置：研究任务、输入边界和已实现机制。
 3. `experiment-runs/` 执行收据、`experiments/README.md` 中的计划覆盖记录（若有）、`results/` 中的真实 JSON/CSV、逐样本预测和必要的数据缓存。
-4. 与当前研究对象匹配的图表设计指南（若有）：按需使用适用的领域表达、颜色、字体和视觉检查规范。通过 `find/read` 或 `skill_resource_read` 查找和读取，不以 Wiki 搜索无结果判定文件不存在。
+4. [电池绘图指南](../../../电池资源库/代码和绘图指南/电池绘图指南.md)：通过 `battery_resources(action="read", resource_id="代码和绘图指南/电池绘图指南")` 读取。按本次任务参考架构图、数据集或结果展示部分，以及共享样式、真实产物代码示例和视觉质量标准。
 
 **计划决定内容，结果决定可画范围，指南提供视觉设计。** 
 
@@ -39,8 +39,8 @@ allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, 
 ```markdown
 | ID | 类型 | 描述 | 数据来源 | 优先事项 |
 |----|------|-------------|-------------|----------|
-| 图1 | 架构图 | ... | 手动的 | 高的 |
-| 图2 | 线图 | ... | figures/exp.json | 高的 |
+| 图1 | 架构图 | ... | 最终方案与实际模型实现 | 高 |
+| 图2 | 线图 | ... | results/ 中对应运行的 training_history.json | 高 |
 ```
 
 确认：
@@ -48,144 +48,35 @@ allowed-tools: Read, Write, Edit, Grep, Glob, Bash, generate_image, view_image, 
 - 需要手动创建（架构图等）
 - 哪些是比较表（生成为 LaTeX ）
 
-### 第2步：设置绘图环境
+### 第 2 步：设置绘图环境
 
-创建共享样式配置脚本：
+按绘图指南的“共享绘图样式”创建或复用 `paper_plot_style.py`，统一数值图的字体、配色和导出设置，并按目标论文版面调整尺寸。
 
-```python
-# paper_plot_style.py — 在所有图形脚本之间共享
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.rcParams.update({
-    'font.size': FONT_SIZE,
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'Times', 'DejaVu Serif'],
-    'axes.labelsize': FONT_SIZE,
-    'axes.titlesize': FONT_SIZE + 1,
-    'xtick.labelsize': FONT_SIZE - 1,
-    'ytick.labelsize': FONT_SIZE - 1,
-    'legend.fontsize': FONT_SIZE - 1,
-    'figure.dpi': DPI,
-    'savefig.dpi': DPI,
-    'savefig.bbox': 'tight',
-    'savefig.pad_inches': 0.05,
-    'axes.grid': False,
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-    'text.usetex': False,  # 如果 LaTeX 可用，则设置为 True
-    'mathtext.fontset': 'stix',
-})
+### 第 3 步：确定图形设计
 
-# 调色板
-COLORS = plt.cm.tab10.colors  # 或 Set2，或色盲安全
+根据图中要回答的问题与实际数据，参考指南中的“数据集展示”或“结果展示”选择图型；架构图遵循指南的“架构图”部分。
 
-def save_fig(fig, name, fmt=FORMAT):
-    """Save figure to FIG_DIR with consistent naming."""
-    fig.savefig(f'{FIG_DIR}/{name}.{fmt}')
-    print(f'Saved: {FIG_DIR}/{name}.{fmt}')
+用户指定参考图或要求结合其他论文画图时，读取并遵循[参考其他论文画图指南](../../../电池资源库/代码和绘图指南/参考其他论文画图指南.md)：
+
+```text
+battery_resources(action="read", resource_id="代码和绘图指南/参考其他论文画图指南")
 ```
-
-### 第 3 步：自动选择图形类型
-
-如果用户指定了参考图，或说明需要结合参考图来画，则先根据以下逻辑来生成图1，否则略过**图一设计指南**
-
-直接调用：battery_resources(action="read", resource_id="代码和绘图指南/架构图1")；使用 `generate_image`生成
-
-### 图 1设计指南：检索参考图并生成绘图 prompt
-
-1. 根据 PAPER_PLAN.md、FINAL_PROPOSAL.md 和实际模型实现，
-   整理本次图 1 的任务描述，包括：
-   - 图要说明的核心问题和创新点；
-   - 必须展示的输入、模块、输出及连接关系；
-   - 面板划分、布局需求和图内文字。
-
-2. 调用 search_figure_references(query=..., top_k=3)。
-   查询同时包含研究任务、方法结构和表达需求，
-   不只使用论文标题或领域名称。
-
-3. 阅读候选图的完整图注，选择最适合参考的 1～2 张，
-   调用 view_image 查看实际图片。
-   图片路径或图注文本不能代替实际看图。
-   检索无结果时，依据当前任务和设计规范继续设计，并记录无参考图。
-
-4. 在收到参考图视觉输入后，结合原始图注、本次任务描述
-   和图 1 设计规范，生成最终绘图 prompt。
-   参考图用于借鉴布局、分组、配色、箭头和视觉层次；
-   科学内容以本项目资料为准，不引入参考论文特有的模块或结论。
-
-5. 将选中的参考图路径、来源及借鉴理由写入
-   figures/figure_1_references.json；
-   将最终绘图 prompt 写入 figures/figure_1_prompt.md。
-
-6. 使用最终 prompt 调用 generate_image，传入的 prompt 正文必须与
-   figures/figure_1_prompt.md 中保存的正文一致；修订时先更新该文件，
-   并保留每次实际调用的 prompt 与回执，避免文档与出图请求不一致。
-   随后执行本 skill 已有的成图视觉检查和修订流程。
-
-对于实验结果图，按数据模式选择图形类型：
-
-使用此决策树来处理数据驱动的图形：
-
-| 数据模式 | 推荐类型 | 尺寸 |
-|-------------|-----------------|------|
-| X= time/steps , Y=指标 | 线图 | 0.48\textwidth |
-| 方法 × 1 指标 | 条形图 | 0.48\textwidth |
-| 方法 × 多个指标 | 分组条形/雷达 | 0.95\textwidth |
-| 两个连续变量 | 散点图 | 0.48\textwidth |
-| 矩阵/网格值 | 热图 | 0.48\textwidth |
-| 分布比较 | 箱线图／小提琴图 | 0.48\textwidth |
-| 多数据集结果 | 多面板（子图） | 0.95\textwidth |
-| 之前的工作比较 | LaTeX表 | — |
 
 ### 第 4 步：生成每个图形
 
-对于计划中的每个关于实验结果的展示图形，创建一个独立的 Python 脚本：
+为每张计划中的数值图创建可重跑的 Python 脚本，从真实实验产物读取数据，按第 1 步的面板映射排版。实际模板产物与读取示例见绘图指南“从真实实验产物绘图”；数据路径、任务、指标与单位按当前项目确定。
 
-以下代码只演示绘图写法，不代表本项目的图号、单面板布局或实验数据。实际脚本须读取真实 CSV/JSON，按第1步的面板映射排版；禁止复制示例数值作为结果。
-
-**线图**（训练曲线、缩放）：
-```python
-# gen_fig2_training_curves.py
-from paper_plot_style import *
-import json
-
-with open('figures/exp_results.json') as f:
-    data = json.load(f)
-
-fig, ax = plt.subplots(1, 1, figsize=(5, 3.5))
-ax.plot(data['steps'], data['fac_loss'], label='Factorized', color=COLORS[0])
-ax.plot(data['steps'], data['crf_loss'], label='CRF-LR', color=COLORS[1])
-ax.set_xlabel('Training Steps')
-ax.set_ylabel('Cross-Entropy Loss')
-ax.legend(frameon=False)
-save_fig(fig, 'fig2_training_curves')
-```
-
-**条形图**（比较，消融实验）：
-```python
-fig, ax = plt.subplots(1, 1, figsize=(5, 3))
-methods = ['Baseline', 'Method A', 'Method B', 'Ours']
-values = [82.3, 85.1, 86.7, 89.2]
-bars = ax.bar(methods, values, color=[COLORS[i] for i in range(len(methods))])
-ax.set_ylabel('Accuracy (%)')
-# 在条上添加值标签
-for bar, val in zip(bars, values):
-    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
-            f'{val:.1f}', ha='center', va='bottom', fontsize=FONT_SIZE-1)
-save_fig(fig, 'fig3_comparison')
-```
-
+场景与架构图按指南设计后调用 `generate_image`，保存生成记录和最终图片。
 
 ### 第 5 步：渲染后自检
+
+先确认生成命令成功，再用 `find` 或 `bash` 列出本次实际生成且非空的预览文件；只把已确认的真实路径传给 `view_image`，不猜页数、文件名或补零规则。生成、LaTeX 编译、PDF 转图片等依赖步骤用 `&&` 串联，避免前一步失败后仍继续。命令失败时先检查退出码及日志摘要，修复并重新生成；不得继续批量查看预期图片。命令成功也不代表旧预览已更新，须确认目标属于本次成功生成的版本。
 
 重新打开每张实际渲染的 PDF/PNG，按最终论文尺寸检查，而非只看脚本：
 
 使用 `view_image` 实际查看每张最终 PNG（PDF 使用同版 PNG 预览）。它会把图片作为视觉输入送给当前模型；读取脚本、检查像素尺寸或文件存在不等于看过图片。
 
-- 标签无裁切、图例不遮数据、字号和线条可读，颜色在灰度下仍有区分。
-- 面板标签、图数、数据范围和图注对应；数值、参考线、单位及指标方向与源数据一致。
-- 缺失组不会显示为零，示意与实测、历史与未来、预测与真值有清晰区别。
-- 负结果和失败边界未被坐标、筛选或图注掩盖；
+检查项目遵循绘图指南“视觉质量标准”，并核对成图与当前计划、数据和图注一致。
 
 按“渲染 → `view_image` → 修正 → 重渲染 → 再次 `view_image`”执行，直到最新版本没有已知的可修复布局问题。**每张图最多修订 2 次**，首次生成不计入。
 

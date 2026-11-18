@@ -50,7 +50,7 @@ def size(value):
 def _image_reference(block):
     url = block.get('image_url', {}).get('url', '')
     return {'type': 'text', 'text': json.dumps({
-        'archived_image': True, 'payload_sha256': hashlib.sha256(url.encode()).hexdigest(),
+        'archived_image': True, 'payload_sha256': block.get('sha256') or hashlib.sha256(url.encode()).hexdigest(),
         'note': 'Pixels omitted from historical context. Source path/hash are in the adjacent tool metadata. '
                 'This reference is not a visual inspection; use view_image again if needed.'})}
 
@@ -95,17 +95,27 @@ def request_tokens(messages, tools=()):
     return total
 
 
-def project_messages(messages, *, for_summary=False, task_start_index=0):
+def project_messages(messages, *, for_summary=False, task_start_index=0, image_store=None):
     """Project historical evidence without modifying the durable transcript."""
     projected = copy.deepcopy(messages)
     last_assistant = max((i for i, m in enumerate(projected) if m.get('role') == 'assistant'), default=-1)
     for index, message in enumerate(projected):
         content = message.get('content')
-        if isinstance(content, list) and (for_summary or index < last_assistant or index < task_start_index):
+        if not isinstance(content, list):
+            continue
+        if for_summary or index < last_assistant or index < task_start_index:
             # Fresh visuals stay multimodal until a model reply has consumed them.
             # Summaries must never serialize image bytes into ordinary text.
-            message['content'] = [_image_reference(b) if b.get('type') == 'image_url' else b
+            message['content'] = [_image_reference(b) if b.get('type') in {'image_url', 'stored_image'} else b
                                   for b in content]
+        else:
+            for block_index, block in enumerate(content):
+                if block.get('type') == 'stored_image':
+                    if image_store is None:
+                        raise ValueError('Fresh stored images require an image store')
+                    content[block_index] = image_store.hydrate(block)
+    # Keep tool arguments intact: synthetic replacement bodies can be copied
+    # into later writes. Token-budget compaction handles long write history.
     # Keep the latest exchanges intact so the model can inspect fresh evidence.
     protected = max(0, len(projected) - 8)
     reads = {}
@@ -123,26 +133,6 @@ def project_messages(messages, *, for_summary=False, task_start_index=0):
                             'note': 'Identical content appears in the later tool result; use that result.'})
                     else:
                         reads[key] = message.get('tool_call_id')
-        if index >= protected or message.get('role') != 'assistant':
-            continue
-        for call in message.get('tool_calls', []):
-            function = call.get('function', {})
-            if function.get('name') not in {'write', 'edit'}:
-                continue
-            try:
-                arguments = json.loads(function['arguments'])
-            except (ValueError, KeyError, TypeError):
-                continue
-            if not isinstance(arguments, dict):
-                continue
-            for key in ('content', 'old', 'new', 'old_string', 'new_string', 'old_text', 'new_text'):
-                body = arguments.get(key)
-                if isinstance(body, str) and len(body) > 2000:
-                    arguments[key] = json.dumps({
-                        'archived_body': True, 'chars': len(body),
-                        'sha256': hashlib.sha256(body.encode()).hexdigest(),
-                        'note': 'Historical tool call already executed; body remains in durable transcript and project artifact.'})
-            function['arguments'] = json.dumps(arguments, ensure_ascii=False)
     return projected
 
 
@@ -227,10 +217,11 @@ class WorkingContext:
         self.cutoff = 1
         self.summary = None
 
-    def prepare(self, state, model, max_tokens, on_compact, *, tools=(), on_compacting=None):
+    def prepare(self, state, model, max_tokens, on_compact, *, tools=(), on_compacting=None,
+                image_store=None):
         threshold = compact_threshold(max_tokens)
         pinned = state.task_start_index
-        messages = project_messages(state.messages, task_start_index=pinned)
+        messages = project_messages(state.messages, task_start_index=pinned, image_store=image_store)
 
         def assemble(cutoff, summary):
             if summary is None:

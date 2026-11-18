@@ -10,16 +10,57 @@ from pydantic import BaseModel, Field
 
 from paper_agent.proposal_review import CanvasDraft, review_status
 
-from .store import connection, event, rows
+from .store import connection, event, rows, now
 
 router = APIRouter(prefix="/api/projects")
 PROPOSAL = "refine-logs/FINAL_PROPOSAL.md"
 CANVAS = "IDEA_CANVAS.json"
 
 
+@router.get('/{project_id}/proposal-overview')
+def read_proposal_overview(project_id: str):
+    from paper_agent.proposal_view import model_overview
+    _, proposal, _ = paths(project_id)
+    if not proposal.is_file():
+        raise HTTPException(404, '尚无模型方案')
+    content = proposal.read_bytes()
+    return {**model_overview(content.decode('utf-8')), 'sha256': hashlib.sha256(content).hexdigest()}
+
+
 class CanvasSave(BaseModel):
     sha256: str = Field(pattern=r"^(|[a-f0-9]{64})$")
     draft: CanvasDraft
+
+
+class CanvasApply(BaseModel):
+    sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+
+
+@router.post('/{project_id}/idea-canvas/apply')
+def apply_canvas(project_id: str, body: CanvasApply):
+    """Adopt a reviewed automatic-mode design without starting downstream work."""
+    import fcntl
+    from paper_agent.proposal_review import publish_candidate
+
+    project, _, _ = paths(project_id)
+    root = Path(project['path'])
+    with (root / '.web-run.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HTTPException(409, '运行期间不能采用方案')
+        with connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM runs WHERE project_id=? AND status IN ('queued','running','stopping')",
+                          (project_id,)).fetchone():
+                raise HTTPException(409, '运行期间不能采用方案')
+            try:
+                receipt = publish_candidate(root, body.sha256, adopt=True)
+            except (ValueError, OSError, KeyError) as exc:
+                raise HTTPException(409, str(exc)) from exc
+            db.execute('INSERT INTO events(project_id,kind,data,created_at) VALUES(?,?,?,?)',
+                       (project_id, 'proposal_applied', json.dumps(receipt), now()))
+    return read_canvas(project_id)
 
 
 def paths(project_id):

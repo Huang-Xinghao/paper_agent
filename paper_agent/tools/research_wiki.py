@@ -49,6 +49,7 @@ import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+from .wiki_layout import library_root, entity_paths, corpus_root, split_layout, resolve_legacy_path
 
 from .threat_scan import scan_for_threats, quarantine
 
@@ -101,16 +102,18 @@ def slugify(title: str, author_last: str = "", year: int = 0) -> str:
     return f"{author}{yr}_{keyword}"
 
 
-def init_wiki(wiki_root: str):
+def init_wiki(wiki_root: str, *, separate_origins: bool = False):
     """Initialize wiki directory structure."""
     root = Path(wiki_root)
-    dirs = ["papers", "ideas", "experiments", "claims", "graph"]
-    for d in dirs:
-        (root / d).mkdir(parents=True, exist_ok=True)
+    from .wiki_layout import CONTENT_DIRS, ORIGINS
+    targets = [root / origin for origin in ORIGINS] if separate_origins or split_layout(root) else [root]
+    for target in targets:
+        for d in CONTENT_DIRS:
+            (target / d).mkdir(parents=True, exist_ok=True)
 
     # Create empty files if they don't exist
     for f in ["index.md", "log.md"]:
-        path = root / f
+        path = library_root(root) / f
         if not path.exists():
             if f == "index.md":
                 path.write_text("# Research Wiki Index\n\n_Auto-generated. Do not edit._\n", encoding="utf-8")
@@ -118,7 +121,8 @@ def init_wiki(wiki_root: str):
                 path.write_text("# Research Wiki Log\n\n_Append-only timeline._\n", encoding="utf-8")
 
     # Create empty edges file
-    edges_path = root / "graph" / "edges.jsonl"
+    edges_path = library_root(root) / "graph" / "edges.jsonl"
+    edges_path.parent.mkdir(parents=True, exist_ok=True)
     if not edges_path.exists():
         edges_path.write_text("", encoding="utf-8")
 
@@ -135,17 +139,8 @@ def add_edge(wiki_root: str, from_id: str, to_id: str, edge_type: str, evidence:
 
 def add_edges(wiki_root: str, edges: list[dict[str, str]]) -> None:
     """Append edges with one graph read, sharing deduplication and evidence hygiene."""
-    VALID_TYPES = {
-        "extends", "contradicts", "addresses_gap", "inspired_by",
-        "tested_by", "supports", "invalidates", "supersedes",
-        # Claim-layer edge types (additive, used by add_claim):
-        #   claim --depends_on--> claim   (proof-obligation dependency)
-        #   claim --refutes--> claim      (a claim that falsifies another)
-        #   claim --uses--> paper         (imports a result/ingredient)
-        "depends_on", "refutes", "uses",
-        "shares_method", "addresses_same_problem", "cites",
-    }
-    edges_path = Path(wiki_root) / "graph" / "edges.jsonl"
+    from .wiki_schema import RELATION_TYPES as VALID_TYPES
+    edges_path = library_root(Path(wiki_root)) / "graph" / "edges.jsonl"
     seen = set()
     if edges_path.exists():
         for line in _read_wiki_text(edges_path).splitlines():
@@ -178,7 +173,7 @@ def add_edges(wiki_root: str, edges: list[dict[str, str]]) -> None:
                 # Fail-closed WITH visibility: the graph gets the placeholder; the
                 # raw flagged text + findings go to a reviewable quarantine log so a
                 # human can inspect it. Nothing is silently dropped.
-                qlog = Path(wiki_root) / "graph" / "quarantine.log"
+                qlog = library_root(Path(wiki_root)) / "graph" / "quarantine.log"
                 with open(qlog, "a", encoding="utf-8") as f:
                     f.write(json.dumps({
                         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -215,15 +210,11 @@ def get_stats(wiki_root: str):
     root = Path(wiki_root)
 
     def count_files(subdir):
-        d = root / subdir
-        return len(list(d.glob("*.md"))) if d.exists() else 0
+        return len(entity_paths(root, subdir))
 
     def count_by_field(subdir, field, value):
-        d = root / subdir
-        if not d.exists():
-            return 0
         count = 0
-        for f in d.glob("*.md"):
+        for f in entity_paths(root, subdir):
             # Read the FRONTMATTER field only — not a full-text substring, so body
             # text mentioning e.g. "outcome: negative" can't inflate the count.
             if _load_paper_frontmatter(f).get(field) == value:
@@ -235,7 +226,7 @@ def get_stats(wiki_root: str):
     experiments = count_files("experiments")
     claims = count_files("claims")
 
-    edges_path = root / "graph" / "edges.jsonl"
+    edges_path = library_root(root) / "graph" / "edges.jsonl"
     edge_count = 0
     if edges_path.exists():
         edge_count = sum(1 for line in _read_wiki_text(edges_path).strip().split("\n") if line.strip())
@@ -415,8 +406,9 @@ def fetch_arxiv_metadata_batch(arxiv_ids: list[str], timeout: float = 30.0) -> d
 
 
 def _last_name(full_name: str) -> str:
-    """Crude last-name extraction for slug generation."""
-    parts = full_name.strip().split()
+    """Use the romanized surname before a trailing Chinese name annotation."""
+    name = re.sub(r"\s*[（(][^()（）]*[\u3400-\u9fff][^()（）]*[)）]\s*$", "", full_name).strip()
+    parts = (name or full_name).strip().split()
     return parts[-1] if parts else ""
 
 
@@ -572,7 +564,7 @@ def ingest_paper(wiki_root: str, *, arxiv_id: str = "", title: str = "",
       - rebuilds index.md
       - appends to log.md
     """
-    root = Path(wiki_root)
+    root = corpus_root(Path(wiki_root))
     if not (root / "papers").exists():
         raise RuntimeError(f"{root} is not an initialized wiki (papers/ missing). "
                            f"Run `init` first.")
@@ -678,7 +670,7 @@ def update_paper_sections(wiki_root: str, slug: str, sections: dict[str, str],
     """Update named analysis sections while preserving the rest of the paper page."""
     if not re.fullmatch(r"[\w.-]+", slug, re.UNICODE) or slug in {".", ".."}:
         raise ValueError("invalid paper slug")
-    path = Path(wiki_root) / "papers" / f"{slug}.md"
+    path = resolve_legacy_path(Path(wiki_root), f"papers/{slug}.md")
     if not path.is_file():
         raise FileNotFoundError(f"Paper not found: {slug}")
     if (not isinstance(sections, dict) or not sections
@@ -739,7 +731,7 @@ def _quarantine_fields(root: Path, kind: str, node_id: str, **fields) -> dict:
         if findings:
             hits.append((field, findings, value))
     if hits:
-        qlog = root / "graph" / "quarantine.log"
+        qlog = library_root(root) / "graph" / "quarantine.log"
         qlog.parent.mkdir(parents=True, exist_ok=True)
         with qlog.open("a", encoding="utf-8") as stream:
             for field, findings, raw in hits:
@@ -839,7 +831,7 @@ def add_claim(wiki_root: str, slug: str, name: str, *, description: str = "",
     Bare gap ids (``G2``) and bare claim/paper slugs are auto-prefixed to the
     ``gap:`` / ``claim:`` / ``paper:`` node_id namespace used by the graph.
     """
-    root = Path(wiki_root)
+    root = corpus_root(Path(wiki_root))
     if not (root / "claims").exists():
         raise RuntimeError(f"{root} is not an initialized wiki (claims/ missing). "
                            f"Run `init` first.")
@@ -885,9 +877,9 @@ def add_claim(wiki_root: str, slug: str, name: str, *, description: str = "",
         kind, _, rest = nid.partition(":")
         exists = True
         if kind == "paper":
-            exists = (root / "papers" / f"{rest}.md").exists()
+            exists = resolve_legacy_path(library_root(root), f"papers/{rest}.md").exists()
         elif kind == "claim":
-            exists = rest == slug or (root / "claims" / f"{rest}.md").exists()
+            exists = rest == slug or resolve_legacy_path(library_root(root), f"claims/{rest}.md").exists()
         if not exists:
             print(f"⚠️  add_claim: edge target {nid} not found in this wiki "
                   f"(dangling edge recorded — create the node or fix the id).",
@@ -1006,7 +998,7 @@ def upsert_idea(wiki_root: str, slug: str, title: str, *, description: str = "",
     NOTE: /result-to-claim updates an idea's outcome by editing the page in place (to
     preserve the rich body); it must NOT call this with update_on_exist (would clobber).
     """
-    root = Path(wiki_root)
+    root = corpus_root(Path(wiki_root))
     if not (root / "ideas").exists():
         raise RuntimeError(f"{root} is not an initialized wiki (ideas/ missing). "
                            f"Run `init` first.")
@@ -1045,7 +1037,7 @@ def upsert_idea(wiki_root: str, slug: str, title: str, *, description: str = "",
         kind, _, rest = nid.partition(":")
         exists = True
         if kind == "paper":
-            exists = (root / "papers" / f"{rest}.md").exists()
+            exists = resolve_legacy_path(library_root(root), f"papers/{rest}.md").exists()
         if not exists:
             print(f"⚠️  upsert_idea: edge target {nid} not found in this wiki "
                   f"(dangling edge recorded — create the node or fix the id).",
@@ -1087,7 +1079,7 @@ def update_idea_sections(wiki_root: str, slug: str, sections: dict[str, str],
         _, findings = quarantine(body, scope="strict", label=f"idea {slug}.{heading}")
         if findings:
             raise ValueError(f"Unsafe content in idea section: {heading}")
-    path = Path(wiki_root) / "ideas" / f"{slug}.md"
+    path = resolve_legacy_path(Path(wiki_root), f"ideas/{slug}.md")
     content = path.read_text(encoding="utf-8")
     # Remove obsolete extracted evidence when refreshing existing idea pages.
     content = re.sub(r"(?m)^## Evidence\n.*?(?=^## |\Z)", "", content, flags=re.S)
@@ -1147,7 +1139,7 @@ def add_experiment(wiki_root: str, slug: str, *, title: str = "", idea: str = ""
     updates refresh only the four standard body sections, retaining frontmatter
     and additional sections. Classification is set independently.
     """
-    root = Path(wiki_root)
+    root = corpus_root(Path(wiki_root))
     if not (root / "experiments").exists():
         raise RuntimeError(f"{root} is not an initialized wiki (experiments/ missing). "
                            f"Run `init` first.")
@@ -1195,7 +1187,7 @@ def add_experiment(wiki_root: str, slug: str, *, title: str = "", idea: str = ""
 
     # Wire the idea --tested_by--> exp edge (idea side owns it, per the schema).
     if idea_id:
-        if idea_id.startswith("idea:") and not (root / "ideas" / f"{idea_id.split(':', 1)[1]}.md").exists():
+        if idea_id.startswith("idea:") and not resolve_legacy_path(library_root(root), f"ideas/{idea_id.split(':', 1)[1]}.md").exists():
             print(f"⚠️  add_experiment: idea {idea_id} not found in this wiki "
                   f"(dangling edge recorded — create the node or fix the id).",
                   file=sys.stderr)
@@ -1244,17 +1236,14 @@ def sync_papers(wiki_root: str, arxiv_ids: list[str], update_on_exist: bool = Fa
 
 def rebuild_index(wiki_root: str) -> None:
     """Regenerate index.md from wiki entity files."""
-    root = Path(wiki_root)
+    root = library_root(Path(wiki_root))
     lines = ["# Research Wiki Index", "",
              "_Auto-generated by `research_wiki.py rebuild_index`. Do not edit._", ""]
 
     for subdir, header in [("papers", "Papers"), ("ideas", "Ideas"),
                             ("experiments", "Experiments"), ("claims", "Claims")]:
-        d = root / subdir
-        if not d.exists():
-            continue
         entries = []
-        for f in sorted(d.glob("*.md")):
+        for f in entity_paths(root, subdir):
             meta = _load_paper_frontmatter(f)
             node_id = meta.get("node_id", f.stem)
             # Claims use `name:` (papers use `title:`); fall back across both
@@ -1264,7 +1253,7 @@ def rebuild_index(wiki_root: str) -> None:
             # Surface the claim's honesty status inline (papers have no status).
             status = meta.get("status", "")
             suffix = f" ({year})" if year else (f" [{status}]" if status else "")
-            entries.append(f"- `{node_id}` — {title}{suffix}")
+            entries.append(f"- [{title}]({f.relative_to(root).as_posix()}){suffix} — `{node_id}`")
         if entries:
             lines.append(f"## {header} ({len(entries)})")
             lines.extend(entries)
@@ -1275,7 +1264,7 @@ def rebuild_index(wiki_root: str) -> None:
 
 def append_log(wiki_root: str, message: str):
     """Append a timestamped entry to log.md."""
-    log_path = Path(wiki_root) / "log.md"
+    log_path = library_root(Path(wiki_root)) / "log.md"
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     entry = f"- `{ts}` {message}\n"
 
@@ -1424,7 +1413,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "init":
-        init_wiki(args.wiki_root)
+        init_wiki(args.wiki_root, separate_origins=True)
     elif args.command == "slug":
         print(slugify(args.title, args.author, args.year))
     elif args.command == "add_edge":

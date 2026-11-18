@@ -9,6 +9,7 @@ import tempfile
 import unicodedata
 from itertools import zip_longest
 from pathlib import Path
+from .wiki_layout import entity_paths, library_root
 from typing import Any, Callable
 from paper_agent.tools import research_wiki
 from paper_agent.tools.wiki_retrieval import Page, Section, load_page, rank_pages
@@ -16,13 +17,8 @@ from paper_agent.tools.wiki_prompts import RELATION_PROMPT
 from paper_agent.tools.wiki_metadata import metadata_path, metadata_records
 from paper_agent.tools.wiki_prompts import PROMPT_VERSION as ANALYSIS_VERSION
 
-PAPER_RELATIONS = {
-    "extends",
-    "contradicts",
-    "supersedes",
-    "shares_method",
-    "addresses_same_problem",
-}
+from .wiki_schema import PAPER_RELATIONS
+
 IDEA_RELATIONS = {"inspired_by"}
 ORIGIN = "wiki-agent-relations-v1"
 MAX_CANDIDATES = 8
@@ -52,7 +48,7 @@ def classification_vocabulary(root: Path) -> dict[str, list[str]]:
         key: set() for key in research_wiki.CLASSIFICATION_FIELDS
     }
     for directory in ("papers", "ideas", "experiments"):
-        for path in sorted((root / directory).glob("*.md")):
+        for path in entity_paths(root, directory):
             summary = _summary(path)
             for key in labels:
                 values = summary.get(key, [])
@@ -127,9 +123,10 @@ def discover_relations(
     analyze: Callable[[str, str], dict[str, Any]],
 ) -> list[dict[str, str]]:
     """Read candidate notes, then validate endpoint types and verbatim evidence."""
+    root = library_root(root)
     papers = {
         f"paper:{p.stem}": p
-        for p in sorted((root / "papers").glob("*.md"))
+        for p in entity_paths(root, "papers")
         if p != paper_path
     }
     if not papers:
@@ -142,14 +139,14 @@ def discover_relations(
     if not papers:
         return []
     existing_ideas = {}
-    graph = root / "graph" / "edges.jsonl"
+    graph = library_root(root) / "graph" / "edges.jsonl"
     linked_ideas = set()
     for line in graph.read_text(encoding="utf-8").splitlines():
         if line.strip():
             edge = json.loads(line)
             if edge.get("type") == "inspired_by" and edge.get("to") in papers:
                 linked_ideas.add(edge.get("from"))
-    for candidate in sorted((root / "ideas").glob("*.md")):
+    for candidate in entity_paths(library_root(root), "ideas"):
         node = f"idea:{candidate.stem}"
         if node != idea_id and node in linked_ideas:
             existing_ideas[node] = candidate
@@ -246,7 +243,7 @@ def write_relations_batch(
     """Commit edges atomically; return warnings for subsequent activity-log failures."""
     if not relations_by_owner:
         return []
-    edge_path = root / "graph" / "edges.jsonl"
+    edge_path = library_root(root) / "graph" / "edges.jsonl"
     existing = [
         json.loads(line)
         for line in edge_path.read_text(encoding="utf-8").splitlines()
@@ -659,12 +656,13 @@ def save_references(
 
 def refresh_citations(root: Path) -> dict[str, int]:
     """Resolve saved bibliographies against all current papers, including new arrivals."""
-    papers = [_identity(p) for p in sorted((root / "papers").glob("*.md"))]
+    root = library_root(root)
+    papers = [_identity(p) for p in entity_paths(root, "papers")]
     lookup = _citation_index(papers)
     ids = {p["id"] for p in papers}
     counts = {}
     relations_by_owner = {}
-    for _paper, path in metadata_records(root, "references"):
+    for _paper, path in metadata_records(library_root(root), "references"):
         record = json.loads(path.read_text(encoding="utf-8"))
         owner = record["paper_id"]
         if owner not in ids:

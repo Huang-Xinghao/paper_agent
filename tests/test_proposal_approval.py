@@ -1,14 +1,16 @@
 """Human approval can retain open questions without accepting a stale draft."""
 
 from types import SimpleNamespace
+import json
 
 import pytest
 
 from paper_agent.agent.workflow import WorkflowRunner, WorkflowState
 from paper_agent.proposal_review import (
-    CANVAS, PROPOSAL, RECORD, CanvasDraft, draft_hash, json_bytes,
+    CANVAS, PROPOSAL, RECORD, CanvasDraft, CanvasNode, draft_hash, json_bytes,
     load_draft, load_record, require_candidate, require_resolved_proposal_review,
     review_status, sha,
+    publish_candidate, require_revision_changes,
 )
 from paper_agent.storage import write_json
 
@@ -64,3 +66,52 @@ def test_open_questions_do_not_bypass_version_checks(tmp_path, candidate):
         require_candidate(tmp_path, old_hash)
     with pytest.raises(ValueError, match='尚未由 Agent'):
         require_candidate(tmp_path, sha((tmp_path / CANVAS).read_bytes()))
+
+
+def test_auto_adoption_publishes_and_freezes_without_starting_plan(tmp_path, candidate):
+    draft, state = candidate
+    state.mode, state.status, state.expert_checkpoint = 'auto', 'completed', None
+    write_json(tmp_path / 'workflow-state.json', state.to_dict())
+    assert review_status(tmp_path, draft)['canApply']
+    publish_candidate(tmp_path, sha((tmp_path / CANVAS).read_bytes()), adopt=True)
+    saved = json.loads((tmp_path / 'workflow-state.json').read_bytes())
+    assert saved['mode'] == 'auto' and saved['status'] == 'completed'
+    assert saved['current_node'] == 'refine' and saved['expert_checkpoint'] is None
+    assert saved['history'][-1]['sha256'] == sha((tmp_path / PROPOSAL).read_bytes())
+    record = load_record(tmp_path)
+    assert (tmp_path / record['frozenPath']).read_bytes() == (tmp_path / PROPOSAL).read_bytes()
+    require_resolved_proposal_review(tmp_path)
+    assert not review_status(tmp_path, load_draft(tmp_path))['canApply']
+
+
+@pytest.mark.parametrize('mode,node,status', [
+    ('expert', 'refine', 'awaiting_user'), ('auto', 'experiment_plan', 'completed'),
+    ('auto', 'refine', 'running'),
+])
+def test_auto_adoption_rejects_ineligible_state_without_writing(tmp_path, candidate, mode, node, status):
+    draft, state = candidate
+    state.mode, state.current_node, state.status = mode, node, status
+    write_json(tmp_path / 'workflow-state.json', state.to_dict())
+    before = {name: (tmp_path / name).read_bytes() for name in [PROPOSAL, CANVAS, RECORD, 'workflow-state.json']}
+    with pytest.raises(ValueError, match='仅支持采用'):
+        publish_candidate(tmp_path, sha((tmp_path / CANVAS).read_bytes()), adopt=True)
+    assert all((tmp_path / name).read_bytes() == content for name, content in before.items())
+
+
+def test_revision_rejects_initial_seed_and_repeated_or_position_only_edits(tmp_path, candidate):
+    draft, _ = candidate
+    (tmp_path / RECORD).unlink()
+    draft.changes = ['已按提案标题整理候选模块，模块职责与连接关系待人工核对。']
+    with pytest.raises(ValueError, match='没有实际修改'):
+        require_revision_changes(tmp_path, draft)
+    draft.review.feedback = 'Simplify the model'
+    require_revision_changes(tmp_path, draft)
+    draft.review.feedback = ''
+    draft.nodes = [CanvasNode(id='model', position={'x': 0, 'y': 0}, data={'title': 'Model'})]
+    write_json(tmp_path / RECORD, {'id': 'review', 'draftHash': draft_hash(draft)})
+    write_json(tmp_path / 'refine-logs/review-history/review.json', {'draft': draft.model_dump()})
+    draft.nodes[0].position.x = 100
+    with pytest.raises(ValueError, match='没有实际修改'):
+        require_revision_changes(tmp_path, draft)
+    draft.review.sections[0].details = 'Changed method'
+    require_revision_changes(tmp_path, draft)

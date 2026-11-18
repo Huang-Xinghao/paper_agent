@@ -84,6 +84,10 @@ history读取保存的执行或讨论记录（含工具记录），按next_offse
 CLI派单和修订沿用原工具的审批、范围及次数预算。一次响应最多一个执行命令，状态和记录查询不受此限制。
 get_project_context中的artifact_versions.changed_files提供改动提示；结合实际依赖判断需要更新的产物，不必重跑无关阶段。
 专家模式的所有用户审批统一由主控接收，沿用既有工作流校验；refine完成交给用户批准。自动模式自行核对方案并推进。
+自动模式完成refine后直接执行授权范围内的下一阶段，不将方案展示、修改或人工批准设为关卡。
+专家模式的方案问题只问需要用户决定的模型输入、架构、输出取舍，写入review_checkpoint.questions，展示在方案下方。
+用户说“按你的建议来”“都按你的意见来”且未提出实质变更时，表示接受当前建议，不重新生成整份方案。
+专家模式存在当前有效检查点时按既有approve_checkpoint校验批准；自动模式沿用当前正式方案继续。
 角色交付后先读真实产物，理解结果、证据和取舍；专家模式遇到待审检查点时，向用户解释关键产物；可用review_checkpoint更新摘要和必要的问题，不要求固定问题数量。自动模式验收后继续派单；角色附带的问题只是参考。
 用户已明确批准当前版本时直接落实批准，不重复提问或重写审阅摘要。若有画布草稿，修改FINAL_PROPOSAL前先读IDEA_CANVAS.json及IDEA_REVIEW.json（存在时），核对尚未写入正文的意见；旧投影将归档，当前MD作为新版依据。
 资源库统一使用battery_resources：action="search"检索说明与登记路径，action="read"读取指定resource_id，action="inspect"查看指定数据文件结构。数据检索与样本理解交给data_search阶段，主控按需定向核对；文献阶段只调研文献。使用inspect_compute核对本机算力。
@@ -167,7 +171,7 @@ class CoordinatorAgent(AgentLoop):
             ToolSpec("get_project_context", "读取最新项目状态、产物目录和阶段任务。", self._context, True),
             ToolSpec("inspect_compute", "只读检查当前执行环境的CPU、CUDA/MPS可用性和项目计算限制。", self._inspect_compute, True),
             ToolSpec("set_research_goal", "依据用户明确的研究需求记录项目总目标goal；可整合此前的澄清答案。仅设置目标，不派单、不增加用户确认。", self._set_research_goal),
-            ToolSpec("read_project_file", "读取项目中的文本产物；仅提供真实路径，按需读取。", self._read, True),
+            ToolSpec("read_project_file", "读取项目中的文本产物。offset和limit均以字符计数，不是行数；默认读取12000字符，单次最多20000字符。通常只需提供真实path；需要续读时使用返回的next_offset。普通read工具才按行读取。", self._read, True),
             ToolSpec("edit_project_markdown", "主控直接落实用户要求：先读文件，再以path、old_text、new_text精确替换一处Markdown。node为所属工作流节点。修改不会批准或派单。", self._edit_markdown),
             ToolSpec("review_checkpoint", "主控理解待审产物后更新面向用户的summary、questions及可选decision_options；沿用当前检查点，不批准、不派单。", self._review_checkpoint),
             ToolSpec("approve_checkpoint", "仅落实用户对当前待审版本的明确批准，沿用工作流校验；无明确批准或版本变化时拒绝。", self._approve_checkpoint),
@@ -195,6 +199,10 @@ class CoordinatorAgent(AgentLoop):
             elif name == 'review_checkpoint':
                 schema['function']['parameters']['properties']['decision_options'] = {
                     'type': 'array', 'items': {'type': 'array', 'items': {'type': 'string'}}}
+            elif name == 'read_project_file':
+                properties = schema['function']['parameters']['properties']
+                properties['offset']['description'] = '跳过的字符数，从0开始；续读请使用返回的next_offset，不是行号。'
+                properties['limit']['description'] = '读取的字符数，不是行数；默认12000，最多20000，通常省略即可。'
         return schemas
 
     def _context(self, ctx) -> ToolResult:

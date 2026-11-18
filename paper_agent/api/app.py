@@ -202,10 +202,13 @@ async def lifespan(_):
         UserQuestions(root).pending()
     monitor = BtsMonitor()
     app.state.bts_monitor = monitor
+    land_monitor = BtsMonitor("land")
+    app.state.land_monitor = land_monitor
     try:
         yield
     finally:
         await monitor.close()
+        await land_monitor.close()
 
 
 app = FastAPI(
@@ -519,10 +522,12 @@ def create_run(project_id: str, body: RunCreate, *, message_prompt=None):
         if message_prompt is not None:
             options["message_prompt"] = message_prompt
         if body.action in {"proposal_revise", "proposal_approve"}:
-            from paper_agent.proposal_review import load_draft, require_candidate, pending_refine
+            from paper_agent.proposal_review import load_draft, require_candidate, pending_refine, require_revision_changes
             try:
                 root = Path(project["path"])
-                load_draft(root, body.proposal_sha256)
+                submitted = load_draft(root, body.proposal_sha256)
+                if body.action == 'proposal_revise':
+                    require_revision_changes(root, submitted)
                 if body.action == "proposal_approve":
                     if not pending_refine(state):
                         raise ValueError("只有当前研究精炼阶段的专家检查点可以批准进入实验规划；历史提案仅可修订草稿")
@@ -815,6 +820,7 @@ def log_tail(project_id: str):
 @app.get("/api/projects/{project_id}/activity")
 def activity(
     project_id: str,
+    role: str | None = Query(default=None),
     before: int | None = Query(default=None, ge=1),
     after: int | None = Query(default=None, ge=0),
     limit: int = Query(default=100, ge=1, le=500),
@@ -830,6 +836,14 @@ def activity(
     elif after is not None:
         clause = " AND id>?"
         values.append(after)
+    if role is not None:
+        from .agents import activity_role_filter
+        try:
+            role_clause, role_values = activity_role_filter(role)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        clause += role_clause
+        values.extend(role_values)
     direction = "ASC" if after is not None else "DESC"
     records = rows(
         f"SELECT * FROM events WHERE project_id=?{clause} ORDER BY id {direction} LIMIT ?",

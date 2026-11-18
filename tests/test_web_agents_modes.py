@@ -67,6 +67,47 @@ def test_new_web_project_defaults_to_expert_and_explicit_auto_is_honored(project
     assert json.loads(store.rows('SELECT options FROM runs ORDER BY created_at DESC')[0]['options'])['mode'] == 'auto'
 
 
+def test_empty_proposal_revision_is_rejected_before_scheduling(project_api):
+    from paper_agent.proposal_review import CANVAS, PROPOSAL, sha
+    client, project, identifier = project_api
+    source = project / PROPOSAL
+    source.parent.mkdir()
+    source.write_text('# Method\nExisting design')
+    write_json(project / CANVAS, {'sourceHash': sha(source.read_bytes()), 'nodes': [], 'edges': [],
+                                'changes': ['已按提案标题整理候选模块，模块职责与连接关系待人工核对。']})
+    response = client.post(f'/api/projects/{identifier}/runs', json={
+        'action': 'proposal_revise', 'proposal_sha256': sha((project / CANVAS).read_bytes())})
+    assert response.status_code == 409 and '没有实际修改' in response.text
+    assert store.rows('SELECT * FROM runs') == []
+
+
+def test_adopt_auto_proposal_endpoint_is_versioned_and_does_not_schedule(project_api):
+    from paper_agent.proposal_review import CANVAS, PROPOSAL, RECORD, CanvasDraft, draft_hash, sha
+    client, project, identifier = project_api
+    source = project / PROPOSAL
+    source.parent.mkdir()
+    source.write_text('# Original')
+    draft = CanvasDraft(sourceHash=sha(source.read_bytes()), nodes=[], edges=[], review={
+        'sections': [{'id': 'method', 'title': 'Method', 'summary': 'New', 'details': 'Revised design'}]})
+    write_json(project / CANVAS, draft.model_dump())
+    write_json(project / RECORD, {'id': 'test', 'draftHash': draft_hash(draft)})
+    write_json(project / 'workflow-state.json', {'mode': 'auto', 'status': 'completed', 'current_node': 'refine'})
+    endpoint = f'/api/projects/{identifier}/idea-canvas/apply'
+    assert client.post(endpoint, json={'sha256': '0' * 64}).status_code == 409
+    expected = sha((project / CANVAS).read_bytes())
+    with store.connection() as db:
+        db.execute('INSERT INTO runs(id,project_id,status,options,created_at) VALUES(?,?,?,?,?)',
+                   ('busy', identifier, 'running', '{}', store.now()))
+    assert client.post(endpoint, json={'sha256': expected}).status_code == 409
+    with store.connection() as db:
+        db.execute("DELETE FROM runs WHERE id='busy'")
+    response = client.post(endpoint, json={'sha256': expected})
+    assert response.status_code == 200, response.text
+    assert not response.json()['canApply']
+    assert 'Revised design' in source.read_text()
+    assert store.rows('SELECT * FROM runs') == []
+
+
 def pending(project):
     report = project / 'literature/RESEARCH_REPORT.md'
     report.parent.mkdir(exist_ok=True)
@@ -187,3 +228,65 @@ def test_runtime_task_identifies_terminal_role_without_web_events(project_api, m
     assert not views()['paper_writer']['is_active']
     monkeypatch.setattr(web, 'terminal_projects', lambda: set())
     assert not any(item['is_active'] for item in views().values())
+
+
+def test_role_history_is_filtered_before_paging_and_survives_refresh(project_api):
+    client, project, identifier = project_api
+    store.event(identifier, 'assistant_output', {'role': 'paper_writer', 'content': 'Earlier draft'})
+    store.event(identifier, 'tool_end', {'phase': 'paper_write', 'tool': 'Read', 'content': 'Read evidence'})
+    store.event(identifier, 'assignment_start', {'role': 'main', 'assignment': {'role': 'paper_writer'}})
+    for index in range(105):
+        store.event(identifier, 'assistant_output', {'role': 'experiment', 'content': str(index)})
+    url = f'/api/projects/{identifier}/activity'
+    assert all(e['data'].get('role') == 'experiment' for e in client.get(url).json()['events'])
+    latest = client.get(url, params={'role': 'paper_writer', 'limit': 2}).json()
+    assert [e['kind'] for e in latest['events']] == ['tool_end', 'assignment_start']
+    assert latest['has_more']
+    earlier = client.get(url, params={'role': 'paper_writer', 'before': latest['events'][0]['id']}).json()
+    assert [e['data']['content'] for e in earlier['events']] == ['Earlier draft']
+    assert not earlier['has_more']
+    assert client.get(url, params={'role': 'paper_writer', 'limit': 2}).json() == latest
+    store.event(identifier, 'assistant_output', {'role': 'paper_writer', 'content': 'New draft'})
+    newer = client.get(url, params={'role': 'paper_writer', 'after': latest['events'][-1]['id']}).json()
+    assert [e['data']['content'] for e in newer['events']] == ['New draft']
+    assert client.get(url, params={'role': 'unknown'}).status_code == 422
+
+
+def test_overview_reads_formal_proposal_and_matching_hash(project_api):
+    import hashlib
+    client, project, identifier = project_api
+    endpoint = f'/api/projects/{identifier}/proposal-overview'
+    assert client.get(endpoint).status_code == 404
+    source = project / 'refine-logs/FINAL_PROPOSAL.md'
+    source.parent.mkdir()
+    source.write_text('## 模型输入\nReal input\n## 模型架构\n```text\nX → y\n```\nActual MLP\n## 模型输出\nReal output\n## 背景\nHidden')
+    write_json(source.parent / 'IDEA_CANVAS.json', {'summary': 'Wrong old canvas'})
+    response = client.get(endpoint)
+    assert response.status_code == 200
+    assert response.json()['sha256'] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert response.json()['input'] == 'Real input'
+    assert 'Wrong old canvas' not in response.text and 'Hidden' not in response.text
+
+
+@pytest.mark.parametrize('answer,accept', [('', True), ('同意，继续下一步', True),
+    ('都按你的意见来', True), ('按你的想法来', True), ('同意，但编码器改为64维', False)])
+def test_review_worker_distinguishes_consent_from_changes(project_api, monkeypatch, answer, accept):
+    from paper_agent.api import worker
+    from paper_agent.agent import workflow_cli
+    client, project, identifier = project_api
+    pending(project)
+    state = json.loads((project / 'workflow-state.json').read_text())
+    token = web.checkpoint_token(web.project_record(identifier), state)
+    response = client.post(f'/api/projects/{identifier}/runs', json={
+        'action': 'review', 'checkpoint_token': token, 'answer': answer})
+    assert response.status_code == 202, response.text
+    run = store.rows('SELECT * FROM runs')[0]
+    (store.data_root() / 'runs' / run['id']).mkdir(parents=True, exist_ok=True)
+    received = {}
+    def capture(root, **options):
+        received.update(options)
+        return SimpleNamespace(status='completed', error=None)
+    monkeypatch.setattr(workflow_cli, 'run_coordinated_workflow', capture)
+    worker._execute(run['id'])
+    assert bool(received.get('continue_run')) == accept
+    assert ('revise' in received) != accept

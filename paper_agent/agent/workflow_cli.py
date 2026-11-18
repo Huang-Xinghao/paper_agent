@@ -27,7 +27,22 @@ def is_approval(value):
     return bool(re.fullmatch(
         r'(?:(?:批准|同意)(?:(?:当前|推荐|这个|该)?方案)?'
         r'(?:并?(?:继续|开始|进入)(?:运行|执行|实验规划|下一步|下一阶段)?)?'
-        r'|可以的?(?:开始|继续)(?:运行|执行)?)', value))
+        r'|可以的?(?:开始|继续)(?:运行|执行)?'
+        r'|(?:都)?按(?:你|您)的(?:建议|意见|想法)(?:来|继续|执行))', value))
+
+
+def is_review_approval(answer, questions):
+    """Recognize consent in either free text or the web's question/answer form."""
+    if is_approval(answer):
+        return True
+    entries = answer.split('\n\n问题：')
+    if not questions or len(entries) != len(questions):
+        return False
+    for index, (entry, question) in enumerate(zip(entries, questions)):
+        prefix = ('问题：' if index == 0 else '') + question + '\n回答：'
+        if not entry.startswith(prefix) or not is_approval(entry[len(prefix):]):
+            return False
+    return True
 
 
 def checkpoint_snapshot(project):

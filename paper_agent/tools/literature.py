@@ -37,7 +37,7 @@ def _pdf_cache_target(name: str) -> Path:
 @tool(read_only=True)
 def discover_local_papers(ctx: ToolContext, query: str = "", library_path: str | None = None,
                           max_papers: int = 20) -> ToolResult:
-    """Find PDFs in the shared research-wiki/raw-paper/ library.
+    """Find PDFs in the shared research-wiki/literature/raw-paper/ library.
 
     An optional library_path also searches a permitted read-only directory.
     Use only to locate an especially relevant paper after Wiki leaves a concrete
@@ -216,7 +216,7 @@ def search_papers(ctx: ToolContext, query: str, source: str = "openalex",
 
 @tool()
 def download_openalex_paper(ctx: ToolContext, paper: dict) -> ToolResult:
-    """Download an OpenAlex PDF to the shared research-wiki/raw-paper/ library.
+    """Download an OpenAlex PDF to the shared research-wiki/literature/raw-paper/ library.
 
     Pass a search_papers record, or title and DOI. Missing PDF links are resolved
     via OpenAlex DOI lookup. Try alternative PDF locations; report unavailable
@@ -280,7 +280,7 @@ def download_openalex_paper(ctx: ToolContext, paper: dict) -> ToolResult:
 
 @tool()
 def download_arxiv_paper(ctx: ToolContext, url: str) -> ToolResult:
-    """Download and cache an arXiv PDF in the shared research-wiki/raw-paper/ library."""
+    """Download and cache an arXiv PDF in the shared research-wiki/literature/raw-paper/ library."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"arxiv.org", "export.arxiv.org"}:
         return ToolResult("Not an arXiv paper URL", True)

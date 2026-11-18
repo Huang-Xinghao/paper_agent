@@ -242,7 +242,7 @@ def test_graph_discovery_returns_candidates_without_neighbor_bodies(wiki):
                                    view='abstracts', strategy='lexical')
     assert not result.is_error
     delivered = json.loads(result.output)
-    related = next(m for m in delivered['matches'] if m['wiki_path'] == 'papers/neighbor.md')
+    related = next(m for m in delivered['related_matches'] if m['wiki_path'] == 'papers/neighbor.md')
     assert related['origin'] == 'graph' and related['abstract'] == 'Neighbor abstract.'
     assert delivered['relations'][0]['relation'] == 'cites'
     assert 'HIDDEN_BODY' not in result.output and 'HIDDEN_GRAPH_PASSAGE' not in result.output
