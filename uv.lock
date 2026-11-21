@@ -743,7 +743,7 @@ wheels = [
 ]
 
 [[package]]
-name = "paper-agent-prototype"
+name = "batteryscientist"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

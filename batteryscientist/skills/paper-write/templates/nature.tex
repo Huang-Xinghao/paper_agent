@@ -1,0 +1,43 @@
+% Default manuscript: Chinese layout with Nature-style references.
+% Copy this file to paper/main.tex, and copy nature-citations.sty and
+% sn-nature.bst to paper/. Compile from the project root with XeLaTeX:
+% latexmk -xelatex -outdir=paper paper/main.tex
+% For English manuscripts, use article and omit the CJK font settings.
+\documentclass[UTF8,zihao=-4,fontset=none,a4paper]{ctexart}
+\usepackage[margin=25mm]{geometry}
+\setCJKmainfont{Noto Serif CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}
+\setCJKmonofont{Noto Sans CJK SC}
+\usepackage{amsmath,amssymb,amsthm,graphicx,booktabs}
+\usepackage{paper/nature-citations}
+\usepackage[colorlinks=true,allcolors=blue]{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+\newtheorem{assumption}{假设}
+\crefname{assumption}{假设}{假设}
+\crefname{figure}{图}{图}
+\crefname{table}{表}{表}
+\crefname{section}{节}{节}
+\input{paper/math_commands.tex}
+
+\title{论文标题}
+\author{Anonymous Authors}
+\date{}
+\begin{document}
+% Neutral manuscript layout: no running section titles, centered footer page number.
+\pagestyle{plain}
+\maketitle
+\begin{abstract}
+\input{paper/sections/abstract.tex}
+\end{abstract}
+\input{paper/sections/introduction.tex}
+\input{paper/sections/related_work.tex}
+\input{paper/sections/method.tex}
+\input{paper/sections/experiments.tex}
+% Final section: 总结与讨论; no separate conclusion.
+\input{paper/sections/discussion.tex}
+
+% Use \cite{key} for superscript numbers; write narrative authors explicitly,
+% e.g. Severson等\cite{severson2019}. Keep full author metadata in references.bib.
+\bibliographystyle{paper/sn-nature}
+\bibliography{paper/references}
+\end{document}

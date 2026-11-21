@@ -1,0 +1,12 @@
+% Nature-style citations for article/ctexart manuscripts.
+% sn-nature.bst is distributed unchanged from Springer Nature's December 2024
+% template (2024/07/19 v1.1), under the LPPL license in its header:
+% https://www.springernature.com/gp/authors/campaigns/latex-author-support
+% https://www.nature.com/nature/for-authors/formatting-guide
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{paper/nature-citations}[2026/11/18 Nature-style numeric citations]
+\RequirePackage[super,sort&compress]{natbib}
+\renewcommand{\bibnumfmt}[1]{#1.}
+\providecommand{\bibcommenthead}{}
+\providecommand{\urlprefix}{}
+\endinput

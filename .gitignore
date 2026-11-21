@@ -3,12 +3,12 @@ __pycache__/
 .venv/
 .env
 build/
-.paper-agent/pdf-figures/
+.batteryscientist/pdf-figures/
 
-.paper-agent/herdr/
+.batteryscientist/herdr/
 
 # Local research data and generated artifacts (stored separately from Git).
-/.paper-agent/
+/.batteryscientist/
 /.latex-env/
 /.env.swp
 /*.pdf

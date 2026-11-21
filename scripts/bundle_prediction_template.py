@@ -30,6 +30,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source', type=Path)
     parser.add_argument('--output', type=Path, default=Path(__file__).resolve().parents[1]
-                        / 'paper_agent/templates/template.zip')
+                        / 'batteryscientist/templates/template.zip')
     args = parser.parse_args()
     bundle(args.source.resolve(), args.output)

@@ -32,4 +32,4 @@ PY
 if [[ "${1:-}" == --check-env ]]; then
   exit 0
 fi
-exec "$runtime_python" -u -m paper_agent.agent.workflow_cli "$@"
+exec "$runtime_python" -u -m batteryscientist.agent.workflow_cli "$@"

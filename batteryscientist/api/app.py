@@ -1,0 +1,901 @@
+"""Local-first HTTP API; run behind authentication before exposing remotely."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal
+
+import psutil
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field, model_validator
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from .schemas import HealthView, ProjectView, QuestionView, QuestionAnswer
+from . import auth
+from .library import router as library_router
+from .idea_canvas import router as idea_canvas_router
+from .laboratory import router as laboratory_router
+from batteryscientist.laboratory.service import LaboratoryService
+from batteryscientist.agent.runtime.execution import StageAssignment
+from batteryscientist.storage import read_json_or_default as read_json
+from .store import (
+    REPO,
+    connection,
+    data_root,
+    event,
+    initialize,
+    now,
+    rows,
+    run_update,
+)
+from batteryscientist.agent.stages import WORKFLOW_NODE_NAMES
+
+LABELS = [
+    "文献研究",
+    "数据检索",
+    "创意生成",
+    "研究精炼",
+    "实验规划",
+    "实验执行",
+    "论文规划",
+    "论文绘图",
+    "论文写作",
+    "编译交付",
+    "审阅改进",
+]
+ACTIVE = ("queued", "running", "stopping")
+READ_SUFFIXES = {
+    ".md",
+    ".txt",
+    ".log",
+    ".json",
+    ".csv",
+    ".py",
+    ".tex",
+    ".bib",
+    ".yaml",
+    ".yml",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".svg",
+    ".pdf",
+}
+EDIT_SUFFIXES = {".md", ".txt", ".tex", ".bib", ".py"}
+MAX_TEXT = 2 * 1024 * 1024
+
+
+def allowed_roots():
+    configured = os.environ.get("BATTERYSCIENTIST_PROJECT_ROOTS")
+    return (
+        [Path(p).expanduser().resolve() for p in configured.split(os.pathsep)]
+        if configured
+        else [
+            Path("/data/xinghao/batteryscientist-projects").resolve(),
+            (data_root() / "projects").resolve(),
+        ]
+    )
+
+
+def valid_project_path(path):
+    path = Path(path).expanduser().resolve()
+    if not any(path != root and path.is_relative_to(root) for root in allowed_roots()):
+        raise HTTPException(400, "项目必须位于已配置的项目根目录内")
+    if not path.is_dir():
+        raise HTTPException(400, "项目目录不存在")
+    return path
+
+
+def project_record(project_id):
+    found = rows("SELECT * FROM projects WHERE id=?", (project_id,))
+    if not found:
+        raise HTTPException(404, "项目不存在")
+    project = found[0]
+    valid_project_path(project["path"])
+    return project
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def file_path(project, relative):
+    parts = Path(relative).parts
+    if (
+        not relative
+        or Path(relative).is_absolute()
+        or any(p.startswith(".") for p in parts)
+    ):
+        raise HTTPException(400, "文件路径无效")
+    root = Path(project["path"]).resolve()
+    path = (root / relative).resolve()
+    if (
+        not path.is_relative_to(root)
+        or not path.is_file()
+        or path.suffix.lower() not in READ_SUFFIXES
+    ):
+        raise HTTPException(404, "文件不存在或不可访问")
+    return path
+
+
+def reconcile():
+    for run in rows(
+        "SELECT * FROM runs WHERE status IN ('queued','running','stopping')"
+    ):
+        if run["pid"]:
+            try:
+                process = psutil.Process(run["pid"])
+                if (
+                    abs(process.create_time() - (run["pid_created"] or 0)) < 0.1
+                    and process.is_running()
+                    and process.status() != psutil.STATUS_ZOMBIE
+                ):
+                    continue
+            except psutil.NoSuchProcess:
+                pass
+        elif (
+            datetime.now(timezone.utc) - datetime.fromisoformat(run["created_at"])
+        ).total_seconds() < 30:
+            continue
+        from batteryscientist.agent.runtime.execution import ExecutionOwner
+        project = project_record(run["project_id"])
+        owner = ExecutionOwner(project["path"], data_root() / "runs" / run["id"])
+        owner.cancel()
+        unresolved = owner.settle(wait_seconds=0)
+        from batteryscientist.agent.runtime.questions import UserQuestions
+        UserQuestions(project["path"]).pending()
+        run_update(
+            run["id"],
+            status="interrupted",
+            finished_at=now(),
+            error="运行管理进程已退出，请核查已有结果。" + (unresolved or ""),
+        )
+        event(run["project_id"], "run_finished", {"status": "interrupted"}, run["id"])
+
+
+def register(name, path):
+    path = valid_project_path(path)
+    identifier = uuid.uuid4().hex[:16]
+    with connection() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO projects VALUES(?,?,?,?)",
+            (identifier, name, str(path), now()),
+        )
+    return rows("SELECT * FROM projects WHERE path=?", (str(path),))[0]
+
+
+@asynccontextmanager
+async def lifespan(_):
+    if os.environ.get("BATTERYSCIENTIST_PUBLIC_HOSTS") and not auth.enabled():
+        raise RuntimeError("Public access requires BATTERYSCIENTIST_PASSWORD_HASH")
+    initialize()
+    auth.initialize()
+    for root in allowed_roots():
+        if root.is_dir():
+            for candidate in sorted(root.iterdir()):
+                if (
+                    candidate.is_dir()
+                    and not candidate.name.startswith(".")
+                    and (candidate / "workflow-state.json").is_file()
+                ):
+                    try:
+                        register(candidate.name, candidate)
+                    except HTTPException:
+                        pass
+    reconcile()
+    from batteryscientist.agent.runtime.questions import UserQuestions
+    for project in rows('SELECT path FROM projects'):
+        try:
+            root = valid_project_path(project['path'])
+        except HTTPException:
+            continue
+        UserQuestions(root).pending()
+    laboratory = LaboratoryService()
+    app.state.laboratory = laboratory
+    try:
+        yield
+    finally:
+        await laboratory.close()
+
+
+app = FastAPI(
+    title="BatteryScientist Workbench API",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+    redoc_url=None,
+)
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"]
+    + [host.strip() for host in os.environ.get("BATTERYSCIENTIST_PUBLIC_HOSTS", "").split(",") if host.strip()],
+)
+app.include_router(auth.router)
+app.include_router(library_router)
+app.include_router(idea_canvas_router)
+app.include_router(laboratory_router)
+
+
+@app.middleware("http")
+async def local_origin(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin:
+        from urllib.parse import urlsplit
+
+        local = urlsplit(origin).hostname in {"localhost", "127.0.0.1", "::1"}
+        allowed = origin in os.environ.get("BATTERYSCIENTIST_PUBLIC_ORIGINS", "").split(",")
+        if not local and not allowed:
+            return Response("Origin not allowed", status_code=403)
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and auth.enabled() and not origin:
+        return Response("Origin required", status_code=403)
+    if request.url.path.startswith("/api") and request.url.path not in {"/api/auth/session", "/api/auth/login"}:
+        if not auth.authenticated(request):
+            return Response('{"detail":"请先登录"}', status_code=401, media_type="application/json")
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    path: str | None = None
+
+
+class RunCreate(BaseModel):
+    model_config = {"extra": "forbid"}
+    action: Literal["start", "resume", "review", "coordinate", "proposal_revise", "proposal_approve"] = "start"
+    prompt: str = Field(default="", max_length=20000)
+    mode: Literal["auto", "expert"] | None = None
+    start_node: str | None = None
+    stop_after: str | None = None
+    max_tool_rounds: int = Field(default=300, ge=1, le=500)
+    timeout: float = Field(default=600, gt=0, le=7200, allow_inf_nan=False)
+    paper_review_timeout: float = Field(default=1800, gt=0, le=14400, allow_inf_nan=False)
+    paper_review_round2_timeout: float = Field(default=1200, gt=0, le=14400, allow_inf_nan=False)
+    model: str | None = Field(default=None, max_length=200)
+    answer: str = Field(default="", max_length=20000)
+    checkpoint_token: str | None = None
+    proposal_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    stage_task: StageAssignment | None = None
+
+    @model_validator(mode="after")
+    def nodes(self):
+        if self.stage_task is not None and self.action != "coordinate":
+            raise ValueError("阶段委派仅用于主控任务")
+        if self.action == "coordinate" and (self.start_node or self.stop_after or self.answer or self.checkpoint_token):
+            raise ValueError("主控任务不能混入工作流恢复或审阅参数")
+        if self.action in {"proposal_revise", "proposal_approve"}:
+            if not self.proposal_sha256:
+                raise ValueError("请先保存要提交的方案草稿")
+            if self.prompt or self.answer or self.mode is not None or self.start_node or self.stop_after:
+                raise ValueError("方案审阅操作不能混入其他研究指令")
+        elif self.proposal_sha256 is not None:
+            raise ValueError("proposal_sha256 仅用于方案审阅操作")
+        for node in [self.start_node, self.stop_after]:
+            if node is not None and node not in WORKFLOW_NODE_NAMES:
+                raise ValueError("未知工作流节点")
+        return self
+
+
+class FileEdit(BaseModel):
+    content: str = Field(max_length=MAX_TEXT)
+    sha256: str
+
+
+def checkpoint_token(project, state):
+    checkpoint = state.get("expert_checkpoint") or {}
+    hashes = {}
+    for relative in checkpoint.get("files", []):
+        try:
+            hashes[relative] = digest(file_path(project, relative))
+        except HTTPException:
+            hashes[relative] = None
+    return hashlib.sha256(
+        json.dumps(
+            {"checkpoint": checkpoint, "hashes": hashes}, sort_keys=True
+        ).encode()
+    ).hexdigest()
+
+
+def terminal_projects():
+    """Recognize CLI-owned runs without taking ownership of their processes."""
+    paths = set()
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            args = process.info["cmdline"] or []
+            if not any(
+                "batteryscientist" in arg
+                or Path(arg).name in {"batteryscientist-workflow", "batteryscientist", "run-workflow"}
+                for arg in args
+            ):
+                continue
+            for index, argument in enumerate(args):
+                value = (
+                    args[index + 1]
+                    if argument == "--project" and index + 1 < len(args)
+                    else (
+                        argument.split("=", 1)[1]
+                        if argument.startswith("--project=")
+                        else None
+                    )
+                )
+                if value:
+                    path = Path(value)
+                    if not path.is_absolute():
+                        path = Path(process.cwd()) / path
+                    paths.add(str(path.resolve()))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    return paths
+
+
+def detail(project, terminal_paths=None):
+    from batteryscientist.agent.runtime.questions import UserQuestions
+    state = read_json(Path(project["path"]) / "workflow-state.json", {})
+    runs = rows(
+        "SELECT * FROM runs WHERE project_id=? ORDER BY created_at DESC LIMIT 30",
+        (project["id"],),
+    )
+    for run in runs:
+        run["options"] = json.loads(run["options"])
+    # Management status overrides stale "running" files after an interrupted run.
+    latest = runs[0] if runs else None
+    terminal_paths = terminal_projects() if terminal_paths is None else terminal_paths
+    status = latest["status"] if latest else state.get("status", "idle")
+    if (latest and latest["options"].get("action") == "proposal_revise"
+            and status not in ACTIVE):
+        # 修订是旁路草稿任务，完成/失败都不能抹掉原研究的待审阅状态。
+        status = state.get("status", "idle")
+    if (status not in ACTIVE and state.get('status') == 'awaiting_user'
+            and (state.get('expert_checkpoint') or {}).get('status') == 'pending'):
+        # A discussion or failed edit cannot dismiss a still-pending stage review.
+        status = 'awaiting_user'
+    if project["path"] in terminal_paths:
+        status = "external_running"
+    elif not latest and status == "running":
+        status = "interrupted"
+    progress = read_json(Path(project["path"]) / "workflow-progress.json", {})
+    from batteryscientist.integrations.progress import live_operations
+    progress["operations"] = live_operations(project["path"])
+    review_progress = progress.get("improvement", {})
+    if (status in ACTIVE and review_progress.get("stage") == "review"
+            and review_progress.get("stage_started_at")):
+        try:
+            progress["improvement"] = {**review_progress, "elapsed_seconds": max(0, round(
+                (datetime.now(timezone.utc) - datetime.fromisoformat(review_progress["stage_started_at"])).total_seconds(), 1))}
+        except (ValueError, TypeError):
+            pass
+    pending_questions = UserQuestions(project['path']).pending()
+    from .agents import agent_views
+    last_events = rows(
+        "SELECT kind,data FROM events WHERE project_id=? AND run_id=? AND kind IN "
+        "('assignment_start','assignment_end','model_start','tool_start','assistant_output','role_task_start','user_question','context_compacting','working_context_compacted') "
+        "ORDER BY id DESC LIMIT 1",
+        (project['id'], latest['id'])) if latest and status in ACTIVE else []
+    last_event = ({**last_events[0], 'data': json.loads(last_events[0]['data'])}
+                  if last_events else None)
+    return {
+        **project,
+        "status": status,
+        "state": state,
+        "progress": progress,
+        "runs": runs,
+        "checkpoint_token": checkpoint_token(project, state),
+        "pending_questions": pending_questions,
+        "agents": agent_views(project['path'], status, state, pending_questions, last_event),
+    }
+
+
+@app.get("/api/health", response_model=HealthView)
+def health():
+    return {
+        "status": "ok",
+        "runtime": sys.executable,
+        "project_roots": [str(p) for p in allowed_roots()],
+        "nodes": [
+            {"id": key, "label": label}
+            for key, label in zip(WORKFLOW_NODE_NAMES, LABELS)
+        ],
+        "concurrency": 1,
+    }
+
+
+@app.get("/api/projects", response_model=list[ProjectView])
+def projects():
+    reconcile()
+    result = []
+    terminal_paths = terminal_projects()
+    for project in rows(
+        "SELECT * FROM projects WHERE id NOT IN "
+        "(SELECT project_id FROM archived_projects) ORDER BY created_at DESC"
+    ):
+        try:
+            valid_project_path(project["path"])
+            result.append(detail(project, terminal_paths))
+        except HTTPException:
+            continue
+    return result
+
+
+@app.post("/api/projects", status_code=201, response_model=ProjectView)
+def create_project(body: ProjectCreate):
+    if body.path:
+        project = register(body.name.strip() or "未命名项目", body.path)
+    else:
+        root = allowed_roots()[0]
+        root.mkdir(parents=True, exist_ok=True)
+        folder = root / ("project-" + uuid.uuid4().hex[:10])
+        folder.mkdir()
+        project = register(body.name.strip() or "未命名项目", folder)
+    event(project["id"], "project_registered", {"name": project["name"]})
+    return detail(project)
+
+
+@app.get("/api/projects/{project_id}", response_model=ProjectView)
+def get_project(project_id: str):
+    reconcile()
+    return detail(project_record(project_id))
+
+
+@app.post("/api/projects/{project_id}/runs", status_code=202)
+def start_run(project_id: str, body: RunCreate):
+    return create_run(project_id, body)
+
+
+class MessageCreate(BaseModel):
+    prompt: str = Field(min_length=1, max_length=20000)
+    mode: Literal["auto", "expert"] | None = None
+    model: str | None = Field(default=None, max_length=200)
+
+
+@app.post("/api/projects/{project_id}/messages")
+def send_message(project_id: str, body: MessageCreate):
+    if not body.prompt.strip():
+        raise HTTPException(400, "请输入消息")
+    reconcile()
+    project = project_record(project_id)
+    active = rows("SELECT id,status FROM runs WHERE project_id=? AND status IN ('queued','running','stopping')", (project_id,))
+    if active:
+        from batteryscientist.agent.runtime.questions import UserQuestions
+        root = Path(project['path'])
+        reply = '主控正在处理当前任务；本条消息未提交执行。请查看当前进度，待任务结束后再发送修改要求。'
+        return {'intent': 'status', 'reply': reply, 'accepted': False, 'run_id': active[0]['id'],
+                'status': active[0]['status'], 'progress': read_json(root / 'workflow-progress.json', {}),
+                'pending_questions': UserQuestions(root).pending()}
+    result = create_run(project_id, RunCreate(action='coordinate', prompt=body.prompt,
+                        mode=body.mode, model=body.model), message_prompt=body.prompt)
+    event(project_id, 'conversation_turn', {'prompt': body.prompt, 'reply': '已交给主控处理。',
+          'intent': 'coordinate', 'run_id': result['id']})
+    return JSONResponse(result, status_code=202)
+
+
+def create_run(project_id: str, body: RunCreate, *, message_prompt=None):
+    project = project_record(project_id)
+    if body.action == 'start' and not body.start_node and not body.stop_after:
+        body = body.model_copy(update={'action': 'coordinate'})
+    reconcile()
+    terminal_paths = terminal_projects()
+    registered_paths = {item["path"] for item in rows("SELECT path FROM projects")}
+    if terminal_paths & registered_paths:
+        raise HTTPException(
+            409, "已有终端工作流正在运行，请等待完成或从原终端停止后再启动"
+        )
+    identifier = uuid.uuid4().hex
+    with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        # First release serializes web runs globally to avoid cross-project GPU contention.
+        if db.execute(
+            "SELECT 1 FROM runs WHERE status IN ('queued','running','stopping')"
+        ).fetchone():
+            raise HTTPException(409, "已有项目正在运行，请等待完成或先停止当前运行")
+        state = read_json(Path(project["path"]) / "workflow-state.json", {})
+        options = body.model_dump(exclude_none=True)
+        if body.action in {'start', 'resume', 'coordinate'}:
+            from batteryscientist.project_config import resolve_mode
+            options['mode'] = resolve_mode(project['path'], body.mode, default='expert')
+            if (state.get('status') == 'awaiting_user' and body.mode is not None
+                    and options['mode'] != state.get('mode')):
+                raise HTTPException(409, '请先审阅并批准或修订当前产物，再切换协作模式')
+        if (state.get("status") == "awaiting_user" and state.get("current_node") == "refine"
+                and body.action not in {"review", "proposal_revise", "proposal_approve", "coordinate"}):
+            raise HTTPException(409, "最终方案待审阅，请先提交修改意见或批准方案")
+        if message_prompt is not None:
+            options["message_prompt"] = message_prompt
+        if body.action in {"proposal_revise", "proposal_approve"}:
+            from batteryscientist.proposal_review import load_draft, require_candidate, pending_refine, require_revision_changes
+            try:
+                root = Path(project["path"])
+                submitted = load_draft(root, body.proposal_sha256)
+                if body.action == 'proposal_revise':
+                    require_revision_changes(root, submitted)
+                if body.action == "proposal_approve":
+                    if not pending_refine(state):
+                        raise ValueError("只有当前研究精炼阶段的专家检查点可以批准进入实验规划；历史提案仅可修订草稿")
+                    if body.checkpoint_token != checkpoint_token(project, state):
+                        raise ValueError("检查点已变化，请刷新后重新确认")
+                    require_candidate(root, body.proposal_sha256)
+            except (ValueError, OSError) as exc:
+                raise HTTPException(409, str(exc)) from exc
+            latest = db.execute("SELECT options FROM runs WHERE project_id=? ORDER BY created_at DESC LIMIT 1", (project_id,)).fetchone()
+            if latest and body.model is None:
+                previous = json.loads(latest["options"])
+                if previous.get("model"):
+                    options["model"] = previous["model"]
+            for key in ["mode", "prompt", "answer", "start_node", "stop_after"]:
+                options.pop(key, None)
+        elif body.action == "coordinate":
+            if not body.prompt.strip():
+                raise HTTPException(400, "请输入主控任务")
+        elif body.action == "review":
+            if state.get("status") != "awaiting_user":
+                raise HTTPException(409, "项目没有待审阅检查点")
+            if body.checkpoint_token != checkpoint_token(project, state):
+                raise HTTPException(409, "报告或检查点已变化，请刷新后重新确认")
+            if state.get("current_node") == "refine" and not (body.answer or '').strip():
+                from batteryscientist.proposal_review import require_resolved_proposal_review
+                try:
+                    require_resolved_proposal_review(Path(project["path"]))
+                except (ValueError, OSError) as exc:
+                    raise HTTPException(409, str(exc)) from exc
+            for key in ["mode", "prompt", "start_node", "stop_after"]:
+                options.pop(key, None)
+            latest = db.execute(
+                "SELECT options FROM runs WHERE project_id=? ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            if latest:
+                previous = json.loads(latest["options"])
+                # Use this request’s round budget, including the current default.
+                # Old runs must not silently restore an obsolete default on review.
+                for key in ["timeout", "model"]:
+                    if key in previous:
+                        options[key] = previous[key]
+        elif body.action == "resume":
+            if not state or state.get("status") == "awaiting_user":
+                raise HTTPException(409, "请先完成专家审阅，或创建研究任务")
+            options["start_node"] = (
+                body.start_node or state.get("failed_node") or state.get("current_node")
+            )
+            options["prompt"] = body.prompt.strip() or state.get("project_goal", "")
+            # The CLI supports changing collaboration mode at a resume node.
+        elif not body.prompt.strip():
+            raise HTTPException(400, "请输入研究目标")
+        elif state and not body.start_node:
+            raise HTTPException(409, "已有项目请使用恢复运行，或明确选择起始节点")
+        db.execute(
+            "INSERT INTO runs(id,project_id,status,options,created_at) VALUES(?,?,?,?,?)",
+            (
+                identifier,
+                project_id,
+                "queued",
+                json.dumps(options, ensure_ascii=False),
+                now(),
+            ),
+        )
+    folder = data_root() / "runs" / identifier
+    folder.mkdir(parents=True)
+    try:
+        runtime = os.environ.get("BATTERYSCIENTIST_RUNTIME_PYTHON", sys.executable)
+        environment = os.environ.copy()
+        environment["PATH"] = (
+            str(Path(runtime).parent) + os.pathsep + environment.get("PATH", "")
+        )
+        with (folder / "supervisor.log").open("wb") as log:
+            process = subprocess.Popen(
+                [runtime, "-u", "-m", "batteryscientist.api.worker", identifier],
+                cwd=REPO,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        # The detached worker also sets its identity. Reap only our short-lived handle.
+        try:
+            run_update(
+                identifier,
+                pid=process.pid,
+                pid_created=psutil.Process(process.pid).create_time(),
+            )
+        except psutil.NoSuchProcess:
+            pass
+        import threading
+
+        threading.Thread(target=process.wait, daemon=True).start()
+    except Exception as exc:
+        run_update(identifier, status="failed", error=str(exc), finished_at=now())
+        raise HTTPException(500, "运行进程启动失败") from exc
+    event(project_id, "run_requested", {"action": body.action}, identifier)
+    return {"id": identifier, "status": "queued"}
+
+
+@app.get("/api/projects/{project_id}/questions", response_model=list[QuestionView])
+def list_questions(project_id: str):
+    from batteryscientist.agent.runtime.questions import UserQuestions
+    return UserQuestions(project_record(project_id)['path']).pending()
+
+
+@app.post("/api/projects/{project_id}/questions/{question_id}/answer")
+def answer_question(project_id: str, question_id: str, body: QuestionAnswer):
+    from batteryscientist.agent.runtime.questions import UserQuestions
+    reconcile()
+    project = project_record(project_id)
+    questions = UserQuestions(project['path'])
+    # Serialize against stop requests without creating a new coordinator turn.
+    with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        stopping = db.execute("SELECT id FROM runs WHERE project_id=? AND status='stopping'",
+                              (project_id,)).fetchone()
+        if stopping:
+            raise HTTPException(409, '任务正在停止，本次回答未提交')
+        try:
+            question = questions.read(question_id)
+            if not question.get('live'):
+                raise ValueError('原提问未保持运行，请在主控核查结果后继续')
+            value = questions.answer(question_id, body.answer, task_id=body.task_id)
+        except FileNotFoundError:
+            raise HTTPException(404, '问题不存在或不属于此项目') from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+    event(project_id, 'user_answer_submitted', {'question_id': question_id,
+          'task_id': value['task_id'], 'role': value['role']})
+    return {'status': 'answered', 'question_id': question_id, 'task_id': value['task_id']}
+
+
+@app.post("/api/projects/{project_id}/stop", status_code=202)
+def stop_run(project_id: str):
+    from batteryscientist.agent.runtime.execution import ExecutionOwner
+    project = project_record(project_id)
+    with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        run = db.execute(
+            "SELECT * FROM runs WHERE project_id=? AND status IN ('queued','running','stopping')",
+            (project_id,),
+        ).fetchone()
+        if run is None:
+            raise HTTPException(409, '没有运行中的任务')
+        folder = data_root() / 'runs' / run['id']
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'stop').touch()
+        ExecutionOwner(project['path'], folder).cancel()
+        db.execute("UPDATE runs SET status='stopping' WHERE id=?", (run['id'],))
+    event(project_id, 'stop_requested', {}, run['id'])
+    return {'status': 'stopping'}
+
+
+@app.get("/api/projects/{project_id}/files")
+def list_files(project_id: str):
+    project = project_record(project_id)
+    root = Path(project["path"])
+    result = []
+    for directory, folders, files in os.walk(root, followlinks=False):
+        # Load research artifacts before large directories of run history.
+        # Otherwise the file limit can hide results/ and paper/ behind logs.
+        folders[:] = sorted(
+            (f for f in folders if not f.startswith(".")
+             and f not in {"__pycache__", "node_modules", "venv"}),
+            key=lambda name: (name in {"experiment-runs", "logs", "runs"}, name),
+        )
+        for name in sorted(files):
+            path = Path(directory) / name
+            if name.startswith(".") or path.suffix.lower() not in READ_SUFFIXES:
+                continue
+            if not path.resolve().is_relative_to(root.resolve()):
+                continue
+            stat = path.stat()
+            result.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                }
+            )
+            if len(result) >= 5000:
+                return {"files": result, "truncated": True}
+    return {"files": result, "truncated": False}
+
+
+@app.get("/api/projects/{project_id}/file")
+def read_file(project_id: str, path: str):
+    target = file_path(project_record(project_id), path)
+    if target.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".svg"}:
+        return {"kind": "binary", "path": path, "size": target.stat().st_size}
+    if target.stat().st_size > MAX_TEXT:
+        raise HTTPException(413, "文件超过 2 MiB，请下载查看")
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeError as exc:
+        raise HTTPException(415, "仅支持 UTF-8 文本") from exc
+    return {
+        "kind": "text",
+        "path": path,
+        "content": content,
+        "sha256": digest(target),
+        "editable": target.suffix.lower() in EDIT_SUFFIXES
+        and not path.startswith("experiment-runs/"),
+    }
+
+
+@app.get("/api/projects/{project_id}/download")
+def download(project_id: str, path: str):
+    target = file_path(project_record(project_id), path)
+    # SVG is downloadable only; do not execute project-supplied scripts in this origin.
+    disposition = (
+        "inline"
+        if target.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
+        else "attachment"
+    )
+    return FileResponse(
+        target, filename=target.name, content_disposition_type=disposition
+    )
+
+
+@app.put("/api/projects/{project_id}/file")
+def edit_file(project_id: str, path: str, body: FileEdit):
+    import fcntl
+
+    project = project_record(project_id)
+    target = file_path(project, path)
+    if target.suffix.lower() not in EDIT_SUFFIXES or path.startswith(
+        "experiment-runs/"
+    ):
+        raise HTTPException(403, "此类文件不允许从界面修改")
+    with (Path(project["path"]) / ".web-run.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HTTPException(409, "运行期间不能编辑产物")
+        with connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM runs WHERE project_id=? AND status IN ('queued','running','stopping')",
+                (project_id,),
+            ).fetchone():
+                raise HTTPException(409, "运行期间不能编辑产物")
+            if digest(target) != body.sha256:
+                raise HTTPException(409, "文件已被修改，请重新加载后编辑")
+            state = read_json(Path(project['path']) / 'workflow-state.json', {})
+            relative = target.relative_to(Path(project['path']).resolve()).as_posix()
+            owners = {node for node, refs in state.get('artifacts', {}).items()
+                      if any(ref['path'] == relative for ref in refs)}
+            checkpoint = state.get('expert_checkpoint') or {}
+            if relative in checkpoint.get('files', [checkpoint.get('report')]):
+                owners.add(checkpoint['node'])
+            node = next((name for name in WORKFLOW_NODE_NAMES if name in owners), None)
+            changed = target.read_text(encoding='utf-8') != body.content
+            import tempfile
+
+            fd, temporary = tempfile.mkstemp(prefix=".web-edit-", dir=target.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(body.content)
+                os.replace(temporary, target)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+            if changed and node is not None:
+                from batteryscientist.agent.workflow_cli import refresh_revision_checkpoint
+                refresh_revision_checkpoint(Path(project['path']), node, files=[relative])
+    event(project_id, "file_saved", {"path": path, "sha256": digest(target)})
+    return read_file(project_id, path)
+
+
+@app.get("/api/projects/{project_id}/log")
+def log_tail(project_id: str):
+    project_record(project_id)
+    latest = rows(
+        "SELECT id FROM runs WHERE project_id=? ORDER BY created_at DESC LIMIT 1",
+        (project_id,),
+    )
+    if not latest:
+        return {"content": ""}
+    target = data_root() / "runs" / latest[0]["id"] / "output.log"
+    if not target.is_file():
+        return {"content": ""}
+    with target.open("rb") as stream:
+        stream.seek(max(0, target.stat().st_size - 100000))
+        content = stream.read().decode("utf-8", errors="replace")
+    return {"content": content}
+
+
+@app.get("/api/projects/{project_id}/activity")
+def activity(
+    project_id: str,
+    role: str | None = Query(default=None),
+    before: int | None = Query(default=None, ge=1),
+    after: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Page durable public execution events for chat history and polling recovery."""
+    project_record(project_id)
+    if before is not None and after is not None:
+        raise HTTPException(400, "不能同时指定 before 和 after")
+    clause, values = "", [project_id]
+    if before is not None:
+        clause = " AND id<?"
+        values.append(before)
+    elif after is not None:
+        clause = " AND id>?"
+        values.append(after)
+    if role is not None:
+        from .agents import activity_role_filter
+        try:
+            role_clause, role_values = activity_role_filter(role)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        clause += role_clause
+        values.extend(role_values)
+    direction = "ASC" if after is not None else "DESC"
+    records = rows(
+        f"SELECT * FROM events WHERE project_id=?{clause} ORDER BY id {direction} LIMIT ?",
+        (*values, limit + 1),
+    )
+    has_more = len(records) > limit
+    records = records[:limit]
+    if after is None:
+        records.reverse()
+    for record in records:
+        record["data"] = json.loads(record["data"])
+    return {"events": records, "has_more": has_more}
+
+
+@app.get("/api/projects/{project_id}/events")
+async def events(
+    project_id: str, request: Request, after: int = Query(default=0, ge=0)
+):
+    project_record(project_id)
+    try:
+        cursor = max(after, int(request.headers.get("last-event-id", "0")))
+    except ValueError:
+        raise HTTPException(400, "无效事件游标")
+
+    async def stream():
+        nonlocal cursor
+        heartbeat = 0
+        while not await request.is_disconnected():
+            if heartbeat % 15 == 0 and not await asyncio.to_thread(auth.authenticated, request):
+                break
+            records = await asyncio.to_thread(
+                rows,
+                "SELECT * FROM events WHERE project_id=? AND id>? ORDER BY id LIMIT 100",
+                (project_id, cursor),
+            )
+            for record in records:
+                cursor = record["id"]
+                record["data"] = json.loads(record["data"])
+                yield f"id: {cursor}\ndata: {json.dumps(record, ensure_ascii=False)}\n\n"
+            heartbeat += 1
+            if heartbeat % 15 == 0:
+                yield ": heartbeat\n\n"
+            if len(records) < 100:
+                await asyncio.sleep(1)
+
+    return StreamingResponse(
+        stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"}
+    )
+
+
+def main():
+    import uvicorn
+
+    uvicorn.run(
+        "batteryscientist.api.app:app",
+        host="127.0.0.1",
+        port=int(os.environ.get("BATTERYSCIENTIST_API_PORT", "8000")),
+    )
+
+
+if __name__ == "__main__":
+    main()

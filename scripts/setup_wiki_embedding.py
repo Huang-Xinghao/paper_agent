@@ -70,7 +70,7 @@ def main():
     )
     if args.python:
         (root / "runtime.env").write_text(
-            f"PAPER_AGENT_EMBEDDING_DIR={root}\nPAPER_AGENT_EMBEDDING_PYTHON={args.python}\n",
+            f"BATTERYSCIENTIST_EMBEDDING_DIR={root}\nBATTERYSCIENTIST_EMBEDDING_PYTHON={args.python}\n",
             encoding="utf-8",
         )
 

@@ -3,31 +3,28 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "paper-agent-prototype"
+name = "batteryscientist"
 version = "0.1.0"
 description = "A file-backed agent for research paper workflows"
 requires-python = ">=3.11"
 dependencies = ["openai>=1.0", "tiktoken>=0.8,<1", "pypdf>=4", "PyMuPDF>=1.24,<2", "httpx>=0.27", "Pillow>=10", "black>=24", "prompt-toolkit>=3.0.48,<4"]
 
 [project.scripts]
-paper-agent = "paper_agent.agent.loop:main"
-paper-workflow = "paper_agent.agent.workflow_cli:main"
-paper-review = "paper_agent.integrations.review:main"
-paper-web-api = "paper_agent.api.app:main"
-paper-coordinator = "paper_agent.agent.coordinator:main"
-paper-main = "paper_agent.agent.terminal.main:main"
-paper-herdr = "paper_agent.agent.runtime.herdr:main"
-paper-roles = "paper_agent.agent.role_cli:main"
+batteryscientist = "batteryscientist.agent.loop:main"
+batteryscientist-workflow = "batteryscientist.agent.workflow_cli:main"
+batteryscientist-review = "batteryscientist.integrations.review:main"
+batteryscientist-web-api = "batteryscientist.api.app:main"
+batteryscientist-coordinator = "batteryscientist.agent.coordinator:main"
+batteryscientist-main = "batteryscientist.agent.terminal.main:main"
+batteryscientist-herdr = "batteryscientist.agent.runtime.herdr:main"
+batteryscientist-roles = "batteryscientist.agent.role_cli:main"
 
 [tool.setuptools.packages.find]
-include = ["paper_agent*"]
+include = ["batteryscientist*"]
 
 [tool.setuptools.package-data]
-paper_agent = ["skills/*/SKILL.md", "skills/paper-write/templates/*", "templates/*.zip"]
+batteryscientist = ["skills/*/SKILL.md", "skills/*/references/*.md", "skills/shared-references/*.md", "skills/auto-paper-improvement-loop/paper-review.md", "skills/paper-write/templates/*", "templates/*.zip"]
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.30,<2"]
 web = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "psutil>=6,<8"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
